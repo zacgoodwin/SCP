@@ -16,6 +16,8 @@ export interface UserJson {
   username: string;
   isAdmin: boolean;
   disabled: boolean;
+  /** Linked to a single sign-on identity (auth/oidc.ts); admins see and can drop the link. */
+  oidcLinked: boolean;
   createdAt: string;
 }
 
@@ -53,6 +55,7 @@ export const userJson = (u: UserRow): UserJson => ({
   username: u.username,
   isAdmin: !!u.is_admin,
   disabled: !!u.disabled,
+  oidcLinked: !!u.oidc_sub,
   createdAt: u.created_at,
 });
 

@@ -33,12 +33,17 @@ export function errorHandler(err: Error, c: Context) {
   if (err instanceof HttpError) {
     const body: { error: { code: string; message: string; details?: unknown } } = { error: { code: err.code, message: err.message } };
     if (err.details !== undefined) body.error.details = err.details;
+    // A 503 that names when to retry (imports/github.ts withZipballSlot) says so in the header too.
+    const retryAfter = (err.details as { retryAfter?: unknown } | undefined)?.retryAfter;
+    if (err.status === 503 && typeof retryAfter === 'number') c.header('Retry-After', String(retryAfter));
     return c.json(body, err.status);
   }
   // Hono's own HTTPException (e.g. bodyLimit 413) carries a status.
   const status = (err as { status?: number }).status;
   if (typeof status === 'number' && status >= 400 && status < 500) {
-    return c.json({ error: { code: 'http_error', message: err.message } }, status as ContentfulStatusCode);
+    // hono/csrf throws with an empty message, which the UI then shows as a blank error box.
+    const message = err.message || (status === 403 ? 'request refused: it must come from this site (Origin header missing or foreign)' : 'request failed');
+    return c.json({ error: { code: 'http_error', message } }, status as ContentfulStatusCode);
   }
   console.error(err);
   return c.json({ error: { code: 'internal', message: 'internal error' } }, 500);

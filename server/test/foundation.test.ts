@@ -42,7 +42,7 @@ test('migrations are idempotent and tx rolls back', () => {
   const db = new DatabaseSync(':memory:');
   migrate(db);
   migrate(db);
-  assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 4);
+  assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
   assert.throws(() =>
     tx(db, () => {
       db.prepare("INSERT INTO settings (key, value) VALUES ('k', 'v')").run();
@@ -244,8 +244,8 @@ test('SPA: index.html revalidates, fingerprinted assets are immutable', async ()
       assert.equal(r.headers.get('content-security-policy'), "frame-ancestors 'none'; frame-src http://art.test; object-src 'none'; base-uri 'none'", path);
       assert.equal(r.headers.get('x-content-type-options'), 'nosniff', path);
     }
-    // OAuth discovery after an MCP 401 gets a JSON 404, not index.html with a 200.
-    for (const path of ['/.well-known/oauth-protected-resource/mcp/kit', '/.well-known/oauth-authorization-server']) {
+    // An unknown /.well-known path gets a JSON 404, not index.html with a 200 (the OAuth documents live in oauth/routes.ts).
+    for (const path of ['/.well-known/oauth-protected-resource/other', '/.well-known/openid-configuration']) {
       const r = await t.req('GET', path);
       assert.equal(r.status, 404, path);
       assert.equal(r.json.error.code, 'not_found', path);

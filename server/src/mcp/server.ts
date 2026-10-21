@@ -8,6 +8,7 @@ import { parseFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, badRequest, notFound } from '../lib/http.ts';
 import { mediaTypeFor, readFile } from '../items/service.ts';
 import { groupReadSql } from '../access.ts';
+import { listOwnGroups } from '../groups/service.ts';
 import { asText, entryText, makeScope, resolveTarget, type McpScope } from './scope.ts';
 import { BINARY_MAX, PAGE, VIEWER_PAGE, registerTools } from './tools.ts';
 import { VIEWER_HTML, VIEWER_URI } from './viewer.ts';
@@ -54,23 +55,8 @@ const INSTRUCTION_GROUPS = 50;
 const PROMPT_GROUPS = 50;
 const MAX_PROMPTS = 200;
 
-/**
- * Global endpoint: the groups that are the principal's own business, owned first: owned, shared with
- * them by name, or picked for this key (a restricted key). Strangers' public groups stay reachable
- * through list_groups and /mcp/<slug> but are never enumerated into instructions or prompts: any
- * account can create them, so they would cost every request and inject text into every reader's agent.
- */
-function ownGroups(s: McpScope, limit: number): (GroupRow & { owner_username: string })[] {
-  const f = groupReadSql(s.p);
-  const chosen = s.p.groupIds ? '1' : '(g.owner_id = ? OR EXISTS (SELECT 1 FROM group_shares gs_o WHERE gs_o.group_id = g.id AND gs_o.user_id = ?))';
-  const params = s.p.groupIds ? [] : [s.p.userId, s.p.userId];
-  return s.ctx.db
-    .prepare(
-      `SELECT g.*, u.username AS owner_username FROM scp_groups g JOIN users u ON u.id = g.owner_id
-       WHERE ${f.sql} AND ${chosen} ORDER BY (g.owner_id = ?) DESC, g.updated_at DESC, g.id DESC LIMIT ?`,
-    )
-    .all(...f.params, ...params, s.p.userId, limit) as unknown as (GroupRow & { owner_username: string })[];
-}
+/** Global endpoint: the principal's own, shared-by-name and picked groups (groups/service.ts listOwnGroups), never strangers' public ones. */
+const ownGroups = (s: McpScope, limit: number) => listOwnGroups(s.ctx.db, s.p, limit);
 
 // ---------- resources ----------
 
@@ -139,9 +125,9 @@ function registerResources(server: McpServer, s: McpScope): void {
         // Same caps as get_skill_file: a whole 10 MB file in one read overflows host context limits.
         if (text === null ? f.bytes.length > BINARY_MAX : text.length > PAGE) {
           const http = `${s.ctx.config.publicUrl}/api/v1/items/${item.id}/files/${path.split('/').map(encodeURIComponent).join('/')}?version=${version.seq}`;
-          throw badRequest(
-            `'${path}' is ${f.bytes.length} bytes, too large to read as an MCP resource. Page it with get_skill_file, or download it with the API key: ${http}`,
-          );
+          // An OAuth token is refused on /api/v1 (oauth/tokens.ts): say what the URL takes instead.
+          const withKey = s.p.via === 'oauth' ? `with an SCP API key minted on ${s.ctx.config.publicUrl}/keys (this connection's OAuth token is not accepted there)` : 'with the API key';
+          throw badRequest(`'${path}' is ${f.bytes.length} bytes, too large to read as an MCP resource. Page it with get_skill_file, or download it ${withKey}: ${http}`);
         }
         return {
           contents: [text !== null ? { uri: uri.href, mimeType, text } : { uri: uri.href, mimeType, blob: Buffer.from(f.bytes).toString('base64') }],

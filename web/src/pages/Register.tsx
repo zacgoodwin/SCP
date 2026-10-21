@@ -37,6 +37,7 @@ export function RegisterPage() {
     return (
       <main className="auth-page">
         <div className="card auth-card stack">
+          <p className="auth-brand">SCP</p>
           <h1>Registration is closed</h1>
           <p>This SCP instance does not accept new sign-ups. Ask an admin to create an account for you.</p>
           <Link to="/login" className="btn btn-primary btn-block">
@@ -50,6 +51,7 @@ export function RegisterPage() {
   return (
     <main className="auth-page">
       <form className="card auth-card stack" onSubmit={submit}>
+        <p className="auth-brand">SCP</p>
         <h1>Create an account</h1>
         <label className="field">
           <span>Email</span>

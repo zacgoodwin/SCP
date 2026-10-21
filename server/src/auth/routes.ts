@@ -2,10 +2,15 @@ import { Hono, type Context } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { z } from 'zod';
 import { hashPassword, sha256Hex, verifyPassword } from '../lib/crypto.ts';
-import { HttpError, clientIp, conflict, forbidden, notFound, parseJson, parseQuery } from '../lib/http.ts';
-import { now, tx } from '../db.ts';
+import { HttpError, conflict, forbidden, notFound, parseJson, parseQuery } from '../lib/http.ts';
+import { AUTH_LIMITS, limitIp, rateLimited, take } from '../lib/ratelimit.ts';
+import { isUniqueViolation, now, tx } from '../db.ts';
 import { audit } from '../audit.ts';
+import { sweepBlobs } from '../items/gc.ts';
 import { SESSION_COOKIE, requireAccountUser, requireAdmin, requireScope, requireUser } from './middleware.ts';
+import { OIDC_PASSWORD_HASH, oidcPublicConfig } from './oidc.ts';
+import { touchGroupsOfUser } from '../groups/touch.ts';
+import { deleteUserCodes, revokeUserGrants } from '../oauth/service.ts';
 import {
   SESSION_TTL_MS,
   createSession,
@@ -50,52 +55,10 @@ const requireSession = (c: Context<AppEnv>, what: string): Principal => {
   return p;
 };
 
-// ---------- anonymous scrypt limiter ----------
-
-interface Bucket {
-  tokens: number;
-  at: number;
-}
-// Per app (keyed by its db), so test apps do not share buckets. ponytail: in-memory and per process;
-// a restart refills every bucket, and several replicas would each allow the full rate.
-const bucketsByDb = new WeakMap<object, Map<string, Bucket>>();
-/**
- * Per client IP across login and register (each runs one scrypt); per login name from one IP
- * (guessing); and per login name from everywhere, looser, against distributed guessing. The tight
- * login bucket is per IP so a stranger cannot lock an account out of every other client.
- */
-export const AUTH_LIMITS = {
-  ip: { burst: 20, perSec: 0.5 },
-  login: { burst: 10, perSec: 1 / 30 },
-  loginAll: { burst: 100, perSec: 1 / 6 },
-};
-/** A bucket idle this long is full again, so forgetting it changes nothing. */
-const FULL_AFTER_MS = Math.max(...Object.values(AUTH_LIMITS).map((l) => l.burst / l.perSec)) * 1000;
-const MAX_BUCKETS = 50_000;
-
-/** Token bucket: true and one token spent, or false when the bucket is empty. */
-function take(c: Context<AppEnv>, key: string, { burst, perSec }: { burst: number; perSec: number }): boolean {
-  let m = bucketsByDb.get(c.var.ctx.db);
-  if (!m) bucketsByDb.set(c.var.ctx.db, (m = new Map()));
-  const t = Date.now();
-  if (m.size > MAX_BUCKETS) {
-    for (const [k, x] of m) if (t - x.at > FULL_AFTER_MS) m.delete(k);
-    if (m.size > MAX_BUCKETS) m.clear(); // ponytail: a flood of fresh keys resets the limiter; memory stays bounded
-  }
-  const b = m.get(key) ?? { tokens: burst, at: t };
-  b.tokens = Math.min(burst, b.tokens + ((t - b.at) / 1000) * perSec);
-  b.at = t;
-  m.set(key, b);
-  if (b.tokens < 1) return false;
-  b.tokens -= 1;
-  return true;
-}
-
-const rateLimited = () => new HttpError(429, 'rate_limited', 'too many attempts; wait a minute and try again');
+// ---------- anonymous scrypt limiter (buckets in lib/ratelimit.ts, shared with the OIDC routes) ----------
 
 function limitAnonymous(c: Context<AppEnv>, login?: string): void {
-  const ip = clientIp(c, c.var.ctx.config.trustProxy) ?? 'unknown';
-  if (!take(c, `ip:${ip}`, AUTH_LIMITS.ip)) throw rateLimited();
+  const ip = limitIp(c);
   if (login === undefined) return;
   const name = JSON.stringify(login.trim().toLowerCase()); // quoted: a name cannot forge another key
   if (!take(c, `login:${ip}:${name}`, AUTH_LIMITS.login) || !take(c, `loginAll:${name}`, AUTH_LIMITS.loginAll)) throw rateLimited();
@@ -161,6 +124,7 @@ authRoutes.get('/auth/config', (c) => {
     publicUrl: config.publicUrl,
     artifactUrl: config.artifactUrl,
     artifactOrigin: new URL(config.artifactUrl).origin,
+    oidc: oidcPublicConfig(c.var.ctx),
   });
 });
 
@@ -240,21 +204,58 @@ authRoutes.post('/users', async (c) => {
 
 authRoutes.patch('/users/:id', async (c) => {
   const p = requireAdminWrite(c);
-  const body = await parseJson(c, z.object({ isAdmin: z.boolean().optional(), disabled: z.boolean().optional(), password: passwordSchema.optional() }));
+  const body = await parseJson(
+    c,
+    z.object({
+      username: usernameSchema.optional(),
+      email: z.email().max(254).optional(),
+      isAdmin: z.boolean().optional(),
+      disabled: z.boolean().optional(),
+      password: passwordSchema.optional(),
+      /** Drop the single sign-on link (an admin cannot see the identity, only that one is bound). */
+      oidcUnlink: z.literal(true).optional(),
+    }),
+  );
   const target = targetUser(c);
   // A reset revokes every session and key of the target, which would sign the admin out mid-click.
   if (body.password !== undefined && target.id === p.userId) throw conflict('use POST /auth/password to change your own password');
+  if (body.oidcUnlink && body.password === undefined && target.password_hash === OIDC_PASSWORD_HASH) {
+    throw conflict('this account has no password; set one in the same request, or it becomes unreachable');
+  }
+  // Recovery semantics: a reset also drops the single sign-on link, which an intruder may have bound to
+  // their own IdP identity while they held a session (it would otherwise sign them straight back in).
+  const unlink = (body.password !== undefined || !!body.oidcUnlink) && target.oidc_sub !== null;
   if (body.isAdmin === false && target.is_admin) guardAdminLoss(c, p, target, 'demote');
   if (body.disabled === true && !target.disabled) guardAdminLoss(c, p, target, 'disable');
   const { db } = c.var.ctx;
   const hash = body.password !== undefined ? await hashPassword(body.password) : null;
+  let grantsRevoked: number | undefined;
   tx(db, () => {
+    try {
+      if (body.username !== undefined) db.prepare('UPDATE users SET username = ? WHERE id = ?').run(body.username, target.id);
+      if (body.email !== undefined) db.prepare('UPDATE users SET email = ? WHERE id = ?').run(body.email, target.id);
+    } catch (e) {
+      if (isUniqueViolation(e)) throw conflict('email or username already taken');
+      throw e;
+    }
     if (body.isAdmin !== undefined) db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(body.isAdmin ? 1 : 0, target.id);
-    if (body.disabled !== undefined) db.prepare('UPDATE users SET disabled = ? WHERE id = ?').run(body.disabled ? 1 : 0, target.id);
+    if (body.disabled !== undefined && (body.disabled ? 1 : 0) !== target.disabled) {
+      db.prepare('UPDATE users SET disabled = ? WHERE id = ?').run(body.disabled ? 1 : 0, target.id);
+      // Their items and groups leave (or rejoin) every group that holds them: those plugins' versions must move.
+      touchGroupsOfUser(db, target.id);
+    }
     if (hash !== null) db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, target.id);
+    if (unlink) db.prepare('UPDATE users SET oidc_issuer = NULL, oidc_sub = NULL WHERE id = ?').run(target.id);
     // A disabled account or a reset password ends every live browser session of that user.
     if (body.disabled === true || body.password !== undefined) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);
-    // A reset is the account-recovery path, so keys minted by whoever held the account die too.
+    // Disabling and a password reset both end every OAuth grant and any code awaiting exchange: a
+    // grant an intruder consented to must not come back when the account is enabled again, and
+    // redeemCode checks only the code. API keys survive a disable (refused meanwhile, reversible)
+    // but not a reset, which is the account-recovery path for whoever held the account.
+    if (body.disabled === true || body.password !== undefined) {
+      deleteUserCodes(db, target.id);
+      grantsRevoked = revokeUserGrants(db, target.id);
+    }
     if (body.password !== undefined) {
       db.prepare('UPDATE api_keys SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now(), target.id);
     }
@@ -263,7 +264,15 @@ authRoutes.patch('/users/:id', async (c) => {
     action: 'user.update',
     targetType: 'user',
     targetId: target.id,
-    detail: { isAdmin: body.isAdmin, disabled: body.disabled, passwordReset: body.password !== undefined },
+    detail: {
+      isAdmin: body.isAdmin,
+      disabled: body.disabled,
+      passwordReset: body.password !== undefined,
+      oidcUnlinked: unlink || undefined,
+      grantsRevoked,
+      username: body.username,
+      emailChanged: body.email !== undefined || undefined,
+    },
   });
   return c.json({ user: userJson(getUser(db, target.id)!) });
 });
@@ -272,7 +281,19 @@ authRoutes.delete('/users/:id', (c) => {
   const p = requireAdminWrite(c);
   const target = targetUser(c);
   guardAdminLoss(c, p, target, 'delete');
-  c.var.ctx.db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+  const { db } = c.var.ctx;
+  // The cascade removes the user's items, versions and files; blobs only those referenced are swept
+  // in the same transaction, like deleteItem (items/service.ts), so nothing waits for the boot sweep.
+  tx(db, () => {
+    const hashes = (
+      db
+        .prepare('SELECT DISTINCT f.sha256 FROM version_files f JOIN item_versions v ON v.id = f.version_id JOIN items i ON i.id = v.item_id WHERE i.owner_id = ?')
+        .all(target.id) as { sha256: string }[]
+    ).map((r) => r.sha256);
+    touchGroupsOfUser(db, target.id); // before the cascade takes the member and include rows with it
+    db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+    sweepBlobs(db, hashes);
+  });
   audit(c, p, { action: 'user.delete', targetType: 'user', targetId: target.id, detail: { username: target.username } });
   return c.body(null, 204);
 });

@@ -1,5 +1,5 @@
-import type { SQLInputValue } from 'node:sqlite';
-import { canEditItem, canReadItem, groupReadSql, itemReadSql, publishedSql } from '../access.ts';
+import type { SQLInputValue, StatementSync } from 'node:sqlite';
+import { canEditItem, canReadItem, itemReadSql, servedByGroupSql, servingGroupsSql } from '../access.ts';
 import { requireScope } from '../auth/middleware.ts';
 import { isUniqueViolation, newId, now, tx, type Db } from '../db.ts';
 import { sha256Hex } from '../lib/crypto.ts';
@@ -7,8 +7,10 @@ import { parseFrontmatter, type Frontmatter } from '../lib/frontmatter.ts';
 import { HttpError, badRequest, forbidden, notFound } from '../lib/http.ts';
 import { assertNoCollisions, isJunkPath, isTextPath, mediaTypeFor, normalizePath, segmentProblem } from '../lib/paths.ts';
 import { LIMITS, checkLimits, stripTopFolder, tooLarge, treeSha256, type TreeFile } from '../lib/tree.ts';
+import { sweepBlobs } from './gc.ts';
 import { lintVersion, type Lint } from './lint.ts';
-import { FORMATS, KINDS, planeOf, type Ctx, type Format, type ItemRow, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
+import { touchGroupsOfItem } from '../groups/touch.ts';
+import { FORMATS, KINDS, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
 
 export { isTextPath, mediaTypeFor };
 export type { Lint, TreeFile };
@@ -40,6 +42,10 @@ export interface CreateItemInput {
   /** The wrapper folder an imported tree came in: a skill without a frontmatter name takes it. */
   folderName?: string;
   forkedFrom?: string;
+  /** Import provenance (D1), written to the item row's source_* columns. */
+  source?: ItemSource;
+  /** With source: whether the unit was the whole tree or a root SKILL.md carved from its siblings (ItemRow.source_scope). */
+  sourceScope?: 'tree' | 'root';
 }
 
 export interface VersionInput {
@@ -88,7 +94,8 @@ export interface VersionSummary {
   totalBytes: number;
   note: string;
   createdAt: string;
-  createdBy: { userId: string | null; keyId: string | null };
+  /** clientId: the connected OAuth app that wrote it (MCP), so two apps and the owner's own edits stay tellable apart. */
+  createdBy: { userId: string | null; keyId: string | null; clientId: string | null };
 }
 
 export interface VersionDetail extends VersionSummary {
@@ -99,7 +106,7 @@ export interface VersionDetail extends VersionSummary {
 
 export interface ItemDetail extends ItemSummary {
   createdAt: string;
-  source: { repo: string | null; ref: string | null; path: string | null } | null;
+  source: ItemSource | null;
   forkedFrom: string | null;
   version: VersionDetail;
   groups: { slug: string; name: string }[];
@@ -156,10 +163,13 @@ export function loadEditableItem(db: Db, p: Principal, id: string): ItemRow {
   return row;
 }
 
+// Prepared once per database (tests open many): every member of every listed group resolves through this.
+const versionStmts = new WeakMap<Db, StatementSync>();
+
 export function resolveVersion(db: Db, item: ItemRow, seq?: number): VersionRow {
-  const v = db.prepare('SELECT * FROM item_versions WHERE item_id = ? AND seq = ?').get(item.id, seq ?? item.latest_seq) as
-    | VersionRow
-    | undefined;
+  let stmt = versionStmts.get(db);
+  if (!stmt) versionStmts.set(db, (stmt = db.prepare('SELECT * FROM item_versions WHERE item_id = ? AND seq = ?')));
+  const v = stmt.get(item.id, seq ?? item.latest_seq) as VersionRow | undefined;
   if (!v) throw notFound('version');
   return v;
 }
@@ -207,7 +217,7 @@ export const versionSummary = (v: VersionRow): VersionSummary => ({
   totalBytes: v.total_bytes,
   note: v.note,
   createdAt: v.created_at,
-  createdBy: { userId: v.created_by_user, keyId: v.created_by_key },
+  createdBy: { userId: v.created_by_user, keyId: v.created_by_key, clientId: v.created_by_client },
 });
 
 export const versionDetail = (db: Db, v: VersionRow): VersionDetail => ({
@@ -218,23 +228,23 @@ export const versionDetail = (db: Db, v: VersionRow): VersionDetail => ({
 });
 
 export function itemDetail(db: Db, p: Principal, row: ItemRow, seq?: number): ItemDetail {
-  const g = groupReadSql(p);
-  const groups = db
-    .prepare(
-      `SELECT g.slug, g.name FROM group_members gm JOIN scp_groups g ON g.id = gm.group_id JOIN items i ON i.id = gm.item_id
-       WHERE gm.item_id = ? AND ${publishedSql()} AND ${g.sql} ORDER BY g.name`,
-    )
-    .all(row.id, ...g.params) as { slug: string; name: string }[];
+  // Readable groups that serve the item, included groups too (a reader may know it only through those).
+  const g = servingGroupsSql(p);
+  const groups = db.prepare(g.sql).all(row.id, ...g.params) as { slug: string; name: string }[];
   return {
     ...itemSummary(db, row),
     createdAt: row.created_at,
-    source: row.source_repo || row.source_path ? { repo: row.source_repo, ref: row.source_ref, path: row.source_path } : null,
+    source: itemSource(row),
     forkedFrom: row.forked_from,
     version: versionDetail(db, resolveVersion(db, row, seq)),
     groups: groups.map((r) => ({ slug: r.slug, name: r.name })),
     canEdit: canEditItem(db, p, row),
   };
 }
+
+/** Provenance of an imported item, null for items created in SCP. */
+export const itemSource = (row: ItemRow): ItemSource | null =>
+  row.source_kind ? { kind: row.source_kind, repo: row.source_repo, ref: row.source_ref, path: row.source_path, commit: row.source_commit } : null;
 
 /** At most this many distinct words of a query are searched. */
 export const MAX_FTS_TERMS = 8;
@@ -281,11 +291,10 @@ export function searchItems(
     params.push(opts.ownerId);
   }
   if (opts.groupId) {
-    // Same republication rule as itemReadSql: only members the group actually publishes.
-    where.push(
-      `EXISTS (SELECT 1 FROM group_members gm JOIN scp_groups g ON g.id = gm.group_id WHERE gm.item_id = i.id AND gm.group_id = ? AND ${publishedSql()})`,
-    );
-    params.push(opts.groupId);
+    // What the group serves, included groups too: the same effective set as get_group / resolvedMembers.
+    const served = servedByGroupSql(opts.groupId);
+    where.push(served.sql);
+    params.push(...served.params);
   }
   const match = ftsQuery(opts.q, opts.anyTerm);
   if (match) {
@@ -438,9 +447,9 @@ function checkVisibility(v: unknown): void {
 // steered by whatever keys a row happens to carry.
 const INSERT_COLUMNS = {
   items: ['id', 'owner_id', 'kind', 'name', 'title', 'description', 'category', 'tags', 'visibility', 'format',
-    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'forked_from', 'created_at', 'updated_at'],
+    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'forked_from', 'created_at', 'updated_at'],
   item_versions: ['id', 'item_id', 'seq', 'entry_path', 'tree_sha256', 'frontmatter', 'lint', 'total_bytes', 'note',
-    'created_by_user', 'created_by_key', 'created_at'],
+    'created_by_user', 'created_by_key', 'created_by_client', 'created_at'],
 } as const;
 
 export function insertRow(db: Db, table: keyof typeof INSERT_COLUMNS, row: object): void {
@@ -467,6 +476,7 @@ function insertVersion(db: Db, p: Principal, itemId: string, seq: number, s: Sha
     note,
     created_by_user: p.userId,
     created_by_key: p.keyId ?? null,
+    created_by_client: p.oauthClientId ?? null,
     created_at: now(),
   };
   insertRow(db, 'item_versions', v);
@@ -541,9 +551,13 @@ export function createItemTx(
     visibility: input.visibility ?? 'private',
     format,
     latest_seq: 0,
-    source_repo: null,
-    source_ref: null,
-    source_path: null,
+    source_repo: input.source?.repo ?? null,
+    source_ref: input.source?.ref ?? null,
+    source_path: input.source?.path ?? null,
+    source_kind: input.source?.kind ?? null,
+    source_commit: input.source?.commit ?? null,
+    source_tree_sha256: null,
+    source_scope: input.source ? (input.sourceScope ?? null) : null,
     forked_from: input.forkedFrom ?? null,
     created_at: ts,
     updated_at: ts,
@@ -552,10 +566,11 @@ export function createItemTx(
     try {
       insertRow(db, 'items', row);
     } catch (e) {
-      if (isUniqueViolation(e)) throw new HttpError(409, 'name_taken', `you already have a ${kind} named '${name}'`);
+      if (isUniqueViolation(e)) throw new HttpError(409, 'name_taken', `you already have a ${kind} named '${name}'`, { name });
       throw e;
     }
-    insertVersion(db, p, row.id, 1, s, lint, input.note);
+    const v = insertVersion(db, p, row.id, 1, s, lint, input.note);
+    if (input.source) db.prepare('UPDATE items SET source_tree_sha256 = ? WHERE id = ?').run(v.tree_sha256, row.id);
     refreshFts(db, row.id);
     return getItemRow(db, row.id)!;
   });
@@ -604,18 +619,27 @@ export function updateItemMeta(ctx: Ctx, p: Principal, item: ItemRow, patch: Met
       now(),
       item.id,
     );
+    // Visibility decides whether other owners' groups publish it (publishedSql): what they serve changed.
+    if (patch.visibility !== undefined && patch.visibility !== item.visibility) touchGroupsOfItem(db, item.id);
     refreshFts(db, item.id);
     return getItemRow(db, item.id)!;
   });
 }
 
-// ponytail: blobs are left behind on delete; add a GC sweep (DELETE blobs not referenced by version_files) if disk use matters.
+/** Cascades to versions and files; blobs those files referenced are swept in the same transaction (gc.ts). */
 export function deleteItem(ctx: Ctx, p: Principal, item: ItemRow): void {
   const { db } = ctx;
   if (!canEditItem(db, p, item)) throw forbidden('you cannot edit this item');
   tx(db, () => {
+    const hashes = (
+      db
+        .prepare('SELECT DISTINCT f.sha256 FROM version_files f JOIN item_versions v ON v.id = f.version_id WHERE v.item_id = ?')
+        .all(item.id) as { sha256: string }[]
+    ).map((r) => r.sha256);
+    touchGroupsOfItem(db, item.id); // before the cascade takes the member rows with it
     db.prepare('DELETE FROM items_fts WHERE item_id = ?').run(item.id);
     db.prepare('DELETE FROM items WHERE id = ?').run(item.id);
+    sweepBlobs(db, hashes);
   });
 }
 

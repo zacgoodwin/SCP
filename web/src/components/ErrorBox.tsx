@@ -31,13 +31,19 @@ export function LintList({ lint }: { lint: Lint[] }) {
   );
 }
 
+/** A zod issue ({path: [...], message}) or an import skip ({path: 'a/b', reason}). */
 interface Issue {
-  path?: (string | number)[];
+  path?: (string | number)[] | string;
   message?: string;
+  reason?: string;
 }
 
-/** Inline error: message, plus the lint list (422) or validation issues (400) when present. */
-export function ErrorBox({ error }: { error: unknown }) {
+/**
+ * Inline error: message, plus the lint list (422) or validation issues (400) when present. With
+ * `onRetry`, a Retry button: a list page whose load failed keeps its list unknown (never the empty
+ * state, which would read as "you have none") and offers to load again.
+ */
+export function ErrorBox({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   // Braces matter: newer browsers return a Promise from scrollIntoView, and React would call it as the cleanup.
   useEffect(() => {
@@ -54,12 +60,22 @@ export function ErrorBox({ error }: { error: unknown }) {
       {lint && <LintList lint={lint} />}
       {issues && (
         <ul>
-          {issues.map((i, n) => (
-            <li key={n}>
-              {i.path?.length ? <code>{i.path.join('.')}</code> : null} {i.message ?? JSON.stringify(i)}
-            </li>
-          ))}
+          {issues.map((i, n) => {
+            const at = Array.isArray(i.path) ? i.path.join('.') : i.path;
+            return (
+              <li key={n}>
+                {at ? <code>{at}</code> : null} {i.message ?? i.reason ?? JSON.stringify(i)}
+              </li>
+            );
+          })}
         </ul>
+      )}
+      {onRetry && (
+        <p>
+          <button type="button" className="btn btn-small" onClick={onRetry}>
+            Retry
+          </button>
+        </p>
       )}
     </div>
   );

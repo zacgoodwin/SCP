@@ -7,6 +7,11 @@ import { ItemCard } from '../components/ItemCard.tsx';
 
 export const PLANE_LABEL: Record<api.Plane, string> = { skill: 'Skills', md: 'Prompts & MDs', artifact: 'Artifacts' };
 export const PLANE_PATH: Record<api.Plane, string> = { skill: '/skills', md: '/mds', artifact: '/artifacts' };
+const PLANE_BLURB: Record<api.Plane, string> = {
+  skill: 'Reusable skill folders agents load on demand. Add them to a group to serve them over MCP or install them as a bundle.',
+  md: 'Prompts, agents, commands, instructions and other markdown that installs into a project.',
+  artifact: 'Self-contained HTML, markdown and other documents, previewable here and shareable by link.',
+};
 const PAGE = 50;
 
 export function ItemsListPage({ plane }: { plane: api.Plane }) {
@@ -20,6 +25,8 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
   const [error, setError] = useState<unknown>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  // Bumped when an import finished, so the first page reloads with the new items.
+  const [imported, setImported] = useState(0);
 
   // setParams closes over the params of its render, so the debounced search must call the latest
   // one or it would revert a chip/toggle clicked during the debounce window.
@@ -61,7 +68,7 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
     return () => {
       live = false;
     };
-  }, [plane, q, kind, mine]);
+  }, [plane, q, kind, mine, imported]);
 
   const loadMore = async () => {
     if (!items) return;
@@ -82,8 +89,11 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
   return (
     <div className="page">
       <header className="page-head">
-        <h1>{PLANE_LABEL[plane]}</h1>
-        <div className="row">
+        <div className="page-title">
+          <h1>{PLANE_LABEL[plane]}</h1>
+          <p className="muted">{PLANE_BLURB[plane]}</p>
+        </div>
+        <div className="page-actions">
           <button type="button" className="btn" onClick={() => setImportOpen(true)}>
             Import
           </button>
@@ -122,7 +132,10 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
       ) : items.length === 0 ? (
         <div className="empty">
           {filtered ? (
-            <p>Nothing matches these filters.</p>
+            <>
+              <p>Nothing matches these filters.</p>
+              <p className="muted">Clear the search, the kind chip or "Mine only" to see everything.</p>
+            </>
           ) : (
             <>
               <p>No {PLANE_LABEL[plane].toLowerCase()} yet.</p>
@@ -155,7 +168,7 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
           )}
         </>
       )}
-      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} plane={plane} />
+      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} onImported={() => setImported((n) => n + 1)} plane={plane} />
     </div>
   );
 }

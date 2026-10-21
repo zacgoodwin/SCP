@@ -4,6 +4,7 @@ import { loadConfig } from './config.ts';
 import { openDb, setting } from './db.ts';
 import { buildApp } from './app.ts';
 import { bootstrapAdmin } from './auth/bootstrap.ts';
+import { sweepBlobs } from './items/gc.ts';
 import type { Ctx } from './types.ts';
 
 const config = loadConfig();
@@ -15,6 +16,8 @@ if (admin?.generatedPassword) {
   console.log(`[scp] created admin '${admin.username}' with generated password: ${admin.generatedPassword}`);
   console.log('[scp] set SCP_ADMIN_PASSWORD to choose it yourself; change it after first login.');
 }
+
+console.log(`[scp] blob sweep: ${JSON.stringify(sweepBlobs(db))}`);
 
 const { app, artifactApp } = buildApp(ctx);
 const s1 = serve({ fetch: app.fetch, port: config.port, hostname: '0.0.0.0' }, (i) =>

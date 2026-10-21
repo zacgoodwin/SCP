@@ -20,6 +20,23 @@ interface CdEntry {
 
 const corrupt = (why = '') => badRequest(`not a valid zip file${why ? `: ${why}` : ''}`);
 
+/** Caps one archive is held to; `what` names the unit in the 413 ('a version', 'a pack'). */
+export interface ZipLimits {
+  files: number;
+  fileBytes: number;
+  totalBytes: number;
+  what: string;
+}
+/** One item version (lib/tree.ts LIMITS): the single-file import. */
+export const VERSION_LIMITS: ZipLimits = { ...LIMITS, what: 'a version' };
+/**
+ * A pack or repository (imports/pack.ts unpack) holds many units, each checked against LIMITS as it
+ * becomes an item (items/service.ts checkLimits), so the archive itself is bounded only by what the
+ * process can hold inflated. One file is bounded by the archive total, not a version's 10 MB: that cap
+ * is the unit's to fail (it lands in `skipped`), never a reason to refuse the whole import.
+ */
+export const PACK_LIMITS: ZipLimits = { files: 20_000, fileBytes: 64 * MB, totalBytes: 64 * MB, what: 'a pack' };
+
 const utf8Strict = new TextDecoder('utf-8', { fatal: true });
 const CP437_HIGH =
   'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
@@ -40,9 +57,10 @@ function entryName(raw: Uint8Array, flags: number): string {
 
 /**
  * Read the central directory ourselves for modes, entry types, sizes, CRCs and path validation.
- * Runs before anything is inflated.
+ * Runs before anything is inflated. With `keep`, entries it declines are skipped here, before they
+ * are validated, counted or sized: a GitHub zipball of a whole repository imports one folder.
  */
-function centralDirectory(u8: Uint8Array): CdEntry[] {
+function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | undefined, limits: ZipLimits): CdEntry[] {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   let e = u8.length - 22;
   for (; e >= 0 && dv.getUint32(e, true) !== 0x06054b50; e--) if (u8.length - e > 22 + 0xffff) throw corrupt();
@@ -50,7 +68,7 @@ function centralDirectory(u8: Uint8Array): CdEntry[] {
   const count = dv.getUint16(e + 10, true);
   let o = dv.getUint32(e + 16, true);
   if (count === 0xffff || o === 0xffffffff) throw badRequest('zip64 archives are not supported');
-  if (count > LIMITS.files * 2) throw tooLarge(`at most ${LIMITS.files} files per version`);
+  if (!keep && count > limits.files * 2) throw tooLarge(`${limits.what} is limited to ${limits.files} files`);
   const out: CdEntry[] = [];
   const seen = new Set<string>();
   for (let i = 0; i < count; i++) {
@@ -59,8 +77,13 @@ function centralDirectory(u8: Uint8Array): CdEntry[] {
     const flags = dv.getUint16(o + 8, true);
     const nameLen = dv.getUint16(o + 28, true);
     if (o + 46 + nameLen > u8.length) throw corrupt();
+    const next = o + 46 + nameLen + dv.getUint16(o + 30, true) + dv.getUint16(o + 32, true);
     const raw = u8.subarray(o + 46, o + 46 + nameLen);
     const name = entryName(raw, flags);
+    if (keep && !keep(name)) {
+      o = next;
+      continue;
+    }
     const attr = dv.getUint32(o + 38, true);
     const mode = os === 3 ? attr >>> 16 : 0;
     const type = mode & 0o170000;
@@ -81,7 +104,7 @@ function centralDirectory(u8: Uint8Array): CdEntry[] {
       size: dv.getUint32(o + 24, true),
       localOffset: dv.getUint32(o + 42, true),
     });
-    o += 46 + nameLen + dv.getUint16(o + 30, true) + dv.getUint16(o + 32, true);
+    o = next;
   }
   return out;
 }
@@ -90,17 +113,18 @@ function centralDirectory(u8: Uint8Array): CdEntry[] {
  * Unzip an untrusted archive: validated paths, no symlinks, size/count/ratio caps before inflating.
  * The declared size is enforced while inflating (maxOutputLength) and the output must match it and
  * the CRC, so a lying header can neither burn CPU on a huge stream nor store a truncated file.
+ * `keep(name)` picks the entries; the caps (`limits`, one version's by default) then apply to those alone (centralDirectory).
  */
-export function safeUnzip(bytes: Uint8Array): TreeFile[] {
+export function safeUnzip(bytes: Uint8Array, keep?: (name: string) => boolean, limits: ZipLimits = VERSION_LIMITS): TreeFile[] {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let files = 0;
   let total = 0;
   const spans: { e: CdEntry; start: number; end: number; o: number }[] = [];
-  for (const e of centralDirectory(bytes)) {
+  for (const e of centralDirectory(bytes, keep, limits)) {
     if (e.isDir) continue;
-    if (++files > LIMITS.files) throw tooLarge(`at most ${LIMITS.files} files per version`);
-    if (e.size > LIMITS.fileBytes) throw tooLarge(`'${e.name}' is over 10 MB`);
-    if ((total += e.size) > LIMITS.totalBytes) throw tooLarge('a version is limited to 30 MB uncompressed');
+    if (++files > limits.files) throw tooLarge(`${limits.what} is limited to ${limits.files} files`);
+    if (e.size > limits.fileBytes) throw tooLarge(`'${e.name}' is over ${limits.fileBytes / MB} MB`);
+    if ((total += e.size) > limits.totalBytes) throw tooLarge(`${limits.what} is limited to ${limits.totalBytes / MB} MB uncompressed`);
     if (e.size > MB && e.size > 100 * e.compressedSize) throw tooLarge(`'${e.name}' compresses over 100:1`);
     if (e.flags & 0x1) throw badRequest(`'${e.name}' is encrypted`);
     const o = e.localOffset;
@@ -128,14 +152,19 @@ export function safeUnzip(bytes: Uint8Array): TreeFile[] {
       }
     } else throw badRequest(`'${e.name}' uses unsupported compression method ${e.method}`);
     if (data.length !== e.size || crc32(data) !== e.crc) throw corrupt(`'${e.name}' fails its size or CRC check`);
-    out.push({ path: e.name, bytes: new Uint8Array(data), mode: e.mode });
+    // A stored entry is a view into the whole upload, which it would keep alive, so it is copied out; an
+    // inflated one is already its own memory and only needs the plain Uint8Array prototype.
+    out.push({ path: e.name, bytes: e.method === 0 ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength), mode: e.mode });
   }
   return out;
 }
 
-/** Deflated zip with unix modes in the external attributes, so `unzip` restores exec bits. */
-export function buildZip(files: TreeFile[]): Uint8Array {
+/**
+ * Deflated zip with unix modes in the external attributes, so `unzip` restores exec bits. Entries
+ * are stamped "now" unless `mtime` fixes them (deterministic bytes for a content hash).
+ */
+export function buildZip(files: TreeFile[], opts: { mtime?: Date } = {}): Uint8Array {
   const tree: Zippable = Object.create(null);
-  for (const f of files) tree[f.path] = [f.bytes, { os: 3, attrs: ((0o100000 | f.mode) << 16) >>> 0 }];
+  for (const f of files) tree[f.path] = [f.bytes, { os: 3, attrs: ((0o100000 | f.mode) << 16) >>> 0, ...(opts.mtime ? { mtime: opts.mtime } : {}) }];
   return zipSync(tree, { level: 6 });
 }

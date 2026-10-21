@@ -1,11 +1,12 @@
 import { now, type Db } from '../db.ts';
+import { sha256Hex } from '../lib/crypto.ts';
 import { HttpError, badRequest } from '../lib/http.ts';
 import { pathKey } from '../lib/paths.ts';
 import { buildZip } from '../lib/zip.ts';
 import type { TreeFile } from '../lib/tree.ts';
 import { itemSummary, listFiles, readTree } from '../items/service.ts';
 import { MAX_GROUP_FILES, resolvedMembers, type ResolvedMember } from './service.ts';
-import { planeOf, type GroupRow, type Kind, type Plane, type Principal } from '../types.ts';
+import { planeOf, type GroupRow, type ItemRow, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
 
 const MB = 1024 * 1024;
 /** Uncompressed bytes per bundle.zip: it is built in memory (~5x that in RSS) on the request thread. */
@@ -147,8 +148,14 @@ export function findConflicts(entries: PathEntry[], focus?: ReadonlySet<string>)
   return [...out.values()];
 }
 
+/** findConflicts lists each name once, so two owners' items with one name are "two members named". */
 export const pathConflict = (c: Conflict) =>
-  new HttpError(409, 'path_conflict', `${c.items.map((n) => `'${n}'`).join(' and ')} both install to '${c.path}'`, c);
+  new HttpError(
+    409,
+    'path_conflict',
+    c.items.length === 1 ? `two members named '${c.items[0]}' install to '${c.path}'` : `${c.items.map((n) => `'${n}'`).join(' and ')} both install to '${c.path}'`,
+    c,
+  );
 
 export interface ManifestItem {
   id: string;
@@ -163,13 +170,26 @@ export interface ManifestItem {
   owner: string;
 }
 
+/** Why a download cannot be built (`code` is the HttpError code it would answer with: group_full, bundle_too_large, path_conflict), or ok. */
+export interface BuildProblem {
+  ok: boolean;
+  problem: string | null;
+  code: string | null;
+}
+
 export interface Manifest {
   group: { slug: string; name: string; description: string; instructions: string; updatedAt: string };
   target: Target;
   scope: InstallScope;
   items: ManifestItem[];
   conflicts: Conflict[];
+  /** Whether plugin.zip builds (and the marketplace lists the group), else the refusal buildPlugin would answer with. */
+  plugin: BuildProblem;
+  /** Whether bundle.zip builds for this target and scope, else the refusal buildBundle would answer with. */
+  bundle: BuildProblem;
 }
+
+const asProblem = (e: HttpError | null): BuildProblem => ({ ok: e === null, problem: e && e.message, code: e && e.code });
 
 interface Placed {
   member: ResolvedMember;
@@ -178,34 +198,55 @@ interface Placed {
   owner: string;
 }
 
-function place(db: Db, p: Principal, group: GroupRow, opts: InstallOpts): Placed[] {
+/** Files across these versions, in one statement; MAX_GROUP_FILES is checked against it on read and on the owner's writes (service.ts). */
+export function fileCount(db: Db, versionIds: string[]): number {
+  return (db.prepare('SELECT COUNT(*) AS n FROM version_files WHERE version_id IN (SELECT value FROM json_each(?))').get(JSON.stringify(versionIds)) as { n: number }).n;
+}
+
+const groupFull = (n: number) => new HttpError(400, 'group_full', `this group's members hold ${n} files; groups are limited to ${MAX_GROUP_FILES}`);
+
+function place(db: Db, p: Principal, group: GroupRow, opts: InstallOpts): { placed: Placed[]; files: number } {
   checkInstallOpts(opts);
   const members = resolvedMembers(db, p, group);
   // Member adds enforce the cap, but unpinned members follow their latest version, which can grow
   // past it later; count before listing (and conflict-checking) every file of every member.
-  const { n } = db
-    .prepare('SELECT COUNT(*) AS n FROM version_files WHERE version_id IN (SELECT value FROM json_each(?))')
-    .get(JSON.stringify(members.map((m) => m.version.id))) as { n: number };
-  if (n > MAX_GROUP_FILES) throw new HttpError(400, 'group_full', `this group's members hold ${n} files; groups are limited to ${MAX_GROUP_FILES}`);
-  return members.map((m) => {
+  const files = fileCount(db, members.map((m) => m.version.id));
+  if (files > MAX_GROUP_FILES) throw groupFull(files);
+  const placed = members.map((m) => {
     const o = { ...opts, installAs: m.installAs };
-    const files = listFiles(db, m.version.id).map((f) => f.path);
+    const paths = listFiles(db, m.version.id).map((f) => f.path);
     return {
       member: m,
       path: installPath(m.item.kind, m.item.name, m.version.entry_path, o),
-      paths: footprint(m.item.kind, m.item.name, m.version.entry_path, files, o),
+      paths: footprint(m.item.kind, m.item.name, m.version.entry_path, paths, o),
       owner: itemSummary(db, m.item).owner.username,
     };
   });
+  return { placed, files };
 }
 
 const placedConflicts = (placed: Placed[]) =>
   findConflicts(placed.flatMap((x) => x.paths.map((path) => ({ path, name: x.member.item.name, id: x.member.item.id }))));
 
+const totalBytes = (members: PluginMember[]) => members.reduce((n, m) => n + m.version.total_bytes, 0);
+
+const tooLargeBundle = (total: number) =>
+  new HttpError(413, 'bundle_too_large', `this group is ${Math.ceil(total / MB)} MB uncompressed; bundles are limited to ${MAX_BUNDLE_BYTES / MB} MB`);
+
+/** The error buildBundle throws for what place() returned, or null: the size cap, then the first conflict. */
+function bundleProblem(placed: Placed[], conflicts: Conflict[]): HttpError | null {
+  const total = totalBytes(placed.map((x) => x.member));
+  if (total > MAX_BUNDLE_BYTES) return tooLargeBundle(total);
+  return conflicts[0] ? pathConflict(conflicts[0]) : null;
+}
+
 /** Catalog for agents: what the group holds and where each piece installs. No file bodies. */
 export function buildManifest(db: Db, p: Principal, group: GroupRow, opts: { target: Target; scope: InstallScope }): Manifest {
-  const placed = place(db, p, group, opts);
+  const { placed, files } = place(db, p, group, opts);
+  const conflicts = placedConflicts(placed);
   return {
+    plugin: asProblem(pluginProblem(placed.map((x) => x.member), files)),
+    bundle: asProblem(bundleProblem(placed, conflicts)),
     group: { slug: group.slug, name: group.name, description: group.description, instructions: group.instructions, updatedAt: group.updated_at },
     target: opts.target,
     scope: opts.scope,
@@ -221,7 +262,7 @@ export function buildManifest(db: Db, p: Principal, group: GroupRow, opts: { tar
       installPath: path,
       owner,
     })),
-    conflicts: placedConflicts(placed),
+    conflicts,
   };
 }
 
@@ -259,14 +300,11 @@ export function buildBundle(
   group: GroupRow,
   opts: { target: Target; scope: InstallScope; publicUrl: string },
 ): { zip: Uint8Array; lock: LockFile } {
-  const placed = place(db, p, group, opts);
+  const { placed } = place(db, p, group, opts);
   // Blobs are deduplicated, so N members sharing one large blob cost one copy on disk but N in the zip.
-  const total = placed.reduce((n, x) => n + x.member.version.total_bytes, 0);
-  if (total > MAX_BUNDLE_BYTES) {
-    throw new HttpError(413, 'bundle_too_large', `this group is ${Math.ceil(total / MB)} MB uncompressed; bundles are limited to ${MAX_BUNDLE_BYTES / MB} MB`);
-  }
-  const conflicts = placedConflicts(placed);
-  if (conflicts.length) throw pathConflict(conflicts[0]);
+  // Refuses exactly what the manifest reports as `bundle`, before any tree is read.
+  const problem = bundleProblem(placed, placedConflicts(placed));
+  if (problem) throw problem;
   const files: TreeFile[] = [];
   const owners = new Map<string, string>(); // file path -> member name
   const folders = new Map<string, string>(); // every folder some file sits in -> member name
@@ -310,6 +348,105 @@ export function buildBundle(
   return { zip: buildZip(files), lock };
 }
 
+// ---------- Claude Code plugin (docs/research/formats.md 3, PLAN-v2 D5) ----------
+
+/** DOS zip epoch, in local time: fflate stamps entries from local getters, so these bytes are the same in every TZ. */
+const PLUGIN_MTIME = new Date(1980, 0, 1);
+
+/** Where a member lands in a plugin: Claude Code's component folders; every other kind under docs/. */
+export function pluginPath(kind: Kind, name: string): string {
+  switch (kind) {
+    case 'skill':
+      return `skills/${name}/`;
+    case 'agent':
+      return `agents/${name}.md`;
+    case 'command':
+      return `commands/${name}.md`;
+    default:
+      return `docs/${kind}/${name}/`;
+  }
+}
+
+/** What listing a group as a plugin reads of a member (service.ts pluginMembers); a ResolvedMember is one. */
+export interface PluginMember {
+  item: Pick<ItemRow, 'id' | 'kind' | 'name'>;
+  version: Pick<VersionRow, 'total_bytes' | 'created_at'>;
+}
+
+/**
+ * `<yyyymmdd>.<hhmmssmmm>` (UTC) of the latest change: the newest member version, or the group row,
+ * which every membership, pin and include change touches, inside an included group too (service.ts
+ * touch walks up the includes). A clock, not a sum of version numbers, so pinning a member back or
+ * swapping one still climbs, and two different trees never share a version.
+ */
+export function pluginVersion(group: GroupRow, members: PluginMember[]): string {
+  const latest = members.reduce((d, m) => (m.version.created_at > d ? m.version.created_at : d), group.updated_at);
+  return `${latest.slice(0, 10).replaceAll('-', '')}.${latest.slice(11, 23).replace(/[:.]/g, '')}`;
+}
+
+/**
+ * Members at one plugin path. pluginPath is kind and name alone (installAs does not apply, extras
+ * stay under docs/<kind>/<name>/), so this is two members of one kind with the same name as pathKey
+ * sees it, which two owners can produce; the folder is the unit, whatever files are in it.
+ */
+export const pluginConflicts = (members: PluginMember[]): Conflict[] =>
+  findConflicts(members.map(({ item }) => ({ path: pluginPath(item.kind, item.name), name: item.name, id: item.id })));
+
+/**
+ * The error buildPlugin throws for these members (holding `files` across their versions), or null,
+ * without reading a file: the files cap place() applies to every other download, the size cap, then
+ * pluginConflicts. The marketplace lists a group exactly when this is null, and the manifest reports
+ * it as `plugin`, so listing, manifest and builder agree.
+ */
+export function pluginProblem(members: PluginMember[], files: number): HttpError | null {
+  if (files > MAX_GROUP_FILES) return groupFull(files);
+  const total = totalBytes(members);
+  if (total > MAX_BUNDLE_BYTES) return tooLargeBundle(total);
+  const [c] = pluginConflicts(members);
+  return c ? pathConflict(c) : null;
+}
+
+export interface PluginBuild {
+  zip: Uint8Array;
+  sha256: string;
+  version: string;
+  items: number;
+}
+
+/**
+ * plugin.zip for a group: `.claude-plugin/plugin.json`, components at pluginPath, and `.mcp.json`
+ * pointing at the group's MCP endpoint with `token` as the bearer. Deterministic bytes for one
+ * effective tree (sorted entries, fixed mtime), so the marketplace sha256 is stable. installAs does
+ * not apply: the layout is Claude Code's. Refuses exactly what pluginProblem reports; `add` below is
+ * the last line of defence for every file written, SCP's own included.
+ */
+export function buildPlugin(db: Db, group: GroupRow, members: ResolvedMember[], opts: { publicUrl: string; token: string }): PluginBuild {
+  const problem = pluginProblem(members, fileCount(db, members.map((m) => m.version.id)));
+  if (problem) throw problem;
+  const files: TreeFile[] = [];
+  const owners = new Map<string, string>(); // pathKey -> member name
+  const add = (f: TreeFile, name: string) => {
+    const key = pathKey(f.path);
+    if (key.split('/').includes('.git')) throw badRequest(`'${name}' would write into .git ('${f.path}')`);
+    const prev = owners.get(key);
+    if (prev !== undefined) throw pathConflict({ path: f.path, items: [prev, name] });
+    owners.set(key, name);
+    files.push(f);
+  };
+  for (const { item, version } of members) {
+    const at = pluginPath(item.kind, item.name);
+    for (const f of placeTree(at, version.entry_path, readTree(db, version.id), `docs/${item.kind}/${item.name}/`)) add(f, item.name);
+  }
+  const version = pluginVersion(group, members);
+  const json = (v: unknown) => enc(JSON.stringify(v, null, 2) + '\n');
+  add({ path: '.claude-plugin/plugin.json', bytes: json({ name: group.slug, version, description: group.description }), mode: 420 }, 'scp');
+  const server = { type: 'http', url: `${opts.publicUrl}/mcp/${group.slug}`, headers: { Authorization: `Bearer ${opts.token}` } };
+  add({ path: '.mcp.json', bytes: json({ mcpServers: { [`scp-${group.slug}`]: server } }), mode: 420 }, 'scp');
+  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const zip = buildZip(files, { mtime: PLUGIN_MTIME });
+  return { zip, sha256: sha256Hex(zip), version, items: members.length };
+}
+
 const cell = (s: string) => s.replace(/\|/g, '\\|').replace(/\r\n|\r|\n/g, '<br>');
 const SECTIONS: [Plane, string][] = [
   ['skill', 'Skills'],
@@ -319,7 +456,7 @@ const SECTIONS: [Plane, string][] = [
 
 /** Roster in the AIBootstrap table style; one row per readable member, full descriptions. */
 export function catalogMarkdown(db: Db, p: Principal, group: GroupRow): string {
-  const placed = place(db, p, group, { target: 'claude-code', scope: 'project' });
+  const { placed } = place(db, p, group, { target: 'claude-code', scope: 'project' });
   const out = [`# ${group.name.replace(/\s+/g, ' ')}`, ''];
   if (group.description.trim()) out.push(group.description.trim(), '');
   for (const [plane, heading] of SECTIONS) {

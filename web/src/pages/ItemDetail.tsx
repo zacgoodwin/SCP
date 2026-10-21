@@ -1,11 +1,13 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
 import * as api from '../api.ts';
+import * as imp from '../api-import.ts';
 import { ArtifactPreview } from '../components/ArtifactPreview.tsx';
 import { CopyBlock } from '../components/CopyBlock.tsx';
 import { ErrorBox, LintList } from '../components/ErrorBox.tsx';
 import { FilesEditor } from '../components/FilesEditor.tsx';
 import { KindBadges } from '../components/ItemCard.tsx';
+import { Tabs } from '../components/Tabs.tsx';
 import { useToast } from '../components/Toast.tsx';
 import { bytes, dateTime, decodeText, parseTags, timeAgo, toBase64 } from '../format.ts';
 import { MULTI_FILE_KINDS } from '../templates.ts';
@@ -136,7 +138,7 @@ function ItemView({ id }: { id: string }) {
         <Link to={PLANE_PATH[item.plane]}>{PLANE_LABEL[item.plane]}</Link> / {item.name}
       </nav>
       <header className="page-head">
-        <div className="stack-tight">
+        <div className="page-title">
           <h1>{item.title || item.name}</h1>
           <p className="row wrap">
             <KindBadges item={item} />
@@ -146,7 +148,7 @@ function ItemView({ id }: { id: string }) {
             </span>
           </p>
         </div>
-        <div className="row wrap">
+        <div className="page-actions">
           <label className="field inline">
             <span>Version</span>
             <select value={seq} onChange={(e) => selectVersion(Number(e.target.value))}>
@@ -201,13 +203,22 @@ function ItemView({ id }: { id: string }) {
         </section>
       )}
 
-      <div className="tabs" role="tablist" aria-label="Item sections">
-        {tabs.map(([t, label]) => (
-          <button key={t} type="button" role="tab" id={`tab-${t}`} aria-selected={tab === t} aria-controls="tab-panel" className="tab" onClick={() => setTab(t)}>
-            {label}
-          </button>
-        ))}
-      </div>
+      {item.source && (
+        <SourcePanel
+          item={item}
+          source={item.source}
+          onUpdated={(next) => {
+            setItem(next);
+            selectVersion(next.latestSeq, next.latestSeq);
+            setTab('files');
+            void loadVersions();
+            toast(`Updated to v${next.latestSeq} from GitHub.`, 'ok');
+          }}
+          onRepinned={setItem}
+        />
+      )}
+
+      <Tabs tabs={tabs} value={tab} onChange={setTab} label="Item sections" idPrefix="tab" panelId="tab-panel" />
       <section id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="tab-panel">
         {!version ? (
           <p className="muted" role="status">Loading version…</p>
@@ -304,6 +315,96 @@ function MetaEditor({ item, onSaved, onCancel }: { item: api.ItemDetail; onSaved
         </button>
       </div>
     </form>
+  );
+}
+
+/** Import provenance (D1): where the item came from, and for GitHub sources the check/update flow. */
+function SourcePanel({
+  item,
+  source: s,
+  onUpdated,
+  onRepinned,
+}: {
+  item: api.ItemDetail;
+  source: api.ItemSource;
+  onUpdated: (i: api.ItemDetail) => void;
+  /** Same item, new pinned commit, no new version. */
+  onRepinned: (i: api.ItemDetail) => void;
+}) {
+  const [check, setCheck] = useState<imp.SourceCheck | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const url = imp.sourceUrl(s);
+  const short = (sha: string) => sha.slice(0, 7);
+
+  const run = (fn: () => Promise<void>) => async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setError(imp.importErrorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const doCheck = run(async () => setCheck(await imp.checkSource(item.id)));
+  const doUpdate = run(async () => {
+    try {
+      const r = await imp.updateSource(item.id);
+      setCheck(null);
+      onUpdated(r.item);
+    } catch (e) {
+      if (!(e instanceof api.ApiError && e.code === 'up_to_date')) throw e;
+      // The tree matched, so the server only re-pinned the commit: reload the panel, or it keeps
+      // showing the old sha next to "New commit … upstream" and an "Update to latest" that 409s again.
+      setCheck(null);
+      onRepinned((await api.getItem(item.id)).item);
+      setError(imp.importErrorMessage(e));
+    }
+  });
+
+  return (
+    <section className="card stack-tight" aria-label="Source">
+      <div className="row wrap">
+        <strong>Source</strong>
+        <span className="badge">{s.kind}</span>
+        {s.repo && (url ? <a href={url} target="_blank" rel="noreferrer noopener">{s.repo}</a> : <code>{s.repo}</code>)}
+        {s.path && <code className="muted">{s.path}</code>}
+        {s.ref && <span className="muted">ref {s.ref}</span>}
+        {s.commit && (
+          <code className="muted" title={s.commit}>
+            {s.kind === 'github' ? '@' : 'sha256 '}
+            {short(s.commit)}
+          </code>
+        )}
+      </div>
+      {s.kind === 'github' && item.canEdit && (
+        <div className="row wrap">
+          <button type="button" className="btn btn-small" disabled={busy} onClick={doCheck}>
+            {busy && !check ? 'Checking…' : 'Check for updates'}
+          </button>
+          {check &&
+            (check.upToDate ? (
+              <span className="muted" role="status">Up to date.</span>
+            ) : (
+              <>
+                <span role="status">
+                  New commit <code title={check.latestCommit}>{short(check.latestCommit)}</code> upstream.
+                </span>
+                <button type="button" className="btn btn-small btn-primary" disabled={busy} onClick={doUpdate}>
+                  {busy ? 'Updating…' : 'Update to latest'}
+                </button>
+              </>
+            ))}
+          {error && (
+            <span className="muted" role="alert">
+              {error}
+            </span>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -470,7 +571,7 @@ function VersionsTab({ versions, current, onSelect }: { versions: api.VersionSum
             <th scope="col">Note</th>
             <th scope="col">Created</th>
             <th scope="col">By</th>
-            <th scope="col">
+            <th scope="col" className="cell-actions">
               <span className="sr-only">Actions</span>
             </th>
           </tr>
@@ -485,8 +586,9 @@ function VersionsTab({ versions, current, onSelect }: { versions: api.VersionSum
                   {timeAgo(v.createdAt)}
                 </time>
               </td>
-              <td className="muted">{v.createdBy?.keyId ? `API key ${v.createdBy.keyId.slice(-6)}` : 'web'}</td>
-              <td>
+              {/* The actor, as Activity shows it: a connected app (its client id), an API key, or the browser. */}
+              <td className="muted">{v.createdBy?.clientId ? `app …${v.createdBy.clientId.slice(-6)}` : v.createdBy?.keyId ? `API key ${v.createdBy.keyId.slice(-6)}` : 'web'}</td>
+              <td className="cell-actions">
                 <button type="button" className="btn btn-small" disabled={v.seq === current} onClick={() => onSelect(v.seq)}>
                   {v.seq === current ? 'Viewing' : 'View'}
                 </button>
@@ -598,11 +700,10 @@ function GroupsTab({ item }: { item: api.ItemDetail }) {
     return (
       <div className="empty">
         <p>Not in any group yet.</p>
-        <p>
-          <Link className="btn" to="/groups">
-            Open groups to add it
-          </Link>
-        </p>
+        <p className="muted">Open a group you own and add this item from its "Add items" panel to serve it over MCP or in a bundle.</p>
+        <Link className="btn btn-primary" to="/groups">
+          Open groups
+        </Link>
       </div>
     );
   }

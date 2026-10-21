@@ -40,7 +40,9 @@ const LIST_PAGE = 50;
 const FILE_INDEX_MAX = 100;
 
 /**
- * Claude Code hands the model structuredContent instead of content when both are present, so
+ * Claude Code hands the model structuredContent instead of content when both are present (verified
+ * 2026-10-20 against Claude Code 2.1.247 with a probe tool whose two channels carried different
+ * markers: only the structured one reached the model; Kata sfxv), so
  * structuredContent carries everything the text does: data fields (the body chunk as `text`, lists,
  * `next` for paging) plus `message`. message is the whole text by default; tools whose structured
  * fields already carry the bulk pass a short message (summary, links, paging note) so nothing is sent twice.
@@ -97,6 +99,12 @@ export function registerTools(server: McpServer, s: McpScope): void {
     ? `Optional; this endpoint already serves group '${s.group.slug}'.`
     : 'Group slug. Required with name on the global endpoint.';
   const itemUrl = (itemId: string) => `${config.publicUrl}/items/${itemId}`;
+  // OAuth tokens work on /mcp only (oauth/tokens.ts): a hosted client must not be told to reuse this
+  // connection's credential on an /api/v1 download URL, where it is refused as an invalid API key.
+  const viaOauth = p.via === 'oauth';
+  const withKey = viaOauth
+    ? `with an SCP API key minted on ${config.publicUrl}/keys (Authorization: Bearer <key>; this connection's OAuth token is not accepted there)`
+    : 'with the API key (Authorization: Bearer)';
 
   /** Audit, run, and turn HttpErrors into tool errors the agent can read. */
   function add<S extends z.ZodRawShape>(
@@ -352,12 +360,10 @@ export function registerTools(server: McpServer, s: McpScope): void {
       }
       const http = `${config.publicUrl}/api/v1/items/${item.id}/files/${encodedPath}?version=${v.seq}`;
       if (f.bytes.length > BINARY_MAX) {
-        return fail(
-          `${a.path} is a ${fmtBytes(f.bytes.length)} binary file; over MCP binary files are capped at ${fmtBytes(BINARY_MAX)}. Download it with the API key (Authorization: Bearer): ${http}`,
-        );
+        return fail(`${a.path} is a ${fmtBytes(f.bytes.length)} binary file; over MCP binary files are capped at ${fmtBytes(BINARY_MAX)}. Download it ${withKey}: ${http}`);
       }
       const b64 = Buffer.from(f.bytes).toString('base64');
-      const head = `${item.name}/${a.path} is binary (${fmtBytes(f.bytes.length)}). Base64 below; decode it before writing to disk, or download it from ${http}`;
+      const head = `${item.name}/${a.path} is binary (${fmtBytes(f.bytes.length)}). Base64 below; decode it before writing to disk, or download it ${withKey} from ${http}`;
       return ok(`${head}\n\n${b64}`, { ...base, encoding: 'base64', base64: b64, url: http, message: head.replace('below', 'in `base64`') });
     },
   );
@@ -555,14 +561,16 @@ export function registerTools(server: McpServer, s: McpScope): void {
       const powershell = `Invoke-WebRequest -Headers @{ Authorization = "Bearer $env:SCP_KEY" } -Uri "${url}" -OutFile ${file}; Expand-Archive -Force ${file} -DestinationPath .`;
       const where = scope === 'user' ? 'your home directory' : 'the project root';
       const conflicts = m.conflicts.slice(0, 20).map((x) => ({ path: x.path, items: x.items.slice(0, 10) }));
+      const summary = `Bundle for group '${g.slug}' (${target}, ${scope} scope): ${m.items.length} item(s).`;
+      // The $SCP_KEY commands presume an API key; an OAuth connection may be the user's only credential, so name what the URL needs instead.
+      const commands = viaOauth
+        ? [
+            `${summary} Download URL: ${url}`,
+            `This connection is an OAuth token, which that URL does not accept: fetch it ${withKey}, then unzip the file in ${where}; or install the group as a Claude Code plugin from its Plugin tab.`,
+          ]
+        : [`${summary} Run from ${where}, with SCP_KEY set to your SCP API key:`, '', 'bash:', bash, '', 'PowerShell:', powershell];
       const text = [
-        `Bundle for group '${g.slug}' (${target}, ${scope} scope): ${m.items.length} item(s). Run from ${where}, with SCP_KEY set to your SCP API key:`,
-        '',
-        'bash:',
-        bash,
-        '',
-        'PowerShell:',
-        powershell,
+        ...commands,
         '',
         'Installs:',
         ...m.items.slice(0, LIST_PAGE).map((i) => `- ${i.installPath} (${i.kind} ${i.name} v${i.version})`),
@@ -572,7 +580,7 @@ export function registerTools(server: McpServer, s: McpScope): void {
           ? ['', `Warning: install path conflicts (the download will fail until fixed): ${conflicts.map((x) => `${x.path} <- ${x.items.join(', ')}`).join('; ')}${m.conflicts.length > conflicts.length ? `; and ${m.conflicts.length - conflicts.length} more` : ''}`]
           : []),
       ].join('\n');
-      return ok(text, { group: g.slug, url, target, scope, items: m.items.length, bash, powershell, conflicts, conflictCount: m.conflicts.length });
+      return ok(text, { group: g.slug, url, target, scope, items: m.items.length, ...(viaOauth ? {} : { bash, powershell }), conflicts, conflictCount: m.conflicts.length });
     },
   );
 

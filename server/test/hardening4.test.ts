@@ -137,6 +137,11 @@ test('GET /groups is paged in SQL, own groups first, with a total', async () => 
   const mine = await t.req('GET', `${API}/groups?owner=me`, { headers: ha });
   assert.deepEqual(mine.json.groups.map((g: { slug: string }) => g.slug), ['mine']);
   assert.equal(mine.json.total, 1);
+  // The dashboard's "Shared with you": other users' readable groups, never buried under the caller's own.
+  const others = await t.req('GET', `${API}/groups?owner=others&limit=200`, { headers: ha });
+  assert.equal(others.json.total, 70);
+  assert.ok(!others.json.groups.some((g: { slug: string }) => g.slug === 'mine'));
+  assert.equal(others.json.groups.length, 70);
   assert.equal((await t.req('GET', `${API}/groups?limit=201`, { headers: ha })).status, 400);
 });
 

@@ -134,7 +134,9 @@ already has `read` and read routes need no per-route scope check.
   member of a readable group. A restricted key sees only its groups' contents (full containment).
 - Item editable: (owner or admin) AND scope `write` AND groupIds null-or-the-item-is-in-an-allowed-group.
 - Reading a group grants read of its members: adding an item to a group publishes it to the group's audience.
-- Only items the actor can read can be added to a group.
+- Only items the actor can read can be added to a group, and a group only republishes what its owner
+  could publish: their own items or public ones (400 `item_not_shareable`). The same rule applies to
+  included groups (v2 D5): a group shared with the owner by name is theirs to read, not to republish.
 - Unknown or unreadable resources return 404, never 403 (no existence leak). 403 only when the
   actor can read but lacks write. One exception: group slugs are one global namespace, so
   `POST /groups` answers 409 `slug_taken` for a slug another user holds, private or not.

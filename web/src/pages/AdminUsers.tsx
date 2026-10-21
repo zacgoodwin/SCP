@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
 import * as api from '../api.ts';
+import { unlinkUserOidc, updateUserAccount } from '../api-admin.ts';
 import { useUser } from '../auth.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
 import { Modal } from '../components/Modal.tsx';
@@ -32,11 +33,26 @@ function UsersAdmin({ meId }: { meId: string }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [resetFor, setResetFor] = useState<api.User | null>(null);
+  /** Inline edit of one row's username/email (D4). */
+  const [edit, setEdit] = useState<{ id: string; username: string; email: string } | null>(null);
 
-  const load = () => api.listUsers().then((r) => setUsers(r.users), (e) => (setError(e), setUsers([])));
+  // A failed load keeps the list unknown (null), never "0 accounts on this instance".
+  const load = () => (setError(null), api.listUsers().then((r) => setUsers(r.users), setError));
   useEffect(() => void load(), []);
 
   const replace = (u: api.User) => setUsers((list) => list?.map((x) => (x.id === u.id ? u : x)) ?? null);
+  const saveEdit = (u: api.User, e: FormEvent) => {
+    e.preventDefault();
+    if (!edit) return;
+    const patch: { username?: string; email?: string } = {};
+    if (edit.username.trim() !== u.username) patch.username = edit.username.trim();
+    if (edit.email.trim() !== u.email) patch.email = edit.email.trim();
+    if (!Object.keys(patch).length) return setEdit(null);
+    void act(u, async () => {
+      replace((await updateUserAccount(u.id, patch)).user);
+      setEdit(null);
+    }, `Updated ${u.username}.`);
+  };
   // 409s (last admin, yourself) come back as readable messages; show them as-is.
   const act = async (u: api.User, fn: () => Promise<void>, done: string) => {
     setBusy(u.id);
@@ -62,14 +78,22 @@ function UsersAdmin({ meId }: { meId: string }) {
   return (
     <div className="page">
       <header className="page-head">
-        <h1>Users</h1>
-        <button type="button" className="btn btn-primary" onClick={() => setCreateOpen(true)}>
-          New user
-        </button>
+        <div className="page-title">
+          <p className="eyebrow">Admin</p>
+          <h1>Users</h1>
+          <p className="muted">
+            {users ? `${users.length} account${users.length === 1 ? '' : 's'} on this instance. ` : ''}Admins manage every user, group and setting.
+          </p>
+        </div>
+        <div className="page-actions">
+          <button type="button" className="btn btn-primary" onClick={() => setCreateOpen(true)}>
+            New user
+          </button>
+        </div>
       </header>
-      <ErrorBox error={error} />
+      <ErrorBox error={error} onRetry={() => void load()} />
       {users === null ? (
-        <p className="muted" role="status">Loading…</p>
+        error ? null : <p className="muted" role="status">Loading…</p>
       ) : (
         <div className="table-wrap">
           <table className="table">
@@ -80,7 +104,7 @@ function UsersAdmin({ meId }: { meId: string }) {
                 <th scope="col">Role</th>
                 <th scope="col">Status</th>
                 <th scope="col">Created</th>
-                <th scope="col">
+                <th scope="col" className="cell-actions">
                   <span className="sr-only">Actions</span>
                 </th>
               </tr>
@@ -88,20 +112,76 @@ function UsersAdmin({ meId }: { meId: string }) {
             <tbody>
               {users.map((u) => (
                 <tr key={u.id} aria-current={u.id === meId}>
-                  <td>
-                    {u.username}
-                    {u.id === meId && <span className="muted"> (you)</span>}
-                  </td>
-                  <td>{u.email}</td>
+                  {edit?.id === u.id ? (
+                    <>
+                      <td>
+                        <form id={`edit-${u.id}`} className="cell-edit" onSubmit={(e) => saveEdit(u, e)}>
+                          <input
+                            aria-label="Username"
+                            required
+                            autoFocus
+                            autoComplete="off"
+                            pattern="[a-z0-9][a-z0-9_\-]{1,31}"
+                            title="2-32 chars: lowercase letters, digits, - and _"
+                            value={edit.username}
+                            onChange={(e) => setEdit({ ...edit, username: e.target.value.toLowerCase() })}
+                          />
+                        </form>
+                      </td>
+                      <td>
+                        <div className="cell-edit">
+                          <input
+                            form={`edit-${u.id}`}
+                            aria-label="Email"
+                            type="email"
+                            required
+                            autoComplete="off"
+                            value={edit.email}
+                            onChange={(e) => setEdit({ ...edit, email: e.target.value })}
+                          />
+                        </div>
+                      </td>
+                    </>
+                  ) : (
+                    <>
+                      <td>
+                        {u.username}
+                        {u.id === meId && <span className="muted"> (you)</span>}
+                      </td>
+                      <td>{u.email}</td>
+                    </>
+                  )}
                   <td>{u.isAdmin ? <span className="badge badge-kind">admin</span> : <span className="muted">user</span>}</td>
-                  <td>{u.disabled ? <span className="badge badge-disabled">disabled</span> : <span className="muted">active</span>}</td>
+                  <td>
+                    <span className="row wrap">
+                      {u.disabled ? <span className="badge badge-disabled">disabled</span> : <span className="muted">active</span>}
+                      {u.oidcLinked && (
+                        <span className="badge badge-kind" title="Linked to a single sign-on identity">
+                          SSO
+                        </span>
+                      )}
+                    </span>
+                  </td>
                   <td>
                     <time dateTime={u.createdAt} title={dateTime(u.createdAt)}>
                       {timeAgo(u.createdAt)}
                     </time>
                   </td>
-                  <td>
-                    <div className="row wrap">
+                  <td className="cell-actions">
+                    {edit?.id === u.id ? (
+                      <div className="row">
+                        <button type="submit" form={`edit-${u.id}`} className="btn btn-small btn-primary" disabled={busy === u.id}>
+                          {busy === u.id ? 'Saving…' : 'Save'}
+                        </button>
+                        <button type="button" className="btn btn-small" disabled={busy === u.id} onClick={() => setEdit(null)}>
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                    <div className="row">
+                      <button type="button" className="btn btn-small" disabled={busy === u.id} onClick={() => setEdit({ id: u.id, username: u.username, email: u.email })}>
+                        Edit
+                      </button>
                       <button
                         type="button"
                         className="btn btn-small"
@@ -118,16 +198,28 @@ function UsersAdmin({ meId }: { meId: string }) {
                       >
                         {u.disabled ? 'Enable' : 'Disable'}
                       </button>
-                      {/* A reset revokes the target's sessions and keys; your own password changes from the account menu. */}
+                      {/* A reset revokes the target's sessions, keys and OAuth grants and drops the SSO link (account recovery); your own password changes from the account menu. */}
                       {u.id !== meId && (
                         <button type="button" className="btn btn-small" disabled={busy === u.id} onClick={() => setResetFor(u)}>
                           Reset password
+                        </button>
+                      )}
+                      {/* 409 for an account without a password (it would become unreachable): reset the password instead. */}
+                      {u.oidcLinked && (
+                        <button
+                          type="button"
+                          className="btn btn-small"
+                          disabled={busy === u.id}
+                          onClick={() => void act(u, async () => replace((await unlinkUserOidc(u.id)).user), `Unlinked single sign-on from ${u.username}.`)}
+                        >
+                          Unlink SSO
                         </button>
                       )}
                       <button type="button" className="btn btn-small btn-danger" disabled={busy === u.id} onClick={() => remove(u)}>
                         Delete
                       </button>
                     </div>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -150,8 +242,9 @@ function UsersAdmin({ meId }: { meId: string }) {
           <ResetPasswordForm
             user={resetFor}
             onCancel={() => setResetFor(null)}
-            onDone={() => {
-              toast(`Password reset for ${resetFor.username}. Their sessions were signed out.`, 'ok');
+            onDone={(u) => {
+              replace(u); // the server dropped the SSO link too: the row's badge and Unlink button go with it
+              toast(`Password reset for ${resetFor.username}. Their sessions, API keys and connected apps were signed out, and any single sign-on link dropped.`, 'ok');
               setResetFor(null);
             }}
           />
@@ -220,7 +313,7 @@ function CreateUserForm({ onCreated, onCancel }: { onCreated: (u: api.User) => v
   );
 }
 
-function ResetPasswordForm({ user, onDone, onCancel }: { user: api.User; onDone: () => void; onCancel: () => void }) {
+function ResetPasswordForm({ user, onDone, onCancel }: { user: api.User; onDone: (u: api.User) => void; onCancel: () => void }) {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -230,8 +323,7 @@ function ResetPasswordForm({ user, onDone, onCancel }: { user: api.User; onDone:
     setBusy(true);
     setError(null);
     try {
-      await api.updateUser(user.id, { password });
-      onDone();
+      onDone((await api.updateUser(user.id, { password })).user);
     } catch (err) {
       setError(err);
       setBusy(false);
