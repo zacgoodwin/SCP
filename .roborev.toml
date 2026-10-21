@@ -1,0 +1,4 @@
+# roborev per-commit background review. Haiku: cheap per-commit loop;
+# deep review happens at PR level via /z-adversarial-review.
+agent = "claude-code"
+review_model = "haiku"

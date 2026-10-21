@@ -1,0 +1,29 @@
+services:
+  scp:
+    build: .
+    image: scp:local
+    restart: unless-stopped
+    ports:
+      - "${SCP_HOST_PORT:-8080}:8080"
+      - "${SCP_HOST_ARTIFACT_PORT:-8081}:8081"
+    environment:
+      # Public URLs as browsers and agents reach them. They must be different origins:
+      # artifact HTML is served only from SCP_ARTIFACT_URL, sandboxed, with no cookies.
+      # The defaults follow the host ports, so changing only SCP_HOST_PORT keeps previews working.
+      SCP_PUBLIC_URL: ${SCP_PUBLIC_URL:-http://localhost:${SCP_HOST_PORT:-8080}}
+      SCP_ARTIFACT_URL: ${SCP_ARTIFACT_URL:-http://localhost:${SCP_HOST_ARTIFACT_PORT:-8081}}
+      SCP_ADMIN_EMAIL: ${SCP_ADMIN_EMAIL:-admin@localhost}
+      SCP_ADMIN_USERNAME: ${SCP_ADMIN_USERNAME:-admin}
+      # Empty = a random admin password is generated and printed once in `docker compose logs scp`.
+      SCP_ADMIN_PASSWORD: ${SCP_ADMIN_PASSWORD:-}
+      SCP_ALLOW_REGISTRATION: ${SCP_ALLOW_REGISTRATION:-true}
+      # Space-separated script/style origins artifacts may load from. Empty = the built-in CDN list.
+      SCP_ARTIFACT_CDNS: ${SCP_ARTIFACT_CDNS:-}
+      # Set to true only behind a reverse proxy that sets X-Forwarded-For (audit log client IP).
+      SCP_TRUST_PROXY: ${SCP_TRUST_PROXY:-false}
+    volumes:
+      # Named volume, not a host bind mount: SQLite WAL needs real shared-memory locking.
+      - scp-data:/data
+
+volumes:
+  scp-data: {}

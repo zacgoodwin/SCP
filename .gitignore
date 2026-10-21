@@ -1,0 +1,11 @@
+node_modules/
+web/dist/
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.kata.local.toml
+.claude/worktrees/
+# roborev snapshots
+/.roborev/
