@@ -1,0 +1,13 @@
+{
+  "name": "scp",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix server ci && npm --prefix web ci",
+    "test": "npm --prefix server test",
+    "typecheck": "npm --prefix server run typecheck && npm --prefix web run typecheck",
+    "build": "npm --prefix web run build",
+    "gate": "npm run typecheck && npm test && npm run build",
+    "dev": "npm --prefix server run dev",
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
