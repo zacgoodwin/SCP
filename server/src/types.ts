@@ -7,8 +7,10 @@ export interface Principal {
   userId: string;
   username: string;
   isAdmin: boolean;
-  via: 'session' | 'key';
+  /** 'oauth' = an OAuth access token (oauth/tokens.ts); accepted on /mcp only, never on /api/v1. */
+  via: 'session' | 'key' | 'oauth';
   keyId?: string;
+  oauthClientId?: string;
   scopes: Scope[];
   /** null = every group the user can read; otherwise the key is restricted to these group ids. */
   groupIds: string[] | null;
@@ -44,6 +46,19 @@ export interface UserRow {
   is_admin: number;
   disabled: number;
   created_at: string;
+  oidc_issuer: string | null;
+  oidc_sub: string | null;
+}
+
+/** Where an imported item came from (docs/PLAN-v2.md D1). */
+export interface ItemSource {
+  kind: 'github' | 'zip';
+  /** `owner/repo` for github; the uploaded file name for zip. */
+  repo: string | null;
+  ref: string | null;
+  path: string | null;
+  /** Full commit sha for github; sha256 of the zip bytes for zip. */
+  commit: string | null;
 }
 
 export interface ItemRow {
@@ -61,6 +76,12 @@ export interface ItemRow {
   source_repo: string | null;
   source_ref: string | null;
   source_path: string | null;
+  source_kind: 'github' | 'zip' | null;
+  source_commit: string | null;
+  /** tree_sha256 of the version the source last wrote: a later upstream tree equal to it is no update, whatever was edited locally since. */
+  source_tree_sha256: string | null;
+  /** How the import carved a skill (imports/pack.ts updateTree): the whole folder, or a root SKILL.md with sibling units carved out. */
+  source_scope: 'tree' | 'root' | null;
   forked_from: string | null;
   created_at: string;
   updated_at: string;
@@ -78,6 +99,8 @@ export interface VersionRow {
   note: string;
   created_by_user: string | null;
   created_by_key: string | null;
+  /** The OAuth client the version was written through (MCP create/update_artifact); null for sessions and keys. */
+  created_by_client: string | null;
   created_at: string;
 }
 

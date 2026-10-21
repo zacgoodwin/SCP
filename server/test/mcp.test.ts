@@ -116,7 +116,8 @@ test('401 without a key, with a bad key, and with only a session cookie', async 
     for (const path of ['/mcp', '/mcp/kit']) {
       const r = await rawPost(path, headers);
       assert.equal(r.status, 401, `${path} ${JSON.stringify(headers)}`);
-      assert.equal(r.headers.get('www-authenticate'), 'Bearer');
+      // RFC 9728 3.3: the pointer names this path's own document (whose `resource` is this URL).
+      assert.equal(r.headers.get('www-authenticate'), `Bearer resource_metadata="http://app.test/.well-known/oauth-protected-resource${path}"`);
       assert.equal(((await r.json()) as any).error.code, 'unauthorized');
     }
   }

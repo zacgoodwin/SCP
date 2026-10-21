@@ -70,7 +70,12 @@ function NewItemForm({ plane, initialKind }: { plane: api.Plane; initialKind: ap
       <nav className="crumbs" aria-label="Breadcrumb">
         <Link to={PLANE_PATH[plane]}>{PLANE_LABEL[plane]}</Link> / New
       </nav>
-      <h1>New {plane === 'md' ? 'prompt or MD' : plane}</h1>
+      <header className="page-head">
+        <div className="page-title">
+          <h1>New {plane === 'md' ? 'prompt or MD' : plane}</h1>
+          <p className="muted">Fill in the details, edit the template below, then create. Every later save becomes a new version.</p>
+        </div>
+      </header>
       <form className="stack" onSubmit={submit}>
         <div className="form-grid">
           {plane === 'md' && (

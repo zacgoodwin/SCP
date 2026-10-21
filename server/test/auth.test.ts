@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
 import { insertGroup, makeTestCtx, type Res, type TestCtx, type TestUser } from './helpers.ts';
 import { otherEnabledAdmins } from '../src/auth/service.ts';
 
@@ -22,7 +23,8 @@ test('register logs you in with a hardened cookie', async () => {
   const t = makeTestCtx();
   const r = await t.req('POST', '/api/v1/auth/register', { json: { email: 'a@x.io', username: 'Alice', password: 'longenough' } });
   assert.equal(r.status, 201);
-  assert.deepEqual(Object.keys(r.json.user).sort(), ['createdAt', 'disabled', 'email', 'id', 'isAdmin', 'username']);
+  assert.deepEqual(Object.keys(r.json.user).sort(), ['createdAt', 'disabled', 'email', 'id', 'isAdmin', 'oidcLinked', 'username']);
+  assert.equal(r.json.user.oidcLinked, false);
   assert.equal(r.json.user.username, 'alice');
   assert.equal(r.json.user.isAdmin, false);
   const sc = r.headers.get('set-cookie')!;
@@ -50,6 +52,7 @@ test('registration disabled returns 403 registration_disabled; config reflects i
     publicUrl: 'http://app.test',
     artifactUrl: 'http://art.test',
     artifactOrigin: 'http://art.test',
+    oidc: { enabled: false, label: '' },
   });
 });
 
@@ -134,7 +137,10 @@ test('cross-site cookie requests cannot log out or revoke keys', async () => {
   const u = t.createUser();
   const { key, token } = (await newKey(t, u)).json;
   const evil = { ...t.session(u), Origin: 'http://evil.test' };
-  assert.equal((await t.req('DELETE', `/api/v1/keys/${key.id}`, { headers: evil })).status, 403);
+  const refused = await t.req('DELETE', `/api/v1/keys/${key.id}`, { headers: evil });
+  assert.equal(refused.status, 403);
+  // The csrf middleware's exception has no message; the API must still say why (QA: a blank error box).
+  assert.match(refused.json.error.message, /Origin/);
   assert.equal((await t.req('POST', '/api/v1/auth/logout', { headers: evil })).status, 403);
   assert.equal((await t.req('GET', '/api/v1/auth/me', { headers: evil })).status, 200);
   assert.equal((await t.req('GET', '/api/v1/auth/me', { headers: bearer(token) })).status, 200);
@@ -458,12 +464,73 @@ test('deleting a user also drops the search index rows of their items and groups
   assert.deepEqual([count('items_fts'), count('groups_fts')], [0, 0]);
 });
 
-test('an admin password reset revokes the user API keys', async () => {
+/** The consent half of the D2 flow for u: DCR and consent, leaving a code awaiting exchange. */
+async function oauthCode(t: TestCtx, u: TestUser) {
+  const redirect = 'https://app.example/cb';
+  const reg = await t.req('POST', '/oauth/register', { json: { redirect_uris: [redirect] } });
+  assert.equal(reg.status, 201, reg.text);
+  const verifier = randomBytes(32).toString('base64url');
+  const q = { response_type: 'code', client_id: reg.json.client_id, redirect_uri: redirect, code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' };
+  const consent = await t.req('POST', '/api/v1/oauth/consent', { headers: sess(t, u), json: { ...q, approve: true } });
+  assert.equal(consent.status, 200, consent.text);
+  const code = new URL(consent.json.redirect).searchParams.get('code')!;
+  return { clientId: reg.json.client_id as string, code, verifier };
+}
+
+const exchangeCode = (t: TestCtx, c: Awaited<ReturnType<typeof oauthCode>>) =>
+  t.req('POST', '/oauth/token', { json: { grant_type: 'authorization_code', code: c.code, client_id: c.clientId, code_verifier: c.verifier } });
+
+/** A consented OAuth grant for u (the D2 flow, minimal): DCR, consent, code exchange. */
+async function oauthGrant(t: TestCtx, u: TestUser) {
+  const c = await oauthCode(t, u);
+  const tok = await exchangeCode(t, c);
+  assert.equal(tok.status, 200, tok.text);
+  return { clientId: c.clientId, ...(tok.json as { access_token: string; refresh_token: string }) };
+}
+
+test('an admin password reset or disable also voids an authorization code awaiting exchange', async () => {
+  const t = makeTestCtx();
+  const admin = t.createUser({ isAdmin: true });
+  const u = t.createUser();
+  // An intruder's client keeps a code warm (10 min); the reset must not leave it redeemable into a live grant.
+  const warm = await oauthCode(t, u);
+  assert.equal((await t.req('PATCH', `/api/v1/users/${u.id}`, { headers: sess(t, admin), json: { password: 'new-password' } })).status, 200);
+  const afterReset = await exchangeCode(t, warm);
+  assert.equal(afterReset.status, 400, afterReset.text);
+  assert.equal(afterReset.json.error, 'invalid_grant');
+  // Disabling takes the codes and revokes the grants too: a grant an intruder consented to must not
+  // come back with the account. API keys survive a disable (refused meanwhile).
+  const warm2 = await oauthCode(t, u);
+  const live = await oauthGrant(t, u);
+  const k = t.key(u);
+  assert.equal((await t.req('PATCH', `/api/v1/users/${u.id}`, { headers: sess(t, admin), json: { disabled: true } })).status, 200);
+  const afterDisable = await exchangeCode(t, warm2);
+  assert.equal(afterDisable.status, 400, afterDisable.text);
+  assert.equal(afterDisable.json.error, 'invalid_grant');
+  assert.equal((t.db.prepare('SELECT COUNT(*) AS n FROM oauth_codes WHERE user_id = ?').get(u.id) as { n: number }).n, 0);
+  assert.equal((t.db.prepare('SELECT COUNT(*) AS n FROM oauth_tokens WHERE user_id = ? AND revoked_at IS NULL').get(u.id) as { n: number }).n, 0);
+  const refresh = await t.req('POST', '/oauth/token', { json: { grant_type: 'refresh_token', refresh_token: live.refresh_token, client_id: live.clientId } });
+  assert.equal(refresh.status, 400, refresh.text);
+  assert.equal((t.db.prepare('SELECT revoked_at FROM api_keys WHERE id = ?').get(k.id) as { revoked_at: string | null }).revoked_at, null);
+});
+
+test('an admin password reset revokes the user API keys and OAuth grants', async () => {
   const t = makeTestCtx();
   const admin = t.createUser({ isAdmin: true });
   const u = t.createUser();
   const k = t.key(u);
+  const g = await oauthGrant(t, u);
+  const initBody = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'raw', version: '0' } } };
+  const mcp = (token: string) => t.req('POST', '/mcp', { headers: { Authorization: `Bearer ${token}`, accept: 'application/json, text/event-stream' }, json: initBody });
+  assert.equal((await mcp(g.access_token)).status, 200);
   assert.equal((await t.req('PATCH', `/api/v1/users/${u.id}`, { headers: sess(t, admin), json: { password: 'new-password' } })).status, 200);
   assert.equal((await t.req('GET', '/api/v1/auth/me', { headers: k.headers })).status, 401);
+  // The reset is account recovery: a grant consented by whoever held the account must not keep refreshing itself.
+  assert.equal((await mcp(g.access_token)).status, 401, 'the OAuth access token dies with the reset');
+  const refresh = await t.req('POST', '/oauth/token', { json: { grant_type: 'refresh_token', refresh_token: g.refresh_token, client_id: g.clientId } });
+  assert.equal(refresh.status, 400, refresh.text);
+  assert.equal(refresh.json.error, 'invalid_grant');
+  const row = t.db.prepare("SELECT detail FROM audit WHERE action = 'user.update' ORDER BY id DESC LIMIT 1").get() as { detail: string };
+  assert.equal(JSON.parse(row.detail).grantsRevoked, 1);
   assert.equal((await t.req('GET', '/api/v1/auth/me', { headers: t.key(admin).headers })).status, 200, 'other users keep their keys');
 });

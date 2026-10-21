@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router';
 import * as api from '../api.ts';
 import { useUser } from '../auth.tsx';
+import { Actor, Detail } from './AdminLogs.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
 import { dateTime, timeAgo } from '../format.ts';
 
@@ -41,15 +42,17 @@ export function ActivityPage() {
   return (
     <div className="page">
       <header className="page-head">
-        <div className="stack-tight">
+        <div className="page-title">
           <h1>Activity</h1>
           <p className="muted">The last {LIMIT} audit events{all ? ' across all users' : ' for your account'}.</p>
         </div>
         {user.isAdmin && (
-          <label className="toggle">
-            <input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} />
-            All users
-          </label>
+          <div className="page-actions">
+            <label className="toggle">
+              <input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} />
+              All users
+            </label>
+          </div>
         )}
       </header>
       <ErrorBox error={error} />
@@ -57,7 +60,11 @@ export function ActivityPage() {
         <p className="muted" role="status">Loading…</p>
       ) : events.length === 0 ? (
         <div className="empty">
-          <p>No activity yet. Create an item or a group and it shows up here.</p>
+          <p>No activity yet.</p>
+          <p className="muted">Logins, item and group changes, key use and bundle downloads show up here.</p>
+          <Link className="btn btn-primary" to="/items/new">
+            Create an item
+          </Link>
         </div>
       ) : (
         <div className="table-wrap">
@@ -81,13 +88,16 @@ export function ActivityPage() {
                     </time>
                   </td>
                   <td>
-                    <code title={Object.keys(e.detail).length ? JSON.stringify(e.detail) : undefined}>{e.action}</code>
+                    <code>{e.action}</code>
+                    <Detail detail={e.detail} />
                   </td>
                   <td>
                     <Target e={e} />
                   </td>
                   <td>{e.username ?? <span className="muted">-</span>}</td>
-                  <td>{e.keyId ? <code>…{e.keyId.slice(-6)}</code> : <span className="muted">web</span>}</td>
+                  <td>
+                    <Actor e={e} />
+                  </td>
                   <td>{e.ip ?? <span className="muted">-</span>}</td>
                 </tr>
               ))}

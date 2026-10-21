@@ -169,6 +169,83 @@ const MIGRATIONS: string[] = [
    CREATE TRIGGER scp_groups_tombstone AFTER DELETE ON scp_groups BEGIN
      INSERT OR REPLACE INTO deleted_group_slugs (slug, owner_id, deleted_at) VALUES (old.slug, old.owner_id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
    END;`,
+  // v2 (docs/PLAN-v2.md): nested groups, import provenance, blob GC index, OIDC identities, OAuth server.
+  `CREATE TABLE group_includes (
+    group_id TEXT NOT NULL REFERENCES scp_groups(id) ON DELETE CASCADE,
+    included_id TEXT NOT NULL REFERENCES scp_groups(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (group_id, included_id),
+    CHECK (group_id <> included_id)
+  );
+  CREATE INDEX group_includes_included ON group_includes(included_id);
+  ALTER TABLE items ADD COLUMN source_kind TEXT CHECK (source_kind IS NULL OR source_kind IN ('github','zip'));
+  ALTER TABLE items ADD COLUMN source_commit TEXT;
+  CREATE INDEX version_files_sha ON version_files(sha256);
+  ALTER TABLE users ADD COLUMN oidc_issuer TEXT;
+  ALTER TABLE users ADD COLUMN oidc_sub TEXT;
+  CREATE UNIQUE INDEX users_oidc ON users(oidc_issuer, oidc_sub) WHERE oidc_sub IS NOT NULL;
+  CREATE TABLE oauth_clients (
+    id TEXT PRIMARY KEY,
+    secret_hash TEXT,
+    name TEXT NOT NULL,
+    redirect_uris TEXT NOT NULL,
+    grant_types TEXT NOT NULL DEFAULT '["authorization_code","refresh_token"]',
+    token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none',
+    client_uri TEXT,
+    logo_uri TEXT,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    disabled INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE oauth_codes (
+    code_hash TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    redirect_uri TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    code_challenge_method TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    group_ids TEXT,
+    resource TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+  );
+  CREATE TABLE oauth_tokens (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK (kind IN ('access','refresh')),
+    client_id TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    grant_id TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    group_ids TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    last_used_at TEXT
+  );
+  CREATE INDEX oauth_tokens_user ON oauth_tokens(user_id);
+  CREATE INDEX oauth_tokens_grant ON oauth_tokens(grant_id);`,
+  // v2 review: a version written through an OAuth client names it (items/service.ts insertVersion), and
+  // the client sweep and admin listing look tokens up by client (oauth/service.ts sweepClients, listClientsAdmin).
+  `ALTER TABLE item_versions ADD COLUMN created_by_client TEXT REFERENCES oauth_clients(id) ON DELETE SET NULL;
+   CREATE INDEX oauth_tokens_client ON oauth_tokens(client_id);`,
+  // v2 review 3: what an import's source last wrote and how it carved the tree (imports/pack.ts
+  // versionFromSource, updateTree); a consented DCR client outlives the token sweep (oauth/service.ts
+  // sweepClients); the token sweep's two range deletes stop scanning the table (sweepTokens).
+  `ALTER TABLE items ADD COLUMN source_tree_sha256 TEXT;
+   ALTER TABLE items ADD COLUMN source_scope TEXT CHECK (source_scope IS NULL OR source_scope IN ('tree','root'));
+   ALTER TABLE oauth_clients ADD COLUMN consented_at TEXT;
+   CREATE INDEX oauth_tokens_expires ON oauth_tokens(expires_at);
+   CREATE INDEX oauth_tokens_revoked ON oauth_tokens(revoked_at);`,
+  // v2 review 4: the client sweep (oauth/service.ts sweepClients, on every token request) finds its
+  // candidates on a partial index instead of scanning a table anonymous registration makes attacker-sized,
+  // and its codes subquery (and issueCode's expiry sweep) run on indexes too.
+  `CREATE INDEX oauth_clients_sweep ON oauth_clients(created_at) WHERE created_by IS NULL AND consented_at IS NULL;
+   CREATE INDEX oauth_codes_client ON oauth_codes(client_id);
+   CREATE INDEX oauth_codes_expires ON oauth_codes(expires_at);`,
 ];
 
 export function openDb(path: string): Db {

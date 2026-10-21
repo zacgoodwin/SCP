@@ -26,17 +26,29 @@ export interface User {
   username: string;
   isAdmin: boolean;
   disabled: boolean;
+  /** Linked to a single sign-on identity; the user (account menu) or an admin can drop the link. */
+  oidcLinked: boolean;
   createdAt: string;
 }
 export interface Me {
   user: User;
-  principal: { via: 'session' | 'key'; scopes: Scope[]; groupIds: string[] | null };
+  principal: { via: 'session' | 'key' | 'oauth'; scopes: Scope[]; groupIds: string[] | null };
 }
 export interface AuthConfig {
   registration: boolean;
   artifactOrigin: string;
   artifactUrl?: string;
   publicUrl: string;
+  /** OIDC login (D3): shown as a button on the login page when enabled. */
+  oidc?: { enabled: boolean; label: string };
+}
+/** Import provenance (D1). */
+export interface ItemSource {
+  kind: 'github' | 'zip';
+  repo: string | null;
+  ref: string | null;
+  path: string | null;
+  commit: string | null;
 }
 
 export interface Lint {
@@ -66,7 +78,8 @@ export interface VersionDetail {
   totalBytes: number;
   note: string | null;
   createdAt: string;
-  createdBy: { userId: string | null; keyId: string | null };
+  /** clientId: the connected OAuth app that wrote it over MCP, when one did. */
+  createdBy: { userId: string | null; keyId: string | null; clientId?: string | null };
   files: VersionFile[];
 }
 // PLAN.md names VersionSummary without spelling it out; assume VersionDetail minus the heavy fields.
@@ -90,7 +103,7 @@ export interface ItemSummary {
 }
 export interface ItemDetail extends ItemSummary {
   createdAt: string;
-  source: unknown;
+  source: ItemSource | null;
   forkedFrom: string | null;
   version: VersionDetail;
   groups: { slug: string; name: string }[];
@@ -164,10 +177,20 @@ export interface ManifestConflict {
   path: string;
   items: string[];
 }
+/** Why a download cannot be built (`code`: group_full, bundle_too_large or path_conflict), or ok. */
+export interface BuildProblem {
+  ok: boolean;
+  problem: string | null;
+  code?: string | null;
+}
 export interface Manifest {
   group: { slug: string; name: string; description: string | null; instructions: string | null };
   items: { id: string; kind: Kind; plane: Plane; name: string; title: string | null; description: string | null; version: number; installPath: string }[];
   conflicts?: ManifestConflict[];
+  /** Whether plugin.zip builds (and the marketplace lists the group); `problem` says why not. */
+  plugin?: BuildProblem;
+  /** Whether bundle.zip builds for the requested target and scope; `problem` says why not. */
+  bundle?: BuildProblem;
 }
 export type BundleTarget = 'claude-code' | 'codex' | 'generic';
 export interface ApiKey {
@@ -272,12 +295,15 @@ async function send(method: string, path: string, body?: unknown): Promise<Respo
 /** Window event fired when any API call finds the session gone. */
 export const SESSION_ENDED = 'scp:session-ended';
 
-async function json<T>(method: string, path: string, body?: unknown): Promise<T> {
+/** Shared by the per-chunk API files (api-*.ts): JSON call, 204 -> undefined, errors as ApiError. */
+export async function json<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await send(method, path, body);
   return (res.status === 204 ? undefined : await res.json()) as T;
 }
 
-function qs(params: object): string {
+export { send };
+
+export function qs(params: object): string {
   const s = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null && v !== '') s.set(k, String(v));
   const out = s.toString();
@@ -330,8 +356,8 @@ export async function getFileBytes(id: string, path: string, version?: number): 
 
 const g = (slug: string) => `/groups/${encodeURIComponent(slug)}`;
 export const getStats = () => json<Stats>('GET', '/stats');
-/** One page of readable groups, the caller's own first (default 50, max 200). */
-export const listGroups = (opts: { q?: string; owner?: 'me'; limit?: number; offset?: number } = {}) =>
+/** One page of readable groups, the caller's own first (default 50, max 200); owner 'others' = other users' readable groups only. */
+export const listGroups = (opts: { q?: string; owner?: 'me' | 'others'; limit?: number; offset?: number } = {}) =>
   json<{ groups: GroupSummary[]; total: number }>('GET', `/groups${qs(opts)}`);
 export const getGroup = (slug: string) => json<{ group: GroupDetail }>('GET', g(slug));
 export const createGroup = (body: GroupCreate) => json<{ group: GroupDetail }>('POST', '/groups', body);
@@ -347,6 +373,10 @@ export const bundleUrl = (slug: string, target: BundleTarget) => `${API}${g(slug
 
 // ---------- keys, users, audit (C1, C0) ----------
 
+/** Start linking single sign-on to the signed-in account: a POST (CSRF-checked), answering the IdP URL to navigate to. */
+export const oidcLink = (next: string) => json<{ url: string }>('POST', '/auth/oidc/link', { next });
+/** Drop the signed-in account's single sign-on link (409 for an account that has no password). */
+export const oidcUnlink = () => json<void>('POST', '/auth/oidc/unlink', {});
 export const listKeys = () => json<{ keys: ApiKey[] }>('GET', '/keys');
 export const createKey = (body: KeyCreate) => json<{ key: ApiKey; token: string }>('POST', '/keys', body);
 export const revokeKey = (id: string) => json<void>('DELETE', `/keys/${id}`);

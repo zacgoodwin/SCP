@@ -27,7 +27,7 @@ import {
 import { FORMATS, KINDS, type AppEnv, type ItemRow, type Principal, type VersionRow } from '../types.ts';
 
 /** These routes carry uploads and set their own limits; app.ts caps every other /api/v1 body at 1 MB. */
-export const UPLOAD_ROUTES = /^\/api\/v1\/items(?:\/import|\/[^/]+\/versions)?$/;
+export const UPLOAD_ROUTES = /^\/api\/v1\/items(?:\/import(?:\/pack)?|\/[^/]+\/versions)?$/;
 
 const fileIn = z.object({
   path: z.string().max(255),

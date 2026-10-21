@@ -21,6 +21,18 @@ services:
       SCP_ARTIFACT_CDNS: ${SCP_ARTIFACT_CDNS:-}
       # Set to true only behind a reverse proxy that sets X-Forwarded-For (audit log client IP).
       SCP_TRUST_PROXY: ${SCP_TRUST_PROXY:-false}
+      # GitHub token for imports (rate limit, private repos). Empty = the admin setting, else anonymous.
+      # Raises the GitHub rate limit for every user's imports; private repositories it can reach import for admins only.
+      SCP_GITHUB_TOKEN: ${SCP_GITHUB_TOKEN:-}
+      # GitHub REST API origin (GitHub Enterprise Server). Empty = https://api.github.com.
+      SCP_GITHUB_API: ${SCP_GITHUB_API:-}
+      # OIDC login. Issuer + client id + secret enable it; values set here override the admin settings.
+      SCP_OIDC_ISSUER: ${SCP_OIDC_ISSUER:-}
+      SCP_OIDC_CLIENT_ID: ${SCP_OIDC_CLIENT_ID:-}
+      SCP_OIDC_CLIENT_SECRET: ${SCP_OIDC_CLIENT_SECRET:-}
+      # Create an account on first OIDC login (true) or only let existing accounts in (false).
+      SCP_OIDC_AUTO_REGISTER: ${SCP_OIDC_AUTO_REGISTER:-}
+      SCP_OIDC_LABEL: ${SCP_OIDC_LABEL:-}
     volumes:
       # Named volume, not a host bind mount: SQLite WAL needs real shared-memory locking.
       - scp-data:/data

@@ -19,7 +19,22 @@ export interface Config {
   secureCookies: boolean;
   /** Trust X-Forwarded-For / X-Real-IP for the audit IP (only behind a proxy that sets them). */
   trustProxy: boolean;
+  /** GitHub REST base for imports (tests point it at a local fake), no trailing slash. */
+  githubApiUrl: string;
+  /** Env-provided GitHub token; overrides the `github.token` setting when set. */
+  githubToken: string | null;
+  /** Env-provided OIDC login settings; each field set here overrides the matching `oidc.*` setting. */
+  oidc: {
+    issuer: string | null;
+    clientId: string | null;
+    clientSecret: string | null;
+    autoRegister: boolean | null;
+    label: string | null;
+  };
 }
+
+/** OIDC label when neither env nor settings name one. */
+export const OIDC_DEFAULT_LABEL = 'Single sign-on';
 
 const trimSlash = (s: string) => s.replace(/\/+$/, '');
 
@@ -67,5 +82,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     webDist: env.SCP_WEB_DIST ?? resolve(import.meta.dirname, '../../web/dist'),
     secureCookies: publicUrl.startsWith('https://'),
     trustProxy: envBool(env, 'SCP_TRUST_PROXY', false),
+    githubApiUrl: trimSlash(env.SCP_GITHUB_API || 'https://api.github.com'),
+    githubToken: env.SCP_GITHUB_TOKEN?.trim() || null,
+    oidc: {
+      issuer: env.SCP_OIDC_ISSUER?.trim() ? trimSlash(env.SCP_OIDC_ISSUER.trim()) : null,
+      clientId: env.SCP_OIDC_CLIENT_ID?.trim() || null,
+      clientSecret: env.SCP_OIDC_CLIENT_SECRET || null,
+      // null = not set in the environment; the admin setting (or the default true) applies.
+      autoRegister: env.SCP_OIDC_AUTO_REGISTER?.trim() ? envBool(env, 'SCP_OIDC_AUTO_REGISTER', true) : null,
+      label: env.SCP_OIDC_LABEL?.trim() || null,
+    },
   };
 }

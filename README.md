@@ -41,13 +41,17 @@ Set these in your shell or in a `.env` file next to `docker-compose.yml`:
 | `SCP_ARTIFACT_URL` | `http://localhost:<SCP_HOST_ARTIFACT_PORT>` | Artifact origin. Must be a different origin; in production use a separate domain such as `scp-content.example.com` |
 | `SCP_ADMIN_USERNAME` / `SCP_ADMIN_EMAIL` | `admin` / `admin@localhost` | First admin, created when the database is empty |
 | `SCP_ADMIN_PASSWORD` | random, printed in the logs | First admin's password |
-| `SCP_ALLOW_REGISTRATION` | `true` | Whether anyone can create an account: `true` or `false` (also `1`/`0`, `yes`/`no`, any case). Any other value stops the server at boot |
+| `SCP_ALLOW_REGISTRATION` | `true` | Whether anyone can create an account with a password (`POST /auth/register`, the Register page): `true` or `false` (also `1`/`0`, `yes`/`no`, any case). Any other value stops the server at boot. Sign-up through OIDC is a separate switch, `SCP_OIDC_AUTO_REGISTER`: with OIDC on and that left at its default, a closed instance still creates an account for every identity the IdP admits |
 | `SCP_TRUST_PROXY` | `false` | Use the rightmost `X-Forwarded-For` entry (the hop your proxy appended) for the audit IP and the login rate limit. Enable only behind exactly one proxy that appends it (nginx `$proxy_add_x_forwarded_for`, Cloudflare). Same values as above |
 | `SCP_ARTIFACT_CDNS` | cdnjs, jsdelivr, unpkg, tailwind, jquery | Space-separated script and style origins artifacts may load from (`https://host[:port]`; a trailing slash is fine, anything else is ignored with a warning at boot) |
 | `SCP_HOST_PORT` / `SCP_HOST_ARTIFACT_PORT` | `8080` / `8081` | Host ports published by compose |
+| `SCP_GITHUB_TOKEN` | unset | GitHub token used by imports from GitHub: a higher rate limit for everyone, and private repositories for admins only (other accounts are refused a private repository, so the token never widens their access). Unset: the token saved under Admin, Settings, else anonymous |
+| `SCP_GITHUB_API` | `https://api.github.com` | GitHub REST API origin imports talk to. Only for a GitHub Enterprise Server or a test stand-in; the public API needs no change |
+| `SCP_OIDC_ISSUER` / `SCP_OIDC_CLIENT_ID` / `SCP_OIDC_CLIENT_SECRET` | unset | OIDC login (see below). All three enable it; each value set here overrides the matching Admin, Settings field |
+| `SCP_OIDC_AUTO_REGISTER` | `true` | Create an account on a user's first OIDC login, whatever `SCP_ALLOW_REGISTRATION` says. `false`: only existing accounts (matched by linked identity, then email) can sign in |
+| `SCP_OIDC_LABEL` | `Single sign-on` | Text of the login button |
 
-[`.env.example`](.env.example) lists every variable with its default. If you set the two URLs
-yourself, they must match how the ports are really reached: previews frame `SCP_ARTIFACT_URL`, and
+If you set the two URLs yourself, they must match how the ports are really reached: previews frame `SCP_ARTIFACT_URL`, and
 artifact pages only allow being framed by `SCP_PUBLIC_URL`.
 
 For a public deployment, put both origins behind HTTPS (Caddy, nginx, Cloudflare Tunnel) and set
@@ -95,7 +99,7 @@ The target can be `claude-code`, `codex` (`.agents/skills/`, `AGENTS.md`, `.code
 ### MCP surface
 
 Endpoints: `/mcp/<group>` is scoped to one group, and `/mcp` covers every group the key can read.
-Auth is by Bearer key only. The group's instructions are sent in the `initialize` response.
+Auth is a Bearer API key, or an OAuth access token obtained through the built-in authorization server (see OAuth below). The group's instructions are sent in the `initialize` response.
 
 Tools follow progressive disclosure: catalog first, then bodies, then files.
 
@@ -127,7 +131,134 @@ GET  /api/v1/search?q=...&plane=skill|md|artifact
 GET  /api/v1/items/<id>/files/<path>       raw file bytes
 POST /api/v1/items                         create (JSON files[] or content)
 POST /api/v1/items/import                  upload .md / .zip / .skill / .html / .svg / .mmd / .jsx
+POST /api/v1/items/import/pack             a zip of many skills/MDs -> items (+ a group)
+POST /api/v1/items/import/github           import from a GitHub repo/ref/path, commit pinned
+GET  /m/<key>/marketplace.json             Claude Code plugin marketplace for the key
 ```
+
+## Importing packs and GitHub repositories
+
+Besides single-file uploads (`POST /api/v1/items/import`), SCP imports whole collections:
+
+```
+POST /api/v1/items/import/pack     multipart: file=<.zip> [visibility=private|public] [group=<slug>] [groupName=<text>]
+POST /api/v1/items/import/github   JSON: {url} or {repo:"owner/repo", ref?, path?} + visibility?, kind?, name?, group?, groupName?
+```
+
+Both answer `201 {items, group, skipped, source}`. Every recognised unit in the tree becomes one item: `.claude-plugin/plugin.json` plugins and `.claude/` layouts (`skills/*/SKILL.md`, `agents/*.md`, `commands/*.md`), top-level `skills/`, `agents/`, `commands/`, `prompts/`, any other folder holding a `SKILL.md` (`skill.md` in any case counts and is stored as `SKILL.md`), a `SKILL.md` at the root, in any case (one skill, every remaining file its own), root `AGENTS.md`/`CLAUDE.md` (instructions) and `DESIGN.md` (design). A folder import (a `/tree/<ref>/<path>` or `/blob/.../SKILL.md` URL, or a zip of one folder) holding a `SKILL.md` is that one skill, `CLAUDE.md` and `agents/*.md` inside it included, the way the same folder is under `skills/` in a whole-repository import; carving root `AGENTS.md`/`CLAUDE.md` and `agents/*.md` into items of their own applies to a repository root only. A tree made only of `.md` files imports each file the way the single-file import would (README/LICENSE-style docs are skipped: README, LICENSE, CHANGELOG, CONTRIBUTING, CODE_OF_CONDUCT and SECURITY, with a locale or variant suffix such as `README.de.md`; a command named `security-review` is an item). At most 200 items per import. Each returned item carries `op`: `create`, `version` (a re-import that changed it) or `unchanged`.
+
+Units that fail validation, clash with an unrelated item's name, or would conflict on an install path are listed in `skipped` with the reason; the rest still import. So is content detection passed over: a folder under `skills/` with no `SKILL.md`, any other loose `.md` outside a layout folder (`docs/guide.md`; one nested below a layout folder, `agents/sub/deep.md`, is told that only `agents/*.md` is imported), and a README inside `agents/`, `commands/` or `prompts/` (which would otherwise ship as a slash command named `readme`); a root README is expected and not reported. When nothing at all was recognised the answer is 400 `nothing_to_import`, with those skip reasons as `error.details` whenever detection passed something over. With `group=<slug>`, the group is created (409 `slug_taken` fails the whole import) with every imported item as a member; `groupName` defaults to the repo or zip name. The import is one transaction. When every unit was skipped the answer is 422 `nothing_imported` with the skip reasons as `error.details`, never a 201 with an empty list, so a group is never created empty and its slug stays free.
+
+GitHub URLs may be a repo (`https://github.com/o/r`), a folder (`.../tree/<ref>/<path>`) or a file (`.../blob/<ref>/<path>/SKILL.md`, which imports the file's folder). `ref` is a branch, tag or commit sha (default: the repo's default branch). SCP only talks to the GitHub REST API (`SCP_GITHUB_API`, default `https://api.github.com`): it resolves the ref to a commit and downloads that commit's zipball of the whole repository (35 MB compressed cap, 60 s timeout); with a `path`, only that folder is inflated. The archive is held to pack caps (20,000 files, 64 MB unpacked); each unit is then held to the per-version limits (1000 files, 30 MB, 10 MB per file) as it becomes an item, so a 150-skill repository imports and a single oversize unit lands in `skipped`, one holding a file over 10 MB included (the archive caps a file at its 64 MB total, not at a version's 10 MB). No clone, nothing is executed. A token (`SCP_GITHUB_TOKEN`, or the `github.token` setting from the admin settings page) raises the rate limit for everyone; private repositories it can reach import for admins only (other accounts get the same 400 `bad_source` as for a repository that does not exist, so the token is no oracle for private repository names). The repository is recorded as GitHub spells it (names are case-insensitive). `kind: artifact` is refused: an artifact imports from a single file. The GitHub quota is one shared identity (the token, or the server's address), so every route that contacts GitHub is limited per user (a burst of 10, then one every 5 s: 429 `rate_limited`), at most 3 repository downloads are in flight at once (503 `busy` with `Retry-After` otherwise), and an exhausted GitHub quota answers 429 naming the reset time instead of a bare 502.
+
+Imported items record their provenance (`item.source`: kind, repo, ref, path, commit; for zips the file name and the zip's sha256). Importing the same repo and path again updates the existing items with a new version instead of failing on the name; at the same commit (or the same zip bytes) nothing is written (the recorded ref still follows the one named), and a new commit whose tree at that path is what the import last wrote is no update either, so a local edit made since stays the latest version. For zips the identity is the uploaded file name: re-uploading under the same name updates, a renamed download (`pack (1).zip`) is a new pack whose units are skipped as `name_taken`, with the reason naming the file to upload under. For GitHub-sourced items:
+
+```
+POST /api/v1/items/:id/source/check            -> {source, upToDate, latestCommit}
+POST /api/v1/items/:id/source/update  {note?}  -> {item}   (new version at the latest commit; 409 up_to_date when nothing changed)
+```
+
+Both need edit rights on the item. An item pinned to a commit sha is always up to date.
+
+### Importing packs and GitHub repos (web UI)
+
+The Import dialog (Dashboard quick links, or the Import button on any plane page) has three tabs:
+
+- **File**: one `.md`, a skill folder as `.zip`/`.skill`, or an artifact file. Kind is detected, or pick one.
+- **Zip pack**: a zip holding many units (a Claude Code plugin with `.claude-plugin/plugin.json`, a `.claude/` folder, `skills/*/SKILL.md`, `agents/*.md`, `commands/*.md`, `prompts/*.md`, or loose `.md` files). Each unit becomes one item, held to the per-version limits; the upload (the zip plus its form fields) may be 35 MB, and the archive 20,000 files and 64 MB unpacked. Re-uploading a zip under the same file name updates the items it created; a renamed file is a new pack. Optionally give a group slug to create a group with every imported item as a member.
+- **GitHub**: paste a repo URL (`https://github.com/owner/repo`, a `/tree/<ref>/<path>` folder or a `/blob/.../SKILL.md` file), or fill in owner/repo, ref and path. The import goes through the GitHub API at the ref's current commit (set `SCP_GITHUB_TOKEN` for higher rate limits; private repos import for admins only), and that commit is pinned on every item. The Artifacts page offers the File tab only: an artifact is one file with a format.
+
+After a pack or GitHub import the UI opens the created group, or the item when exactly one was imported, provided nothing was skipped; otherwise it lists the imported items, a link to the group when one was created, and the units it skipped with the reason (unknown layout, lint errors, name taken), also when every unit was skipped and the requested group was therefore not created.
+
+### Source panel and update checks
+
+An imported item shows a **Source** card under its description: kind (github or zip), repo link, path, ref and the pinned commit. For GitHub sources, editors get **Check for updates**; when the ref has moved, **Update to latest** re-imports that path at the new commit as a new version (a loose `design.md` or `skill.md` imported from a folder of `.md` files is re-homed to `DESIGN.md` / `SKILL.md` again). "Already up to date" means the ref still points at the pinned commit, or the tree at the new commit is still what the import last wrote (a commit elsewhere in a monorepo); either way a local edit made since the import is never overwritten by an update. A whole-folder import (a `skills/<name>/` folder, or a `kind` override) keeps its whole folder on update, however upstream renames files inside it; a root `SKILL.md` import keeps carving sibling units out.
+
+### Dashboard
+
+The dashboard lists **Your groups** and **Shared with you** (groups other users shared with you or made public), each with owner, plane counts and a Connect link. An admin reads every group, so for them the second card is **Other users' groups** and says so.
+
+## Nested groups
+
+A group can include other groups (`PUT /api/v1/groups/:slug/includes {includes: [slug]}`, `POST .../includes {slug}`, `DELETE .../includes/:slug`). Everything an included group serves flows into the including one: its own members first, then each include's members in order, up to 4 levels deep. An item that appears more than once is served once, from the first place it appears, with the version pin and "Install as" of that row. Cycles are refused (409 `include_cycle`), a fifth level is 400 `include_too_deep`.
+
+You can include your own groups and public ones. A group another user shared with you by name is yours to read, not to republish, the same rule as for their private items (400 `include_not_shareable`), or a share recipient could turn private items into a public group. An included public group keeps flowing only while it stays public and its owner is enabled: if its owner makes it private or shared, its members drop out of your group until it is public again. The stale include stays listed for you (`flowing: false`, shown as "not flowing"), so you can reorder or remove it, but once you can no longer read the group you see its slug alone, not its live name or member count; and its owner's `includedBy` no longer names your group, since the edge no longer flows. A reader of your group sees an include they cannot open (your private group under your public one) as its slug alone too, still flowing: its members arrive, marked `via` that slug. Each included group still publishes only its owner's items or public ones, like any group. Reading a group grants read of everything it serves, included groups too, so a key restricted to one group sees what flows in through its includes and nothing else. A group includes at most 50 groups directly, is included by at most 50 other users' groups (your own includes of your own group never count against that, so strangers cannot lock you out of it), and serves at most 100 through its includes in all, at most 500 members and at most 20,000 files (400 `include_too_many` / `group_full`); the caps are checked on the group you edit and on every group of yours that includes it, so growing a child cannot push your own hub past them. The depth and member caps count your own groups, not another user's: four private groups a stranger stacks on your public group neither block your next include nor serve anything past depth 4 from their end, and a public group of theirs that you include may deepen or grow afterwards without failing your own reorders, includes or member adds (it truncates at depth 4 on read, and reordering or trimming your includes re-judges nothing). Another user's hub that includes your public group is theirs to trim. A group whose members hold more than 20,000 files (an unpinned member grew) answers 400 `group_full` for its manifest, bundle, catalog, plugin.zip and is left out of the marketplace alike. A change inside an included group (a member, a pin, an include) also updates every group that includes it, as does anything that shrinks what it serves (a member deleted or made private, an included group made private or deleted).
+
+Install-path conflicts are checked across the whole effective set: an include that would make two members install to the same path is refused (409 `path_conflict`), and a clash that appears later inside an included group shows up as a manifest conflict and blocks the bundle until a member gets an "Install as" path.
+
+In the UI, the group page has an "Included groups" section; members that flow in show "via <slug>" (the group holding the member's row, linked when it is a direct include you can open; a deeper group, or one you cannot read, is named only) and are edited in that group. The "Shared with" list is shown to editors whatever the visibility: the names survive a switch to private or public and grant access again on a switch back to shared, and count toward your marketplace and MCP group list only while the group is shared.
+
+## Claude Code plugin marketplace
+
+Every API key is a marketplace: `GET /m/<key>/marketplace.json` lists one plugin per group of the key's owner, plus the groups shared with them by name and, for a restricted key, the groups it was restricted to (named after the group slug; marketplace name `scp-<username>`), each pointing at `GET /m/<key>/<slug>/plugin.zip` as an `archive` source. Other users' public groups are not enumerated (any account can create any number of them), and Claude Code resolves `<slug>@scp-<username>` against that listing, so they install from the archive only: download `GET /m/<key>/<slug>/plugin.zip` (any group the key can read) and unpack it where Claude Code loads plugins from; the group page's Plugin tab shows that command for them. The zip is the Claude Code plugin layout: `.claude-plugin/plugin.json`, `skills/<name>/`, `agents/<name>.md`, `commands/<name>.md`, other kinds under `docs/<kind>/<name>/`, and a `.mcp.json` that connects the group's MCP server with the same key. Plugin versions are `<yyyymmdd>.<hhmmssmmm>`, the UTC time of the latest change (a member version, a pin, an include, the group itself, inside an included group too, and whatever removes files from the plugin: a member deleted or made private, an included group made private or deleted, a member's or an included group's owner disabled, enabled again or deleted), so they only ever climb and `claude plugin update` sees every change; the archive carries no sha256 pin (the listing would have to build every zip to compute one). `/m/<key>/*` answers 100 requests, then one a second, per key (429 `rate_limited`): the key sits in the URL, and the listing walks every member of every group.
+
+```
+claude plugin marketplace add https://scp.example.com/m/<YOUR_KEY>/marketplace.json
+claude plugin install <group-slug>@scp-<username>
+```
+
+Use a key restricted to the groups you want installed: the key ends up inside each plugin's `.mcp.json`, and the marketplace lists exactly those groups (otherwise the first 200 of your own and shared ones). Claude Code downloads archives over `https://` only, never from localhost or a private address, so a Docker SCP on `http://localhost:8080` needs a real HTTPS hostname (a reverse proxy such as Caddy) before `claude plugin install` works. For local use, download `plugin.zip` from the group's Connect section (or `GET /api/v1/groups/<slug>/plugin.zip`) and unpack it where Claude Code loads plugins from; a browser download carries a `<YOUR_KEY>` placeholder in `.mcp.json`.
+
+A group whose plugin cannot be built (two members with the same kind and name from different owners, which the plugin layout cannot separate with "Install as", or over 100 MB) is left out of the marketplace and `plugin.zip` answers 409 `path_conflict` / 413. The manifest reports it as `plugin: {ok: false, problem}`, the group page's Plugin tab shows the reason and its "Download plugin.zip" button is disabled with it.
+
+## OAuth for hosted MCP clients
+
+Hosted MCP hosts (Claude.ai, Claude Desktop, ChatGPT, VS Code, Claude Code without a pasted key) can connect to `/mcp` or `/mcp/<group>` with OAuth 2.1 instead of an API key. Point the host at the MCP URL and it does the rest: the 401 carries `WWW-Authenticate: Bearer resource_metadata=...`, the host reads `/.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server`, registers itself (dynamic client registration, anonymous, 20 per hour per IP; a registration nobody ever consents to is dropped after 7 days and the host simply registers again, while a consented one is kept however long its tokens have been gone, so the client id the host stored keeps working), and opens `/oauth/authorize` in your browser. You sign in if needed, land on the **Authorize** page, pick the permissions (`read` always, `write` optional) and either every group you can read or specific groups, and approve. The host exchanges the code for tokens and connects.
+
+- PKCE S256 is mandatory; redirect URIs must be `https://`, `http://` on `localhost`, `127.0.0.1` or `[::1]` (any port; RFC 8252 reserves the port exemption for the IP literals, `localhost` is accepted too because hosts commonly register it), or the private-use scheme of a native host (`cursor://anysphere.cursor-mcp/oauth/callback`, `vscode://...`, `com.example.app:/oauth`; RFC 8252), matched exactly. Browser-executed schemes (`javascript:`, `data:`, `blob:`, `file:`, `vbscript:`, `about:`) are refused. An unknown client or a redirect URI that does not match the registration is a 400 page, never a redirect; any other failure of a registered client (an unknown scope, a PKCE method other than S256, a bad `resource`) is reported to its redirect URI as `error=` with the `state` (RFC 6749 4.1.2.1), so the host's pending flow ends instead of waiting for a code.
+- Access tokens (`scp_at_...`) live 1 hour, refresh tokens (`scp_rt_...`) 30 days and rotate on every refresh; a rotated refresh token presented again revokes the whole grant, and so does replaying an authorization code with its PKCE verifier (without the verifier, or from another client, a spent code is refused and nothing is revoked: a leaked code cannot take the grant down). A client registered with `grant_types: ["authorization_code"]` alone gets no `refresh_token` and its refresh requests are 400 `unauthorized_client`. One exception: within 60 s of the rotation, while the grant still holds a live refresh token, the late call alone fails (`invalid_grant`) and the pair the first one issued survives. That is two refreshes in flight at access-token expiry (hosts do not serialize them), not a theft, and revoking would strand the host. Both are stored hashed. The token endpoint sweeps expired rows and rows revoked more than a day ago (on indexes), so a grant keeps a bounded number of rows however often it refreshes, and answers 30 requests, then one a second, per client address and per client id (429 `rate_limited`). A grant revoked by a replayed code or a reused refresh token is audited as `oauth.revoke` (`by: code_replay` / `reuse`).
+- OAuth tokens work on `/mcp*` only. They are refused everywhere under `/api/v1`, so a token leaked from an MCP host cannot manage the account, mint keys or read the audit log. They never carry admin rights either, even for an admin's consent: "every group you can read" means the groups a regular user with that account reads, and the consent page offers an admin only those (another user's private group is 400 `unknown_group`). An admin who wants admin reach over MCP mints an API key.
+- Every tool call and write made with a token is audited with the connected app's client id (`detail.oauthClientId`, shown as "app …xxxxxx" in Activity and Admin logs), so two apps stay tellable apart; a version an app writes names it the same way (`createdBy.clientId`, the item's Versions tab).
+- Revoke a connected app any time under **API Keys → Connected apps** (or `DELETE /api/v1/oauth/grants/<id>`). An admin password reset (Admin > Users, `PATCH /api/v1/users/<id> {password}`) is account recovery: it revokes the user's sessions, API keys, every OAuth grant and any authorization code still awaiting exchange, and drops any single sign-on link, so neither an intruder's connected app nor an IdP identity they bound to the account can get back in. Disabling a user voids their pending codes and revokes their grants too (a connected app has to be approved again once the account is enabled); their API keys survive, refused until then. Admins list and disable OAuth clients with `GET /api/v1/oauth/clients?limit=&offset=` (newest first, 50 a page, with `total`) and `PATCH /api/v1/oauth/clients/<id> {"disabled": true}`; disabling suspends every grant of that client (its tokens are refused, Connected apps shows "disabled by admin") until it is enabled again, it does not revoke them. The token endpoint answers a disabled client with 400 `invalid_grant`, not 401 `invalid_client`: on the latter an MCP host (the SDK behind Claude Code, Claude Desktop, VS Code, Cursor) discards its client id and registers itself afresh, back in business under a client nobody disabled; on the former it keeps its id and lands on the refusal page until the admin enables it.
+- Registration metadata `client_uri` and `logo_uri` must be `http(s)` URLs (400 `invalid_client_metadata`). The token request may omit `redirect_uri` (OAuth 2.1; PKCE binds the code), and a failed HTTP Basic client authentication answers `401` with `WWW-Authenticate: Basic realm="oauth"`.
+- `SCP_PUBLIC_URL` must be the URL the host reaches you on: it is the issuer and the `resource` identifier in the metadata documents, and hosts refuse metadata whose issuer does not match. The 401 on `/mcp/<group>` points at `/.well-known/oauth-protected-resource/mcp/<group>`, whose `resource` is that URL (RFC 9728); one token still covers every MCP path. Group slugs are case-insensitive, so a host pointed at `/mcp/Kit` authorizes like `/mcp/kit`.
+
+Endpoints: `GET /.well-known/oauth-authorization-server`, `GET /.well-known/oauth-protected-resource[/mcp[/<group>]]`, `POST /oauth/register`, `GET /oauth/authorize`, `POST /oauth/token` (`authorization_code`, `refresh_token`; form or JSON; `client_secret_post` or HTTP Basic for confidential clients), `POST /oauth/revoke`.
+
+## OIDC login
+
+SCP can sign users in through an external OpenID Connect provider (Authelia, Keycloak, Authentik, Entra ID, Google Workspace, ...). Set the three required values and a "Continue with <label>" button appears on the login page:
+
+| Variable | Setting key (Admin > Settings) | Meaning |
+|---|---|---|
+| `SCP_OIDC_ISSUER` | `oidc.issuer` | Issuer URL; `{issuer}/.well-known/openid-configuration` must exist and name the same issuer |
+| `SCP_OIDC_CLIENT_ID` | `oidc.client_id` | Client id registered at the IdP |
+| `SCP_OIDC_CLIENT_SECRET` | `oidc.client_secret` | Client secret (confidential client). Sent as HTTP Basic (`client_secret_basic`, the OIDC default and what Authelia enforces), or in the body when the discovery document lists `client_secret_post` alone |
+| `SCP_OIDC_AUTO_REGISTER` | `oidc.auto_register` | Create an account on first sign-in (default `true`), independently of `SCP_ALLOW_REGISTRATION` |
+| `SCP_OIDC_LABEL` | `oidc.label` | Button text (default `Single sign-on`) |
+
+An environment variable wins over the admin setting for that field. Register the redirect URI `{SCP_PUBLIC_URL}/api/v1/auth/oidc/callback` at the IdP; SCP asks for the `openid email profile` scopes, uses PKCE (S256), and accepts `RS256` or `ES256` id_tokens.
+
+How a sign-in maps to an account, in order:
+
+1. A user already linked to this identity (issuer + `sub`).
+2. A user whose email equals the token's `email`, when the IdP marks it `email_verified: true` and that account has no password (an auto-registered account whose link an admin dropped): linked. An account with a password is never linked from the callback, because anyone may have registered that address first and kept the password (a pre-hijack); the page says to sign in with the password and link single sign-on from the account menu.
+3. When auto-register is on and the IdP sent an email it does not call unverified: a new account. The username comes from `preferred_username` (else the email's local part), lowercased and slugified to SCP's username rules, with `-2`, `-3`, ... appended on a clash. Such accounts have no password: password login always fails for them. An admin can set one from Admin > Users (`PATCH /users/:id {password}`); `POST /auth/password` needs the current password, so it is not usable for them.
+4. Otherwise a "no account" page. An admin creates the account (Admin > Users) and the user links it from their account menu, or the admin turns auto-register on.
+
+A signed-in user links their own account from the user menu (`Link <label>`: `POST /api/v1/auth/oidc/link {next}` answers the IdP URL the browser then follows): the browser session is the proof of ownership, the callback then stores the identity on that account (403 when the identity already belongs to another account, or the account to a different identity). The link is bound to that session: if it ends before the callback (an admin reset, a logout) the link is refused. Linking starts from a POST only, so a page that navigates a signed-in user to `/auth/oidc/start` gets a plain sign-in, never a link. Password login keeps working after a link.
+
+A link is dropped three ways: the user from the account menu (`Unlink <label>`: `POST /api/v1/auth/oidc/unlink`, 409 for an account without a password, which would become unreachable), an admin from Admin > Users ("Unlink SSO": `PATCH /api/v1/users/<id> {oidcUnlink: true}`, 409 for a password-less account unless a `password` comes in the same request; `GET /users` reports `oidcLinked` per user), and an admin password reset, which is account recovery and drops the link with everything else. Unlinking is how an account follows the IdP to a new issuer URL (a realm rename, http to https): the old link reads as "linked to a different identity, or to this provider under a previous issuer URL", the user unlinks and links again. The anonymous `/auth/oidc/start` and `/auth/oidc/callback` share the per-address rate limit of login and register (20, then one every 2 s), so a replayed state cannot drive token exchanges, which carry the client secret, at any rate.
+
+Disabled accounts cannot sign in through OIDC either. SCP contacts only the token endpoint and JWKS the discovery document advertises, and only on a public `https://` host (the issuer's own or another, as Google and Cognito serve them from `*.googleapis.com` / `*.amazoncognito.com`); plain `http://` or an internal address (loopback, private, link-local) is refused unless the issuer itself is there (a local or test IdP). Requests time out after 10 seconds; discovery and keys are cached for 10 minutes, and a key rotation is picked up on the next unknown `kid`.
+
+## Admin
+
+Admins get three pages: **Users** (`/admin/users`), **Logs** (`/admin/logs`) and **Settings** (`/admin/settings`).
+
+### Admin settings and storage
+
+Admins manage server settings at `/admin/settings` (API: `GET`/`PUT /api/v1/admin/settings`). Settings live in the SQLite `settings` table under these keys: `oidc.issuer`, `oidc.client_id`, `oidc.client_secret`, `oidc.auto_register`, `oidc.label`, `github.token`. An environment variable (`SCP_OIDC_*`, `SCP_GITHUB_TOKEN`) always wins over the stored value and makes that one field read-only in the UI (the API lists them as `oidc.envFields` and answers `400 env_managed`); the other fields stay editable, so `SCP_OIDC_LABEL` alone does not lock the issuer. Unset the variable to manage the value in the app. Secrets are write-only: the API reports `clientSecretSet` / `tokenSet`, never the value, and the audit log records only which keys changed. Sending `""` clears a value; omitted fields are kept.
+
+The same page shows storage statistics and a "Sweep orphan blobs" button (`POST /api/v1/admin/gc`). File contents are stored once per sha256. Blob rows are removed in the same transaction as the item or user delete that drops their last reference, and a full sweep runs at boot (this reclaims space left by a database created before v2). The button runs that sweep by hand and is disabled while there is nothing to sweep.
+
+### Admin logs
+
+`/admin/logs` lists every user's audit events with filters (`GET /api/v1/audit?all=1&user=<username>&action=<prefix>&q=<text>&before=<id>&limit=`). `before` is a cursor: pass the smallest id of the page you have to load the next one. Non-admins can use the same filters on `/api/v1/audit` for their own events.
+
+### Users
+
+Admins can rename a user and change their email inline on `/admin/users` (`PATCH /api/v1/users/:id {username, email}`; 409 when either is taken). Renaming keeps the user's sessions and keys. A user linked to single sign-on carries an "SSO" badge and an "Unlink SSO" action (see OIDC login).
 
 ## Security model
 

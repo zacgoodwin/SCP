@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import * as api from '../api.ts';
+import * as oauth from '../api-oauth.ts';
 import { CopyBlock } from '../components/CopyBlock.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
 import { Modal } from '../components/Modal.tsx';
@@ -24,7 +25,8 @@ export function KeysPage() {
   const [error, setError] = useState<unknown>(null);
   const [open, setOpen] = useState(Boolean(preselect));
 
-  const load = () => api.listKeys().then((r) => setKeys(r.keys), (e) => (setError(e), setKeys([])));
+  // A failed load keeps the list unknown (null), never the "No API keys yet" empty state.
+  const load = () => (setError(null), api.listKeys().then((r) => setKeys(r.keys), setError));
   useEffect(() => void load(), []);
 
   const close = () => {
@@ -45,17 +47,19 @@ export function KeysPage() {
   return (
     <div className="page">
       <header className="page-head">
-        <div className="stack-tight">
+        <div className="page-title">
           <h1>API keys</h1>
           <p className="muted">Keys let agents reach MCP endpoints and bundles as you. Restrict a key to the groups it needs.</p>
         </div>
-        <button type="button" className="btn btn-primary" onClick={() => setOpen(true)}>
-          New key
-        </button>
+        <div className="page-actions">
+          <button type="button" className="btn btn-primary" onClick={() => setOpen(true)}>
+            New key
+          </button>
+        </div>
       </header>
-      <ErrorBox error={error} />
+      <ErrorBox error={error} onRetry={() => void load()} />
       {keys === null ? (
-        <p className="muted" role="status">Loading…</p>
+        error ? null : <p className="muted" role="status">Loading…</p>
       ) : keys.length === 0 ? (
         <div className="empty">
           <p>No API keys yet. Mint one to connect an agent.</p>
@@ -75,7 +79,7 @@ export function KeysPage() {
                 <th scope="col">Created</th>
                 <th scope="col">Last used</th>
                 <th scope="col">Expires</th>
-                <th scope="col">
+                <th scope="col" className="cell-actions">
                   <span className="sr-only">Actions</span>
                 </th>
               </tr>
@@ -122,7 +126,7 @@ export function KeysPage() {
                     {/* Listed until revoked, but every request with it is a 401. */}
                     {k.expiresAt && Date.parse(k.expiresAt) <= Date.now() && <span className="badge"> expired</span>}
                   </td>
-                  <td>
+                  <td className="cell-actions">
                     <button type="button" className="btn btn-small btn-danger" onClick={() => void revoke(k)}>
                       Revoke
                     </button>
@@ -136,7 +140,116 @@ export function KeysPage() {
       <Modal open={open} title="New API key" onClose={close}>
         <CreateKeyForm preselect={preselect} onCreated={() => void load()} onDone={close} />
       </Modal>
+      <ConnectedApps />
     </div>
+  );
+}
+
+/** OAuth grants (D2): hosted MCP clients that went through /consent. Revoking kills their tokens. */
+function ConnectedApps() {
+  const toast = useToast();
+  const [grants, setGrants] = useState<oauth.Grant[] | null>(null);
+  const [error, setError] = useState<unknown>(null);
+
+  const load = () => (setError(null), oauth.listGrants().then((r) => setGrants(r.grants), setError));
+  useEffect(() => void load(), []);
+
+  const revoke = async (g: oauth.Grant) => {
+    if (!confirm(`Disconnect "${g.client.name}"? It loses access immediately and must ask for consent again.`)) return;
+    try {
+      await oauth.revokeGrant(g.grantId);
+      toast('App disconnected.', 'ok');
+      void load();
+    } catch (e) {
+      toast(api.errorMessage(e), 'error');
+    }
+  };
+
+  return (
+    <section className="stack">
+      <div className="stack-tight">
+        <h2>Connected apps</h2>
+        <p className="muted">
+          Hosted MCP clients you authorized with OAuth. They reach the MCP endpoints only, never your account, and never with admin rights. The id next
+          to each app is what its actions carry in the activity log.
+        </p>
+      </div>
+      <ErrorBox error={error} onRetry={() => void load()} />
+      {grants === null ? (
+        error ? null : <p className="muted" role="status">Loading…</p>
+      ) : grants.length === 0 ? (
+        <div className="empty">
+          <p>No connected apps.</p>
+          <p className="muted">An MCP host that supports OAuth connects by pointing at a group's MCP URL and asking for consent; it shows up here.</p>
+        </div>
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th scope="col">App</th>
+                <th scope="col">Scopes</th>
+                <th scope="col">Groups</th>
+                <th scope="col">Connected</th>
+                <th scope="col">Last used</th>
+                <th scope="col">Expires</th>
+                <th scope="col" className="cell-actions">
+                  <span className="sr-only">Actions</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {grants.map((g) => (
+                <tr key={g.grantId}>
+                  <td>
+                    {g.client.name} <code className="muted">…{g.client.id.slice(-6)}</code>
+                    {g.clientDisabled && <span className="badge badge-disabled"> disabled by admin</span>}
+                  </td>
+                  <td>
+                    <span className="badges">
+                      {g.scopes.map((s) => (
+                        <span key={s} className="badge">
+                          {s}
+                        </span>
+                      ))}
+                    </span>
+                  </td>
+                  <td>
+                    {g.groups === null ? (
+                      <span className="muted">all readable groups</span>
+                    ) : g.groups.length === 0 ? (
+                      <span className="muted">none (groups deleted)</span>
+                    ) : (
+                      <span className="row wrap">
+                        {g.groups.map((x) => (
+                          <Link key={x.id} to={`/groups/${encodeURIComponent(x.slug)}`}>
+                            {x.slug}
+                          </Link>
+                        ))}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    <When iso={g.createdAt} />
+                  </td>
+                  <td>
+                    <When iso={g.lastUsedAt} />
+                  </td>
+                  <td>
+                    <When iso={g.expiresAt} />
+                  </td>
+                  <td className="cell-actions">
+                    <button type="button" className="btn btn-small btn-danger" onClick={() => void revoke(g)}>
+                      Disconnect
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 

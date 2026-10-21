@@ -3,10 +3,18 @@ import { Link, useRouteError } from 'react-router';
 export function NotFoundPage() {
   return (
     <div className="page">
-      <h1>Page not found</h1>
-      <p>
-        <Link to="/">Go to the dashboard</Link>
-      </p>
+      <header className="page-head">
+        <div className="page-title">
+          <h1>Page not found</h1>
+          <p className="muted">Nothing lives at this address. It may have been deleted, or the link is wrong.</p>
+        </div>
+      </header>
+      <div className="empty">
+        <p>Try one of the sections in the sidebar.</p>
+        <Link className="btn btn-primary" to="/">
+          Go to the dashboard
+        </Link>
+      </div>
     </div>
   );
 }

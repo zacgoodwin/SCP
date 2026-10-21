@@ -176,6 +176,12 @@ test('bundle.zip refuses over 100 MB uncompressed; groups cap members and files'
   const r = await t.req('GET', `${API}/groups/kit/bundle.zip`, { headers: h });
   assert.equal(r.status, 413);
   assert.equal(r.json.error.code, 'bundle_too_large');
+  // The manifest reports the same refusal for both downloads, so the UI never offers a link the server answers 413 to.
+  const m = await t.req('GET', `${API}/groups/kit/manifest`, { headers: h });
+  assert.equal(m.status, 200, m.text);
+  assert.equal(m.json.bundle.code, 'bundle_too_large');
+  assert.equal(m.json.bundle.problem, r.json.error.message);
+  assert.equal(m.json.plugin.code, 'bundle_too_large');
 
   // 500 members at most (raw rows: the cap counts rows, not what resolves).
   const full = await group(t, h, { slug: 'full', name: 'Full' });

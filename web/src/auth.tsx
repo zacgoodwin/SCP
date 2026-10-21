@@ -71,5 +71,18 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   return children;
 }
 
-/** Only same-app relative paths are honored as ?next= targets (no open redirect). */
-export const safeNext = (next: string | null) => (next && next.startsWith('/') && !next.startsWith('//') ? next : '/');
+/**
+ * Only same-app paths are honored as ?next= targets, normalized by the URL parser (mirrors
+ * server/src/auth/oidc.ts safeNext): a prefix check alone lets `/\evil.com` or `/<TAB>/evil.com`
+ * through, which browsers resolve to another host. A parsed pathname starting with `//`
+ * (`/..//evil.com`: dot segments collapse to a scheme-relative URL) is refused for the same reason.
+ */
+export const safeNext = (next: string | null) => {
+  if (!next || !next.startsWith('/')) return '/';
+  try {
+    const u = new URL(next, window.location.origin);
+    return u.origin === window.location.origin && !u.pathname.startsWith('//') ? u.pathname + u.search + u.hash : '/';
+  } catch {
+    return '/';
+  }
+};

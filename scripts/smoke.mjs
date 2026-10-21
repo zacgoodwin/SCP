@@ -20,7 +20,8 @@ const req = createRequire(new URL('../server/package.json', import.meta.url));
 const load = (spec) => import(pathToFileURL(req.resolve(spec)).href);
 const { Client } = await load('@modelcontextprotocol/sdk/client/index.js');
 const { StreamableHTTPClientTransport } = await load('@modelcontextprotocol/sdk/client/streamableHttp.js');
-const { unzipSync, strFromU8 } = await load('fflate');
+const { unzipSync, zipSync, strFromU8, strToU8 } = await load('fflate');
+import { createHash } from 'node:crypto';
 
 let step = 0;
 const ok = (msg) => console.log(`ok ${++step} - ${msg}`);
@@ -166,7 +167,110 @@ const revoke = await api('DELETE', `/api/v1/shares/${shares.json.shares[0].id}`)
 check(revoke.status === 204, 'revoke share');
 check((await fetch(`${ART}/r/${token}`)).status === 404, 'revoked share 404s');
 
-// 8. cleanup checks: key revocation stops MCP
+// 8. v2: OAuth 2.1 for hosted MCP clients (metadata -> DCR -> authorize -> consent -> token -> MCP)
+const prm = await fetch(`${BASE}/.well-known/oauth-protected-resource`).then((r) => r.json());
+check(prm.resource === `${BASE}/mcp` && prm.authorization_servers?.[0] === BASE, 'protected resource metadata', prm);
+const asm = await fetch(`${BASE}/.well-known/oauth-authorization-server`).then((r) => r.json());
+check(asm.token_endpoint === `${BASE}/oauth/token` && asm.code_challenge_methods_supported?.includes('S256'), 'authorization server metadata', asm);
+const redirectUri = 'http://127.0.0.1:9/callback';
+const dcr = await fetch(`${BASE}/oauth/register`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ client_name: `smoke-host-${id}`, redirect_uris: [redirectUri] }),
+});
+const clientReg = await dcr.json();
+check(dcr.status === 201 && typeof clientReg.client_id === 'string', 'dynamic client registration', clientReg);
+const verifier = randomBytes(32).toString('base64url');
+const challenge = createHash('sha256').update(verifier).digest('base64url');
+const authQuery = new URLSearchParams({
+  response_type: 'code',
+  client_id: clientReg.client_id,
+  redirect_uri: redirectUri,
+  code_challenge: challenge,
+  code_challenge_method: 'S256',
+  state: `st-${id}`,
+  scope: 'read',
+});
+const authz = await fetch(`${BASE}/oauth/authorize?${authQuery}`, { redirect: 'manual' });
+check(authz.status === 302 && (authz.headers.get('location') ?? '').startsWith(`${BASE}/consent?`), 'authorize hands off to the consent page', authz.headers.get('location'));
+const consentQuery = Object.fromEntries(authQuery);
+const consentInfo = await api('GET', `/api/v1/oauth/consent?${authQuery}`);
+check(consentInfo.status === 200 && consentInfo.json.client?.name === `smoke-host-${id}`, 'consent info names the client', consentInfo.json);
+const decision = await api('POST', '/api/v1/oauth/consent', { ...consentQuery, approve: true, scopes: ['read'], groups: [slug] });
+check(decision.status === 200 && decision.json.redirect?.startsWith(redirectUri), 'consent approved with a code', decision.json);
+const cbUrl = new URL(decision.json.redirect);
+check(cbUrl.searchParams.get('state') === `st-${id}`, 'state echoed verbatim');
+const tokenRes = await fetch(`${BASE}/oauth/token`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams({
+    grant_type: 'authorization_code',
+    code: cbUrl.searchParams.get('code'),
+    redirect_uri: redirectUri,
+    client_id: clientReg.client_id,
+    code_verifier: verifier,
+  }),
+});
+const tokens = await tokenRes.json();
+check(tokenRes.status === 200 && tokens.access_token?.startsWith('scp_at_') && tokens.refresh_token?.startsWith('scp_rt_'), 'code exchanged for tokens', tokens);
+const mcpPost = (bearer) =>
+  fetch(`${BASE}/mcp/${slug}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${bearer}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+  });
+check((await mcpPost(tokens.access_token)).status === 200, 'OAuth access token works on MCP');
+check((await api('GET', '/api/v1/auth/me', undefined, { Authorization: `Bearer ${tokens.access_token}` })).status === 401, 'OAuth token is refused on /api/v1');
+const grants = await api('GET', '/api/v1/oauth/grants');
+check(grants.status === 200 && grants.json.grants.length === 1, 'grant listed as a connected app', grants.json);
+check((await api('DELETE', `/api/v1/oauth/grants/${grants.json.grants[0].grantId}`)).status === 204, 'grant revoked');
+check((await mcpPost(tokens.access_token)).status === 401, 'revoked OAuth token is rejected on MCP');
+check((await api('GET', '/api/v1/auth/oidc/start')).status === 404, 'OIDC start is 404 while unconfigured');
+
+// 9. v2: nested groups flow through a restricted key; marketplace export
+const tip = await api('POST', '/api/v1/items', { kind: 'prompt', name: `tip-${id}`, content: 'Summarize {{text}} in one line.' });
+check(tip.status === 201, 'create prompt for the base group', tip.json);
+const baseSlug = `${slug}-base`;
+const base = await api('POST', '/api/v1/groups', { slug: baseSlug, name: `Base ${id}` });
+check(base.status === 201, 'create base group', base.json);
+check((await api('POST', `/api/v1/groups/${baseSlug}/members`, { itemId: tip.json.item.id })).status === 201, 'add prompt to base group');
+const inc = await api('POST', `/api/v1/groups/${slug}/includes`, { slug: baseSlug });
+check(inc.status === 201 && inc.json.group.includes?.some((g) => g.slug === baseSlug), 'include base group', inc.json);
+const viaMember = inc.json.group.members.find((m) => m.item.id === tip.json.item.id);
+check(viaMember?.via === baseSlug, 'included member shows via', viaMember);
+const manifest2 = await api('GET', `/api/v1/groups/${slug}/manifest`, undefined, auth);
+check(manifest2.status === 200 && manifest2.json.items.some((i) => i.name === `tip-${id}`), 'restricted key sees the included member in the manifest', manifest2.json);
+check((await api('POST', `/api/v1/groups/${baseSlug}/includes`, { slug })).status === 409, 'include cycle is 409');
+const market = await api('GET', `/m/${key.json.token}/marketplace.json`);
+const plugin = market.json?.plugins?.find((p) => p.name === slug);
+// No sha256 pin: the listing builds no zip (groups/marketplace.ts); the version is a UTC clock of the latest change.
+check(
+  market.status === 200 && plugin?.source?.source === 'archive' && plugin.source.url.endsWith(`/m/${key.json.token}/${slug}/plugin.zip`) && /^\d{8}\.\d{9}$/.test(plugin.version),
+  'marketplace.json lists the group as an archive plugin',
+  market.json,
+);
+const pz = await api('GET', `/m/${key.json.token}/${slug}/plugin.zip`);
+check(pz.status === 200, 'plugin.zip downloads');
+const pzFiles = unzipSync(pz.bytes);
+for (const p of ['.claude-plugin/plugin.json', `skills/smoke-skill-${id}/SKILL.md`, `agents/reviewer-${id}.md`, '.mcp.json']) check(p in pzFiles, `plugin.zip contains ${p}`, Object.keys(pzFiles));
+check(strFromU8(pzFiles['.mcp.json']).includes(key.json.token), 'plugin .mcp.json carries the key');
+check((await api('GET', `/m/scp_not_a_key/marketplace.json`)).status === 404, 'unknown marketplace token is 404');
+
+// 10. v2: pack import creates many items and a group, with provenance
+const packZip = zipSync({
+  [`pack/skills/alpha-${id}/SKILL.md`]: strToU8(`---\nname: alpha-${id}\ndescription: Alpha skill from a pack.\n---\n# Alpha\n`),
+  [`pack/agents/beta-${id}.md`]: strToU8(`---\nname: beta-${id}\ndescription: Beta agent from a pack.\n---\nYou are beta.\n`),
+  [`pack/prompts/gamma-${id}.md`]: strToU8('Say gamma.\n'),
+});
+const packForm = new FormData();
+packForm.set('file', new Blob([packZip], { type: 'application/zip' }), `pack-${id}.zip`);
+packForm.set('group', `pack-${id}`);
+const pack = await api('POST', '/api/v1/items/import/pack', packForm);
+check(pack.status === 201 && pack.json.items?.length === 3 && pack.json.group?.slug === `pack-${id}`, 'pack import creates 3 items and a group', pack.json);
+check(pack.json.items.every((i) => i.source?.kind === 'zip' && i.source.commit?.length === 64), 'pack items record zip provenance', pack.json.items?.map((i) => i.source));
+check((await api('POST', `/api/v1/items/${pack.json.items[0].id}/source/check`)).status === 404, 'source check is 404 for a zip source');
+
+// 11. cleanup checks: key revocation stops MCP
 await api('DELETE', `/api/v1/keys/${key.json.key.id}`);
 const dead = await fetch(`${BASE}/mcp/${slug}`, {
   method: 'POST',

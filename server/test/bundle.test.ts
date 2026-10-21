@@ -247,6 +247,11 @@ test('path conflicts count multi-file extras, in the manifest and on member add'
   assert.equal(v2.status, 201, v2.text);
   const m = await t.req('GET', `${API}/groups/kit/manifest`, { headers: h });
   assert.deepEqual(m.json.conflicts, [{ path: '.scp/design/brand/notes.md', items: ['brand', 'notes'] }]);
+  // The manifest says bundle.zip cannot be built, with the very refusal the download answers, so the UI can gate the link.
+  assert.equal(m.json.bundle.ok, false);
+  assert.equal(m.json.bundle.code, 'path_conflict');
+  assert.match(m.json.bundle.problem, /both install to '\.scp\/design\/brand\/notes\.md'/);
+  assert.deepEqual(m.json.plugin, { ok: true, problem: null, code: null }, 'the plugin layout keeps the two apart');
   assert.equal((await t.req('GET', `${API}/groups/kit/bundle.zip`, { headers: h })).status, 409);
   // The same clash is refused up front when it is created by adding a member.
   const other = await item(t, h, { kind: 'prompt', name: 'other', content: 'Other.' });

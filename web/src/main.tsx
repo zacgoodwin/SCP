@@ -5,7 +5,10 @@ import { AuthProvider, RequireAuth } from './auth.tsx';
 import { Layout } from './components/Layout.tsx';
 import { ToastProvider } from './components/Toast.tsx';
 import { ActivityPage } from './pages/Activity.tsx';
+import { AdminLogsPage } from './pages/AdminLogs.tsx';
+import { AdminSettingsPage } from './pages/AdminSettings.tsx';
 import { AdminUsersPage } from './pages/AdminUsers.tsx';
+import { ConsentPage } from './pages/Consent.tsx';
 import { DashboardPage } from './pages/Dashboard.tsx';
 import { GroupDetailPage } from './pages/GroupDetail.tsx';
 import { GroupsPage } from './pages/Groups.tsx';
@@ -21,6 +24,16 @@ import './styles.css';
 const router = createBrowserRouter([
   { path: '/login', element: <LoginPage />, errorElement: <RouteErrorPage /> },
   { path: '/register', element: <RegisterPage />, errorElement: <RouteErrorPage /> },
+  // Consent is a standalone card, like login: an OAuth client sent the user here, not the app's nav.
+  {
+    path: '/consent',
+    element: (
+      <RequireAuth>
+        <ConsentPage />
+      </RequireAuth>
+    ),
+    errorElement: <RouteErrorPage />,
+  },
   {
     element: (
       <RequireAuth>
@@ -40,6 +53,8 @@ const router = createBrowserRouter([
       { path: '/keys', element: <KeysPage /> },
       { path: '/activity', element: <ActivityPage /> },
       { path: '/admin/users', element: <AdminUsersPage /> },
+      { path: '/admin/logs', element: <AdminLogsPage /> },
+      { path: '/admin/settings', element: <AdminSettingsPage /> },
       { path: '*', element: <NotFoundPage /> },
     ],
   },

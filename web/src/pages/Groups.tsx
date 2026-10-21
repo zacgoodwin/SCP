@@ -53,13 +53,15 @@ export function GroupsPage() {
   return (
     <div className="page">
       <header className="page-head">
-        <div className="stack-tight">
+        <div className="page-title">
           <h1>Groups</h1>
           <p className="muted">A group bundles skills, MDs and artifacts into one MCP server and one installable bundle.</p>
         </div>
-        <button type="button" className="btn btn-primary" onClick={() => setNewOpen(true)}>
-          New group
-        </button>
+        <div className="page-actions">
+          <button type="button" className="btn btn-primary" onClick={() => setNewOpen(true)}>
+            New group
+          </button>
+        </div>
       </header>
 
       <label className="field">
@@ -73,7 +75,10 @@ export function GroupsPage() {
       ) : groups.length === 0 ? (
         <div className="empty">
           {q ? (
-            <p>No groups match "{q}".</p>
+            <>
+              <p>No groups match "{q}".</p>
+              <p className="muted">Try another name or slug, or clear the search.</p>
+            </>
           ) : (
             <>
               <p>No groups yet. Create one, add items to it, then connect an agent.</p>

@@ -34,7 +34,8 @@ export function LoginPage() {
   return (
     <main className="auth-page">
       <form className="card auth-card stack" onSubmit={submit}>
-        <h1>Sign in to SCP</h1>
+        <p className="auth-brand">SCP</p>
+        <h1>Sign in</h1>
         <label className="field">
           <span>Email or username</span>
           <input autoComplete="username" required autoFocus value={login} onChange={(e) => setLogin(e.target.value)} />
@@ -47,6 +48,11 @@ export function LoginPage() {
         <button type="submit" className="btn btn-primary btn-block" disabled={busy}>
           {busy ? 'Signing in…' : 'Sign in'}
         </button>
+        {config?.oidc?.enabled && (
+          <a className="btn btn-block" href={`/api/v1/auth/oidc/start?next=${encodeURIComponent(next)}`}>
+            Continue with {config.oidc.label}
+          </a>
+        )}
         {config?.registration !== false && (
           <p className="muted">
             No account? <Link to={`/register${next !== '/' ? `?next=${encodeURIComponent(next)}` : ''}`}>Register</Link>

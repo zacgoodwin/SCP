@@ -10,7 +10,12 @@ import { authRoutes } from './auth/routes.ts';
 import { UPLOAD_ROUTES, itemRoutes } from './items/routes.ts';
 import { artifactApiRoutes, artifactOriginRoutes, sharePageRoutes } from './artifacts/routes.ts';
 import { groupRoutes } from './groups/routes.ts';
+import { marketplaceRoutes } from './groups/marketplace.ts';
 import { mcpRoutes } from './mcp/routes.ts';
+import { importRoutes } from './imports/routes.ts';
+import { oauthApiRoutes, oauthRoutes } from './oauth/routes.ts';
+import { oidcRoutes } from './auth/oidc.ts';
+import { adminRoutes } from './admin/routes.ts';
 import type { AppEnv, Ctx } from './types.ts';
 
 export function buildApp(ctx: Ctx) {
@@ -32,10 +37,14 @@ export function buildApp(ctx: Ctx) {
   const api = new Hono<AppEnv>();
   api.use('*', bodyCap, principalMiddleware, csrfForCookies);
   api.route('/', authRoutes);
+  api.route('/', oidcRoutes);
   api.route('/', itemRoutes);
+  api.route('/', importRoutes);
   api.route('/', artifactApiRoutes);
   api.route('/', groupRoutes);
   api.route('/', auditRoutes);
+  api.route('/', oauthApiRoutes);
+  api.route('/', adminRoutes);
   api.all('*', () => {
     throw notFound('route');
   });
@@ -50,9 +59,17 @@ export function buildApp(ctx: Ctx) {
   });
   app.route('/', mcpRoutes);
   app.route('/', sharePageRoutes);
-  // No OAuth here. MCP clients probe these after a 401; the SPA fallback answered them with
-  // index.html and a 200, which they failed to parse as JSON instead of showing the 401.
+  app.route('/', marketplaceRoutes);
+  // OAuth server (D2): /oauth/* and the two /.well-known documents. Any other /.well-known path is a
+  // JSON 404: MCP clients probe these after a 401, and the SPA fallback used to answer with index.html.
+  app.route('/', oauthRoutes);
   app.all('/.well-known/*', () => {
+    throw notFound('route');
+  });
+  app.all('/oauth/*', () => {
+    throw notFound('route');
+  });
+  app.all('/m/*', () => {
     throw notFound('route');
   });
 

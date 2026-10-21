@@ -20,15 +20,20 @@ export const publishedSql = (i = 'i', g = 'g') => `(${i}.owner_id = ${g}.owner_i
  */
 const ownerEnabled = (ownerCol: string) => `NOT EXISTS (SELECT 1 FROM users du WHERE du.id = ${ownerCol} AND du.disabled = 1)`;
 
+/**
+ * WHERE fragment: group alias `g` is readable by the plain (non-admin) user whose id is the SQL
+ * expression `user` (a column, or `?` bound twice): their own, public, or shared with them, and the
+ * group's owner enabled.
+ */
+export const groupReadableByUserSql = (user: string, g = 'g') =>
+  `(${g}.owner_id = ${user} OR ${g}.visibility = 'public' OR (${g}.visibility = 'shared' AND EXISTS (SELECT 1 FROM group_shares gs WHERE gs.group_id = ${g}.id AND gs.user_id = ${user}))) AND ${ownerEnabled(`${g}.owner_id`)}`;
+
 /** WHERE fragment: group alias `g` is readable by p. */
 export function groupReadSql(p: Principal, g = 'g'): SqlFrag {
   const parts: string[] = [];
   const params: SQLInputValue[] = [];
   if (!p.isAdmin) {
-    parts.push(
-      `(${g}.owner_id = ? OR ${g}.visibility = 'public' OR (${g}.visibility = 'shared' AND EXISTS (SELECT 1 FROM group_shares gs WHERE gs.group_id = ${g}.id AND gs.user_id = ?)))`,
-      ownerEnabled(`${g}.owner_id`),
-    );
+    parts.push(groupReadableByUserSql('?', g));
     params.push(p.userId, p.userId);
   }
   if (p.groupIds) {
@@ -38,16 +43,74 @@ export function groupReadSql(p: Principal, g = 'g'): SqlFrag {
   return { sql: parts.length ? parts.join(' AND ') : '1', params };
 }
 
+/** Nested groups (docs/PLAN-v2.md D5): the longest include chain, root at depth 0. */
+export const MAX_INCLUDE_DEPTH = 4;
+
 /**
- * WHERE fragment: item alias `i` is readable by p. A restricted key (groupIds set) sees only
- * members of its groups, even items the user owns: full containment.
+ * Include edge `parent` -> `child` flows while the child is something the parent's owner could
+ * publish themselves: their own group, or a public one (its owner enabled). The same rule as
+ * item_not_shareable (publishedSql): a group shared with the parent's owner by name is not theirs
+ * to republish, or a share recipient could make a public group out of another user's private items.
+ * No admin override either.
+ */
+export const includeVouchSql = (parent: string, child: string) =>
+  `(${child}.owner_id = ${parent}.owner_id OR ${child}.visibility = 'public') AND ${ownerEnabled(`${child}.owner_id`)}`;
+
+/**
+ * Rows one upward walk may dequeue and expand (SQLite's LIMIT on the recursive select stops the
+ * recursion at that many rows). Each expansion joins the row's parents, and fan-in is capped at
+ * MAX_INCLUDED_BY (groups/service.ts insertInclude), so one item row costs at most MAX_UP_ROWS x
+ * MAX_INCLUDED_BY edge visits on every other user's listing, however large the DAG above it. The
+ * cap is the bound; this is the backstop for a DAG grown past it (an older build). ponytail: a group
+ * reachable only past MAX_UP_ROWS serves nothing through SQL; its owner trims an include.
+ */
+export const MAX_UP_ROWS = 1000;
+
+/**
+ * Recursive CTE up_r(group_id, depth): the groups serving one item. Anchored on the item's own
+ * group_members rows (gm_r, with the group as g_c; `itemIs` names the item id, `join` may bring the
+ * item row in as `i`), each anchor group publishing the item (publishedSql), then walked upward
+ * through group_includes while each parent's owner vouches for the child (includeVouchSql), at most
+ * MAX_INCLUDE_DEPTH hops and MAX_UP_ROWS rows: the same walk as groups/service.ts effectiveGroups,
+ * upward. Never anchored on "every readable group": public groups are attacker-sized.
+ */
+const upCte = (i: string, itemIs: string, join = '') =>
+  `WITH RECURSIVE up_r(group_id, depth) AS (` +
+  `SELECT gm_r.group_id, 0 FROM group_members gm_r JOIN scp_groups g_c ON g_c.id = gm_r.group_id${join} WHERE gm_r.item_id = ${itemIs} AND ${publishedSql(i, 'g_c')}` +
+  ` UNION SELECT gi_r.group_id, up_r.depth + 1 FROM up_r JOIN group_includes gi_r ON gi_r.included_id = up_r.group_id` +
+  ` JOIN scp_groups par_r ON par_r.id = gi_r.group_id JOIN scp_groups chi_r ON chi_r.id = up_r.group_id` +
+  ` WHERE up_r.depth < ${MAX_INCLUDE_DEPTH} AND ${includeVouchSql('par_r', 'chi_r')} LIMIT ${MAX_UP_ROWS})`;
+
+/** WHERE fragment: item alias `i` is served by a group p can read, as a direct member or through includes. */
+export function servedBySql(p: Principal, i = 'i'): SqlFrag {
+  const g = groupReadSql(p, 'g_r');
+  return { sql: `EXISTS (${upCte(i, `${i}.id`)} SELECT 1 FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql})`, params: g.params };
+}
+
+/** WHERE fragment: item alias `i` is served by the one group `groupId`, directly or through its includes (group-scoped search). */
+export function servedByGroupSql(groupId: string, i = 'i'): SqlFrag {
+  return { sql: `EXISTS (${upCte(i, `${i}.id`)} SELECT 1 FROM up_r WHERE up_r.group_id = ?)`, params: [groupId] };
+}
+
+/** Query: slug and name of every group p can read that serves the item whose id is bound first (item detail). */
+export function servingGroupsSql(p: Principal): SqlFrag {
+  const g = groupReadSql(p, 'g_r');
+  return {
+    sql: `${upCte('i', '?', ' JOIN items i ON i.id = gm_r.item_id')} SELECT DISTINCT g_r.slug, g_r.name FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql} ORDER BY g_r.name`,
+    params: g.params,
+  };
+}
+
+/**
+ * WHERE fragment: item alias `i` is readable by p. A restricted key (groupIds set) sees only what
+ * its groups serve, even items the user owns: full containment. Reading a group grants read of
+ * everything it serves, included groups too (servedBySql).
  */
 export function itemReadSql(p: Principal, i = 'i'): SqlFrag {
-  const g = groupReadSql(p, 'g_r');
-  const viaGroup = `EXISTS (SELECT 1 FROM group_members gm_r JOIN scp_groups g_r ON g_r.id = gm_r.group_id WHERE gm_r.item_id = ${i}.id AND ${publishedSql(i, 'g_r')} AND ${g.sql})`;
-  if (p.isAdmin) return p.groupIds ? { sql: viaGroup, params: g.params } : { sql: '1', params: [] };
-  const read = p.groupIds ? viaGroup : `(${i}.owner_id = ? OR ${i}.visibility = 'public' OR ${viaGroup})`;
-  return { sql: `(${read} AND ${ownerEnabled(`${i}.owner_id`)})`, params: p.groupIds ? g.params : [p.userId, ...g.params] };
+  const viaGroup = servedBySql(p, i);
+  if (p.isAdmin) return p.groupIds ? viaGroup : { sql: '1', params: [] };
+  const read = p.groupIds ? viaGroup.sql : `(${i}.owner_id = ? OR ${i}.visibility = 'public' OR ${viaGroup.sql})`;
+  return { sql: `(${read} AND ${ownerEnabled(`${i}.owner_id`)})`, params: p.groupIds ? viaGroup.params : [p.userId, ...viaGroup.params] };
 }
 
 export function canReadGroup(db: Db, p: Principal, groupId: string): boolean {

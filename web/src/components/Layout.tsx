@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router';
+import * as api from '../api.ts';
 import { useAuth, useUser } from '../auth.tsx';
 import { ChangePasswordDialog } from './ChangePasswordDialog.tsx';
+import { useToast } from './Toast.tsx';
 
-const NAV: { to: string; label: string; admin?: boolean }[] = [
+const NAV: { to: string; label: string }[] = [
   { to: '/', label: 'Dashboard' },
   { to: '/skills', label: 'Skills' },
   { to: '/mds', label: 'Prompts & MDs' },
@@ -11,12 +13,19 @@ const NAV: { to: string; label: string; admin?: boolean }[] = [
   { to: '/groups', label: 'Groups' },
   { to: '/keys', label: 'API Keys' },
   { to: '/activity', label: 'Activity' },
-  { to: '/admin/users', label: 'Admin', admin: true },
+];
+
+/** Shown under an "Admin" heading to admins only (D4). */
+const ADMIN_NAV: { to: string; label: string }[] = [
+  { to: '/admin/users', label: 'Users' },
+  { to: '/admin/logs', label: 'Logs' },
+  { to: '/admin/settings', label: 'Settings' },
 ];
 
 export function Layout() {
   const user = useUser();
-  const { signOut } = useAuth();
+  const { signOut, config, refresh } = useAuth();
+  const toast = useToast();
   const nav = useNavigate();
   const { pathname } = useLocation();
   const [open, setOpen] = useState(false);
@@ -28,6 +37,33 @@ export function Layout() {
     await signOut();
     nav('/login');
   };
+  // The signed-in session is what proves this account is yours to link; the callback never links by email alone.
+  // A POST, not a link: a GET would start the link under the Lax cookie from any page that navigates here.
+  const link = async () => {
+    try {
+      window.location.assign((await api.oidcLink(pathname)).url);
+    } catch (e) {
+      toast(api.errorMessage(e), 'error');
+    }
+  };
+  // Offered whenever a link exists, OIDC configured or not (the issuer may have changed); 409 for an account without a password.
+  const unlink = async () => {
+    try {
+      await api.oidcUnlink();
+      await refresh();
+      toast('Single sign-on unlinked. Sign in with your password from now on, or link again from this menu.', 'ok');
+    } catch (e) {
+      toast(api.errorMessage(e), 'error');
+    }
+  };
+
+  const item = (n: { to: string; label: string }) => (
+    <li key={n.to}>
+      <NavLink to={n.to} end={n.to === '/'} className="nav-link">
+        {n.label}
+      </NavLink>
+    </li>
+  );
 
   return (
     <div className="shell">
@@ -46,13 +82,18 @@ export function Layout() {
         <div id="side-panel" className={open ? 'side-panel open' : 'side-panel'}>
           <nav aria-label="Main">
             <ul className="nav-list">
-              {NAV.filter((n) => !n.admin || user.isAdmin).map((n) => (
-                <li key={n.to}>
-                  <NavLink to={n.to} end={n.to === '/'} className="nav-link">
-                    {n.label}
-                  </NavLink>
-                </li>
-              ))}
+              <li className="nav-heading" role="presentation">
+                Workspace
+              </li>
+              {NAV.map(item)}
+              {user.isAdmin && (
+                <>
+                  <li className="nav-heading nav-admin" role="presentation">
+                    Admin
+                  </li>
+                  {ADMIN_NAV.map(item)}
+                </>
+              )}
             </ul>
           </nav>
           <details className="user-menu">
@@ -66,6 +107,17 @@ export function Layout() {
               <button type="button" className="btn btn-block" onClick={() => setPwOpen(true)}>
                 Change password
               </button>
+              {user.oidcLinked ? (
+                <button type="button" className="btn btn-block" onClick={() => void unlink()}>
+                  Unlink {config?.oidc?.label || 'single sign-on'}
+                </button>
+              ) : (
+                config?.oidc?.enabled && (
+                  <button type="button" className="btn btn-block" onClick={() => void link()}>
+                    Link {config.oidc.label}
+                  </button>
+                )
+              )}
               <button type="button" className="btn btn-block" onClick={logout}>
                 Log out
               </button>
