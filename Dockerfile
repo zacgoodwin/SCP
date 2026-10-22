@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
-FROM node:24.18.0-bookworm-slim AS web
+FROM node:24.22.1-bookworm-slim AS web
 WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
 
-FROM node:24.18.0-bookworm-slim
+FROM node:24.22.1-bookworm-slim
 ENV NODE_ENV=production \
     PORT=8080 \
     SCP_ARTIFACT_PORT=8081 \
