@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.18.0" },
+  "engines": { "node": ">=24.22.1" },
   "scripts": {
     "start": "node src/main.ts",
     "dev": "node --watch src/main.ts",
@@ -21,7 +21,7 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
-    "@types/node": "24.19.1",
+    "@types/node": "24.19.2",
     "typescript": "7.0.2"
   }
 }
