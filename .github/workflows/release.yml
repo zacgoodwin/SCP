@@ -1,7 +1,9 @@
 # Push a v* tag to publish ghcr.io/zacgoodwin/scp:<version> (and :latest for non-prerelease tags).
 # The tag must match VERSION (scripts/release-tag.mts), so an image is never labelled with a version
 # the code does not claim. The gate runs in its own job with a read-only token: npm install scripts
-# never see a token that can push packages.
+# never see a token that can push packages. Actions are pinned to commit SHAs (the repo enforces it),
+# because the image job holds packages: write. Verify a pulled image with
+# `gh attestation verify oci://ghcr.io/zacgoodwin/scp:<version> --owner zacgoodwin`.
 name: release
 
 on:
@@ -16,13 +18,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
       - name: Tagged commit is on main
         run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$GITHUB_REF_NAME is not on main"; exit 1; }
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.22.1
       # Node 24 strips types natively, so this needs no install step first.
@@ -36,12 +38,15 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Keyless signing of the provenance attestation (Sigstore via the workflow's OIDC identity).
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -49,15 +54,25 @@ jobs:
       # ponytail: flavor latest=auto (the default) skips prereleases but still moves :latest on a
       # backport tag (v0.1.2 after v0.2.0); compare against the highest released tag if backports start.
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/zacgoodwin/scp
           tags: type=semver,pattern={{version}}
-      - uses: docker/build-push-action@v7
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Storage records need an org-owned repo; this one is user-owned.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/zacgoodwin/scp
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false

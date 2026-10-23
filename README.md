@@ -37,7 +37,9 @@ instead of building, set `image: ghcr.io/zacgoodwin/scp:latest` and remove `buil
 `docker-compose.yml`. To cut a release, bump `VERSION`, merge, then push the matching tag
 (`git tag v$(cat VERSION) && git push origin v$(cat VERSION)`); `.github/workflows/release.yml`
 refuses a tag that is not on `main`, does not match `VERSION`, or carries a `VERSION` that is not
-semver.
+semver. Release tags are immutable (a repository ruleset blocks moving or deleting a `v*` tag), and
+each image carries a signed build provenance attestation:
+`gh attestation verify oci://ghcr.io/zacgoodwin/scp:<version> --owner zacgoodwin`.
 
 ### Configuration
 

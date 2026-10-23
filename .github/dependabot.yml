@@ -1,0 +1,26 @@
+# Keeps the SHA-pinned actions, the digest-pinned base image and both lockfiles current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    # Node version bumps are deliberate (ci.yml and release.yml pin node-version to match), so only
+    # digest refreshes of the same tag (OS-layer patches) come from Dependabot.
+    ignore:
+      - dependency-name: node
+        update-types: [version-update:semver-major, version-update:semver-minor, version-update:semver-patch]
+  - package-ecosystem: npm
+    directories: [/server, /web]
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
