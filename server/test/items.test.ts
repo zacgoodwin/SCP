@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { strToU8, zipSync } from 'fflate';
 import { makeTestCtx, insertGroup, type TestCtx, type TestUser } from './helpers.ts';
 import { buildZip, safeUnzip } from '../src/lib/zip.ts';
-import { createItemTx, entryPathFor, insertRow, loadEditableItem, searchItems } from '../src/items/service.ts';
+import { createItemTx, entryPathFor, insertRow, loadEditableItem, renameFrontmatter, searchItems } from '../src/items/service.ts';
 import type { Principal } from '../src/types.ts';
 
 const API = '/api/v1';
@@ -204,7 +204,7 @@ test('insertRow takes column names only from its fixed lists', () => {
   const row = {
     id: 'x1', owner_id: u.id, kind: 'skill', name: 'n', title: '', description: '', category: '', tags: '[]',
     visibility: 'private', format: null, latest_seq: 0, source_repo: null, source_ref: null, source_path: null,
-    source_kind: null, source_commit: null, source_tree_sha256: null, source_scope: null, source_carve: null, forked_from: null, created_at: 'now', updated_at: 'now',
+    source_kind: null, source_commit: null, source_tree_sha256: null, source_scope: null, source_carve: null, lint_waived: 0, source_prefix: null, forked_from: null, created_at: 'now', updated_at: 'now',
   };
   assert.throws(() => insertRow(t.db, 'items', { ...row, 'name) VALUES (1); DROP TABLE users; --': 1 }), /do not match/);
   assert.throws(() => insertRow(t.db, 'items', { id: 'x2' }), /do not match/);
@@ -513,4 +513,17 @@ test('buildZip output imports back as the same tree', async () => {
   const r = await importFile(t, h, 'roundtrip.zip', zip);
   assert.equal(r.status, 201, r.text);
   assert.deepEqual(r.json.item.version.files.map((f: { path: string; mode: number }) => [f.path, f.mode]), [['SKILL.md', 420], ['bin/x', 493]]);
+});
+
+test('renameFrontmatter (5ef6): replaces or inserts the name line keeping every other byte, re-emits what a line edit cannot set, null when the frontmatter does not parse', () => {
+  assert.equal(renameFrontmatter('---\nname: a\ndescription: d # kept\n---\nBody.\n', 'x-a'), '---\nname: x-a\ndescription: d # kept\n---\nBody.\n');
+  assert.equal(renameFrontmatter('---\r\ndescription: d\r\n---\r\nBody.\r\n', 'x-a'), '---\r\nname: x-a\r\ndescription: d\r\n---\r\nBody.\r\n');
+  assert.equal(renameFrontmatter('# Title\n', 'x-a'), '---\nname: x-a\n---\n# Title\n');
+  // A slug YAML would read as another type is quoted, so it parses back as the name.
+  assert.equal(renameFrontmatter('---\nname: a\n---\n', 'null'), '---\nname: "null"\n---\n');
+  assert.equal(renameFrontmatter('---\n"name": a\ndescription: d\n---\n', 'x-a'), '---\n"name": x-a\ndescription: d\n---\n');
+  assert.equal(renameFrontmatter('---\nname: >\n  a\ndescription: d\n---\n', 'x-a'), '---\nname: >-\n  x-a\ndescription: d\n---\n');
+  assert.equal(renameFrontmatter('---\nname: a\ndescription: Use when: x\n---\n', 'x-a'), null);
+  assert.equal(renameFrontmatter('---\nname: a\n', 'x-a'), null);
+  assert.equal(renameFrontmatter('\n---\nname: a\n---\n', 'x-a'), null);
 });

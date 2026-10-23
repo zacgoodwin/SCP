@@ -17,7 +17,8 @@ export const FOLDER_KINDS: FolderKind[] = ['prompt', 'agent', 'command', 'instru
 export interface ImportResult {
   items: (ItemDetail & { op?: ImportOp })[];
   group: GroupDetail | null;
-  skipped: { path: string; reason: string }[];
+  /** prefixed: a name another source's item holds; the unit imports as this name with onNameClash 'prefix' (5ef6). */
+  skipped: { path: string; reason: string; prefixed?: string }[];
   /** Folders to offer a kind for (re-import with folderKinds). */
   skippedFolders?: SkippedFolder[];
   source: ItemSource | null;
@@ -33,6 +34,10 @@ export interface ImportGroupOpts {
   /** No detection: the tree is one item, or one item per .md for agent, command, prompt and instructions. */
   kind?: Kind;
   folderKinds?: Record<string, FolderKind>;
+  /** A name another source's item holds: skip the unit (default) or import it as `<repo>-<name>`. */
+  onNameClash?: 'skip' | 'prefix';
+  /** Units whose only problem is their frontmatter: 'ask' (default, a 409 listing them), 'import' them anyway, or 'skip' them. */
+  frontmatterErrors?: 'ask' | 'import' | 'skip';
 }
 
 /** The instance's caps (GET /imports/limits): admin settings, read by any signed-in user. */
@@ -53,6 +58,15 @@ export const getImportLimits = () => json<ImportLimits>('GET', '/imports/limits'
 export function refuseOversize(file: File, mb: number): void {
   if (file.size + 4096 > mb * 1024 * 1024) throw new ApiError(413, 'too_large', `request body is over ${mb} MB`);
 }
+/** A unit of a 409 `frontmatter_errors`: nothing was imported, the user picks import anyway, skip, or cancel. */
+export interface FrontmatterUnit {
+  path: string;
+  kind: Kind;
+  errors: string[];
+}
+
+export const frontmatterErrorsOf = (e: unknown): FrontmatterUnit[] | null =>
+  e instanceof ApiError && e.code === 'frontmatter_errors' && Array.isArray(e.details) ? (e.details as FrontmatterUnit[]) : null;
 
 export function importPack(file: File, opts: ImportGroupOpts = {}) {
   const fd = new FormData();

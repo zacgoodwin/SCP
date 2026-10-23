@@ -1,4 +1,5 @@
 import type { SQLInputValue, StatementSync } from 'node:sqlite';
+import { parseDocument, stringify as stringifyYaml } from 'yaml';
 import { canEditItem, canReadItem, itemReadSql, servedByGroupSql, servingGroupsSql } from '../access.ts';
 import { requireScope } from '../auth/middleware.ts';
 import { isUniqueViolation, newId, now, tx, type Db } from '../db.ts';
@@ -8,7 +9,7 @@ import { HttpError, badRequest, forbidden, notFound } from '../lib/http.ts';
 import { assertNoCollisions, isJunkPath, isTextPath, mediaTypeFor, normalizePath, segmentProblem } from '../lib/paths.ts';
 import { LIMITS, checkLimits, stripTopFolder, tooLarge, treeSha256, type TreeFile } from '../lib/tree.ts';
 import { sweepBlobs } from './gc.ts';
-import { lintVersion, type Lint } from './lint.ts';
+import { FRONTMATTER_ERRORS, lintVersion, type Lint } from './lint.ts';
 import { touchGroupsOfItem } from '../groups/touch.ts';
 import { FORMATS, KINDS, aKind, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
 
@@ -48,6 +49,8 @@ export interface CreateItemInput {
   sourceScope?: 'tree' | 'root';
   /** With source: the paths other units took out of this one (ItemRow.source_carve). */
   sourceCarve?: string[];
+  /** With source: the prefix the import put in front of the unit's bare name (ItemRow.source_prefix). */
+  sourcePrefix?: string;
 }
 
 export interface VersionInput {
@@ -146,8 +149,8 @@ export function entryPathFor(kind: Kind, name: string, format?: Format | null): 
   }
 }
 
-export const slugify = (s: string) =>
-  s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64).replace(/-+$/, '');
+export const slugify = (s: string, max = 64) =>
+  s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, max).replace(/-+$/, '');
 
 // ---------- reads ----------
 
@@ -394,10 +397,15 @@ function placeEntry(s: Shaped, kind: Kind, name: string, format: Format | null):
   return { ...s, entryPath, files: [{ ...s.files[0], path: entryPath }] };
 }
 
-function lintShaped(kind: Kind, name: string, s: Shaped, gate: boolean): Lint[] {
+/** waive: frontmatter errors (FRONTMATTER_ERRORS) are kept as waived warnings, for an import that accepted them (0rdh). */
+function lintShaped(kind: Kind, name: string, s: Shaped, waive = false): Lint[] {
   const lint = lintVersion(kind, name, s.files, s.fm, { path: s.entryPath, text: s.entryText });
   for (const path of s.dropped) lint.push({ level: 'info', code: 'path.junk', message: 'dropped build/OS junk file', path });
-  if (gate && lint.some((l) => l.level === 'error')) throw new HttpError(422, 'lint_failed', 'content failed validation', lint);
+  return waive ? lint.map((l) => (l.level === 'error' && FRONTMATTER_ERRORS.has(l.code) ? { ...l, level: 'warn', waived: true } : l)) : lint;
+}
+
+function gateLint(lint: Lint[]): Lint[] {
+  if (lint.some((l) => l.level === 'error')) throw new HttpError(422, 'lint_failed', 'content failed validation', lint);
   return lint;
 }
 
@@ -414,6 +422,15 @@ function firstHeading(s: Shaped): string | undefined {
   let end = line.length;
   while (end > 0 && ' \t#'.includes(line[end - 1])) end--;
   return line.slice(0, end) || undefined;
+}
+
+/** The body's first paragraph that is not a heading: Claude Code's description when frontmatter has none (0rdh). */
+function firstParagraph(s: Shaped): string {
+  for (const para of (s.fm?.body ?? s.entryText).replace(/^#.*$/gm, '').split(/\n[ \t\r]*\n/)) {
+    const text = para.replace(/\s+/g, ' ').trim();
+    if (text) return text.slice(0, 1024);
+  }
+  return '';
 }
 
 function checkFormat(kind: Kind, format: Format | null | undefined): Format | null {
@@ -449,7 +466,7 @@ function checkVisibility(v: unknown): void {
 // steered by whatever keys a row happens to carry.
 const INSERT_COLUMNS = {
   items: ['id', 'owner_id', 'kind', 'name', 'title', 'description', 'category', 'tags', 'visibility', 'format',
-    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'forked_from', 'created_at', 'updated_at'],
+    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'lint_waived', 'source_prefix', 'forked_from', 'created_at', 'updated_at'],
   item_versions: ['id', 'item_id', 'seq', 'entry_path', 'tree_sha256', 'frontmatter', 'lint', 'total_bytes', 'note',
     'created_by_user', 'created_by_key', 'created_by_client', 'created_at'],
 } as const;
@@ -509,21 +526,8 @@ function refreshFts(db: Db, itemId: string): void {
   );
 }
 
-/**
- * Create an item with its first version. Joins an outer transaction when called inside one (the MCP
- * chunk creates an artifact and adds it to a group atomically, so it passes skipRestrictedCheck).
- */
-export function createItemTx(
-  ctx: Ctx,
-  p: Principal,
-  input: CreateItemInput,
-  opts: { skipRestrictedCheck?: boolean; skipLintGate?: boolean } = {},
-): ItemRow {
-  const { db } = ctx;
-  requireScope(p, 'write');
-  if (p.groupIds && !opts.skipRestrictedCheck) {
-    throw new HttpError(403, 'restricted_key', 'a group-restricted API key cannot create items it could not see');
-  }
+/** An input shaped, named and linted (not gated): everything createItemTx decides before it writes. */
+function prepareItem(input: CreateItemInput, waive: boolean) {
   if (!KINDS.includes(input.kind)) throw badRequest(`kind must be one of ${KINDS.join(', ')}`);
   checkVisibility(input.visibility);
   const kind = input.kind;
@@ -534,12 +538,47 @@ export function createItemTx(
   // A skill installs as .claude/skills/<name>/, so its imported folder outranks its heading.
   const folder = kind === 'skill' && input.folderName ? slugify(input.folderName) : '';
   const fmName = fmString(shaped.fm, 'name');
-  const name =
-    input.name ?? ((fmName ? slugify(fmName) : folder || slugify(title)) || (input.fallbackName ? slugify(input.fallbackName) : ''));
+  // With frontmatter errors accepted (0rdh), a skill or agent without a name takes its folder or file name, as Claude Code does.
+  const heading = waive && (kind === 'skill' || kind === 'agent') ? '' : slugify(title);
+  const name = input.name ?? ((fmName ? slugify(fmName) : folder || heading) || (input.fallbackName ? slugify(input.fallbackName) : ''));
   if (!name) throw badRequest('name is required (could not derive one from frontmatter or title)');
   checkName(kind, name);
   const s = placeEntry(shaped, kind, name, format);
-  const lint = lintShaped(kind, name, s, !opts.skipLintGate);
+  return { kind, format, s, title, name, lint: lintShaped(kind, name, s, waive) };
+}
+
+/**
+ * The name and lint createItemTx would give input, without writing (an import names and classifies
+ * its units before it writes any, 5ef6 and 0rdh); null when it would refuse the input before linting.
+ */
+export function previewItem(input: CreateItemInput, waive = false): { name: string; lint: Lint[] } | null {
+  try {
+    const { name, lint } = prepareItem(input, waive);
+    return { name, lint };
+  } catch (e) {
+    if (e instanceof HttpError) return null;
+    throw e;
+  }
+}
+
+/**
+ * Create an item with its first version. Joins an outer transaction when called inside one (the MCP
+ * chunk creates an artifact and adds it to a group atomically, so it passes skipRestrictedCheck).
+ */
+export function createItemTx(
+  ctx: Ctx,
+  p: Principal,
+  input: CreateItemInput,
+  opts: { skipRestrictedCheck?: boolean; skipLintGate?: boolean; waiveFrontmatter?: boolean } = {},
+): ItemRow {
+  const { db } = ctx;
+  requireScope(p, 'write');
+  if (p.groupIds && !opts.skipRestrictedCheck) {
+    throw new HttpError(403, 'restricted_key', 'a group-restricted API key cannot create items it could not see');
+  }
+  const { kind, format, s, title, name, lint } = prepareItem(input, !!opts.waiveFrontmatter);
+  if (!opts.skipLintGate) gateLint(lint);
+  const waived = lint.some((l) => l.waived);
   const ts = now();
   const row: ItemRow = {
     id: newId(),
@@ -547,7 +586,7 @@ export function createItemTx(
     kind,
     name,
     title,
-    description: input.description ?? fmString(s.fm, 'description') ?? '',
+    description: input.description ?? fmString(s.fm, 'description') ?? (waived ? firstParagraph(s) : ''),
     category: input.category ?? '',
     tags: JSON.stringify(normalizeTags(input.tags)),
     visibility: input.visibility ?? 'private',
@@ -561,6 +600,8 @@ export function createItemTx(
     source_tree_sha256: null,
     source_scope: input.source ? (input.sourceScope ?? null) : null,
     source_carve: input.source && input.sourceCarve?.length ? JSON.stringify(input.sourceCarve) : null,
+    lint_waived: waived ? 1 : 0,
+    source_prefix: (input.source && input.sourcePrefix) || null,
     forked_from: input.forkedFrom ?? null,
     created_at: ts,
     updated_at: ts,
@@ -581,16 +622,20 @@ export function createItemTx(
 
 export const createItem = (ctx: Ctx, p: Principal, input: CreateItemInput): ItemRow => createItemTx(ctx, p, input);
 
-/** New full-snapshot version. Frontmatter title/description, when present, refresh the item's. */
-export function addVersion(ctx: Ctx, p: Principal, item: ItemRow, input: VersionInput): VersionRow {
+/**
+ * New full-snapshot version. Frontmatter title/description, when present, refresh the item's.
+ * waiveFrontmatter: an import's source write that accepts frontmatter errors (0rdh); the item is marked for later updates.
+ */
+export function addVersion(ctx: Ctx, p: Principal, item: ItemRow, input: VersionInput, opts: { waiveFrontmatter?: boolean } = {}): VersionRow {
   const { db } = ctx;
   if (!canEditItem(db, p, item)) throw forbidden('you cannot edit this item');
   const s = placeEntry(shapeTree(item.kind, item.format, inputTree(item.kind, item.format, input), 'entry'), item.kind, item.name, item.format);
-  const lint = lintShaped(item.kind, item.name, s, true);
+  const lint = gateLint(lintShaped(item.kind, item.name, s, opts.waiveFrontmatter));
   return tx(db, () => {
     const cur = getItemRow(db, item.id);
     if (!cur) throw notFound('item');
     const v = insertVersion(db, p, cur.id, cur.latest_seq + 1, s, lint, input.note);
+    if (lint.some((l) => l.waived)) db.prepare('UPDATE items SET lint_waived = 1 WHERE id = ?').run(cur.id);
     db.prepare('UPDATE items SET title = ?, description = ? WHERE id = ?').run(
       fmString(s.fm, 'title') ?? cur.title,
       fmString(s.fm, 'description') ?? cur.description,
@@ -647,23 +692,32 @@ export function deleteItem(ctx: Ctx, p: Principal, item: ItemRow): void {
 }
 
 /**
- * A copy of the entry text with its top-level frontmatter `name:` set to name, or null when there is
- * no such line or the result would not parse back to that name (a block scalar, say). Renamed fork
- * names end in '-fork' or '-fork-N', so they never need YAML quoting.
+ * A copy of the entry text with its top-level frontmatter `name:` set to name (5ef6): the `name:` line
+ * replaced, or added first in a block that names nothing, every other byte kept; a block those edits
+ * cannot set (a block-scalar or quoted key) is re-emitted by the yaml library. Text with no frontmatter
+ * gets a block of its own. Null when the frontmatter cannot be parsed (invalid YAML or fence): no name
+ * can be set in it safely.
  */
-function renameFrontmatter(text: string, name: string): string | null {
-  if (typeof parseFrontmatter(text).data.name !== 'string') return null;
+export function renameFrontmatter(text: string, name: string): string | null {
+  const fm = parseFrontmatter(text);
+  const line = stringifyYaml({ name }).trimEnd();
+  // A fence that is not on line 1 is a frontmatter error (lint frontmatter.invalid), not a body.
+  if (!fm.hasFrontmatter) return /^[\uFEFF\s]*---/.test(text) ? null : `---\n${line}\n---\n${text}`;
+  if (fm.error) return null;
   const lines = text.split('\n');
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].replace(/\r$/, '');
-    if (line === '---' || line === '...') return null;
-    if (/^name[ \t]*:/.test(line)) {
-      lines[i] = `name: ${name}${lines[i].endsWith('\r') ? '\r' : ''}`;
-      const out = lines.join('\n');
-      return parseFrontmatter(out).data.name === name ? out : null;
-    }
-  }
-  return null;
+  const cr = lines[0].endsWith('\r') ? '\r' : '';
+  const close = lines.findIndex((l, i) => i > 0 && /^(---|\.\.\.)\r?$/.test(l));
+  const at = lines.findIndex((l, i) => i > 0 && i < close && /^name[ \t]*:/.test(l));
+  const withBlock = (block: string[]) => [lines[0], ...block, ...lines.slice(close)].join('\n');
+  const named = (out: string) => (parseFrontmatter(out).data.name === name ? out : null);
+  const edited =
+    at > 0 ? withBlock([...lines.slice(1, at), line + cr, ...lines.slice(at + 1, close)])
+    : 'name' in fm.data ? null
+    : withBlock([line + cr, ...lines.slice(1, close)]);
+  if (edited !== null && named(edited)) return edited;
+  const doc = parseDocument(lines.slice(1, close).join('\n'), { schema: 'core', uniqueKeys: false });
+  doc.set('name', name);
+  return named(withBlock(String(doc).trimEnd().split('\n').map((l) => l.replace(/\r$/, '') + cr)));
 }
 
 /**

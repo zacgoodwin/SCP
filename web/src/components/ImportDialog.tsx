@@ -21,9 +21,13 @@ const TABS: [Tab, string][] = [
 /** The API error with the statuses that read badly (404 route, 413, bad_source) spelled out; details kept for ErrorBox. */
 const friendly = (e: unknown) => (e instanceof api.ApiError ? new api.ApiError(e.status, e.code, imp.importErrorMessage(e), e.details) : e);
 
-/** The same import again (same zip File, or the same GitHub source) with more options: folderKinds from the result screen. */
+/** The same import again (same zip File, or the same GitHub source) with more options: folderKinds, onNameClash or frontmatterErrors from a later screen. */
 type Rerun = (more: imp.ImportGroupOpts) => Promise<imp.ImportResult>;
-type OnDone = (r: imp.ImportResult, rerun: Rerun) => void;
+/** Run an import (first time or again) and show what came of it. */
+type OnRun = (run: Rerun, more?: imp.ImportGroupOpts) => Promise<void>;
+
+/** A re-run joins the group the first run created (its slug is taken now) instead of creating it again. */
+const sameGroup = (r: imp.ImportResult): imp.ImportGroupOpts => (r.group ? { group: undefined, groupName: undefined, intoGroup: r.group.slug } : {});
 
 export function ImportDialog({
   open,
@@ -62,16 +66,20 @@ export function ImportDialog({
   const [rerun, setRerun] = useState<Rerun | null>(null);
   // Folder kinds picked so far: each re-run sends them all, so an earlier pick is not offered again.
   const [folderKinds, setFolderKinds] = useState<Record<string, imp.FolderKind>>({});
+  // 0rdh: a 409 frontmatter_errors (nothing imported yet) and the run to answer it with.
+  const [ask, setAsk] = useState<{ units: imp.FrontmatterUnit[]; run: Rerun; more: imp.ImportGroupOpts } | null>(null);
 
   const close = () => {
     setResult(null);
     setFolderKinds({});
+    setAsk(null);
     onClose();
   };
   // Per docs/PLAN-v2.md D6: a created group wins, else the single item, else the list. Anything skipped
   // shows the list first (it links to the group), or the skip reasons would be lost.
-  const done: OnDone = (r, again) => {
+  const done = (r: imp.ImportResult, again: Rerun) => {
     setRerun(() => again);
+    setAsk(null);
     onImported?.(r);
     if (r.group && r.items.length > 0 && r.skipped.length === 0) {
       close();
@@ -81,21 +89,42 @@ export function ImportDialog({
       nav(`/items/${r.items[0].id}`);
     } else setResult(r);
   };
-  // A group this import created is joined, not created again (its slug is taken now).
+  // Units with frontmatter errors are asked about before anything is written (409); every other outcome is a result.
+  const show: OnRun = async (run, more = {}) => {
+    try {
+      done(await run(more), run);
+    } catch (e) {
+      const units = imp.frontmatterErrorsOf(e);
+      if (!units) throw e;
+      setAsk({ units, run, more });
+    }
+  };
   const importFolders = async (picked: Record<string, imp.FolderKind>) => {
     if (!rerun || !result) return;
     const all = { ...folderKinds, ...picked };
-    const r = await rerun({ folderKinds: all, ...(result.group ? { group: undefined, groupName: undefined, intoGroup: result.group.slug } : {}) });
     setFolderKinds(all);
-    done(r, rerun);
+    await show(rerun, { folderKinds: all, ...sameGroup(result) });
+  };
+  // 5ef6: the same import with clashing names prefixed; what it already imported stays `unchanged`.
+  const importPrefixed = async () => {
+    if (!rerun || !result) return;
+    await show((more) => rerun({ ...more, onNameClash: 'prefix' }), { folderKinds, ...sameGroup(result) });
+  };
+  // 0rdh: "Import anyway" or "Skip these" re-posts the import the 409 answered, with the choice.
+  const answer = async (choice: 'import' | 'skip') => {
+    if (!ask) return;
+    const { run, more } = ask;
+    await show((m) => run({ ...m, frontmatterErrors: choice }), more);
   };
   // An artifact is one file with a format; a pack or repository tree cannot become one (the server refuses kind: artifact).
   const tabs = plane === 'artifact' ? TABS.filter(([t]) => t === 'file') : intoGroup ? TABS.filter(([t]) => t !== 'file') : TABS;
 
   return (
     <Modal open={open} title={intoGroup ? `Import into ${intoGroup}` : 'Import'} onClose={close}>
-      {result ? (
-        <ImportResultView result={result} onClose={close} onImportFolders={rerun ? importFolders : undefined} />
+      {ask ? (
+        <FrontmatterPrompt units={ask.units} onChoose={answer} onCancel={close} />
+      ) : result ? (
+        <ImportResultView result={result} onClose={close} onImportFolders={rerun ? importFolders : undefined} onImportPrefixed={rerun ? importPrefixed : undefined} />
       ) : (
         <div className="stack">
           <Tabs tabs={tabs} value={tab} onChange={setTab} label="Import source" idPrefix="itab" panelId="import-panel" />
@@ -103,9 +132,9 @@ export function ImportDialog({
             {tab === 'file' ? (
               <FileForm plane={plane} limits={limits} onCancel={close} />
             ) : tab === 'pack' ? (
-              <PackForm limits={limits} intoGroup={intoGroup} onCancel={close} onDone={done} />
+              <PackForm limits={limits} intoGroup={intoGroup} onCancel={close} onRun={show} />
             ) : (
-              <GithubForm plane={plane} intoGroup={intoGroup} onCancel={close} onDone={done} />
+              <GithubForm plane={plane} intoGroup={intoGroup} onCancel={close} onRun={show} />
             )}
           </div>
         </div>
@@ -269,7 +298,7 @@ function FileForm({ plane, limits, onCancel }: { plane?: api.Plane; limits: imp.
   );
 }
 
-function PackForm({ limits, intoGroup, onCancel, onDone }: { limits: imp.ImportLimits | null; intoGroup?: string; onCancel: () => void; onDone: OnDone }) {
+function PackForm({ limits, intoGroup, onCancel, onRun }: { limits: imp.ImportLimits | null; intoGroup?: string; onCancel: () => void; onRun: OnRun }) {
   const [file, setFile] = useState<File | null>(null);
   const [visibility, setVisibility] = useState<api.Visibility>('private');
   const [group, setGroup] = useState(() => initialGroup(intoGroup));
@@ -279,8 +308,7 @@ function PackForm({ limits, intoGroup, onCancel, onDone }: { limits: imp.ImportL
     if (!file) return;
     if (limits) imp.refuseOversize(file, limits.maxArchiveMb);
     const opts = { visibility, ...groupOpts(group) };
-    const run: Rerun = (more) => imp.importOrSkipped(imp.importPack(file, { ...opts, ...more }));
-    onDone(await run({}), run);
+    await onRun((more) => imp.importOrSkipped(imp.importPack(file, { ...opts, ...more })));
   });
 
   return (
@@ -305,7 +333,7 @@ function PackForm({ limits, intoGroup, onCancel, onDone }: { limits: imp.ImportL
   );
 }
 
-function GithubForm({ plane, intoGroup, onCancel, onDone }: { plane?: api.Plane; intoGroup?: string; onCancel: () => void; onDone: OnDone }) {
+function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; intoGroup?: string; onCancel: () => void; onRun: OnRun }) {
   const [url, setUrl] = useState('');
   const [repo, setRepo] = useState('');
   const [ref, setRef] = useState('');
@@ -323,8 +351,7 @@ function GithubForm({ plane, intoGroup, onCancel, onDone }: { plane?: api.Plane;
   const go = submit(async () => {
     const where: imp.GithubImport = byUrl ? { url: url.trim() } : { repo: repo.trim(), ref: ref.trim() || undefined, path: path.trim() || undefined };
     const body: imp.GithubImport = { ...where, kind: kind || undefined, visibility, ...groupOpts(group) };
-    const run: Rerun = (more) => imp.importOrSkipped(imp.importGithub({ ...body, ...more }));
-    onDone(await run({}), run);
+    await onRun((more) => imp.importOrSkipped(imp.importGithub({ ...body, ...more })));
   });
 
   return (
@@ -424,6 +451,71 @@ function FolderOffer({ folders, onImport }: { folders: imp.SkippedFolder[]; onIm
   );
 }
 
+/**
+ * 0rdh: the import found units whose only problem is their frontmatter and wrote nothing yet. "Import anyway"
+ * stores them with their upstream files (the errors become warnings on the item), "Skip these" imports the rest.
+ */
+function FrontmatterPrompt({ units, onChoose, onCancel }: { units: imp.FrontmatterUnit[]; onChoose: (c: 'import' | 'skip') => Promise<void>; onCancel: () => void }) {
+  const { busy, error, submit } = useSubmit();
+  return (
+    <div className="stack" role="group" aria-label="Frontmatter errors">
+      <p>
+        {units.length === 1 ? 'One unit has' : `${units.length} units have`} frontmatter errors. Nothing has been imported yet. Claude Code may still load them: it falls back to the
+        folder or file name and the first paragraph.
+      </p>
+      <ul className="link-list">
+        {units.map((u) => (
+          <li key={u.path}>
+            <code>{u.path || '(root)'}</code> <span className="badge">{u.kind}</span>
+            <ul className="lint-rows">
+              {u.errors.map((m, i) => (
+                <li key={i} className="muted">
+                  {m}
+                </li>
+              ))}
+            </ul>
+          </li>
+        ))}
+      </ul>
+      <ErrorBox error={error} />
+      <div className="row end">
+        <button type="button" className="btn" onClick={onCancel}>
+          Cancel
+        </button>
+        <button type="button" className="btn" disabled={busy} onClick={submit(() => onChoose('skip'))}>
+          Skip these
+        </button>
+        <button type="button" className="btn btn-primary" disabled={busy} onClick={submit(() => onChoose('import'))}>
+          {busy ? 'Importing…' : 'Import anyway'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 5ef6: units skipped because another source's item holds their name, offered again under a `<repo>-` prefixed name. */
+function PrefixOffer({ clashes, onImport }: { clashes: imp.ImportResult['skipped']; onImport: () => Promise<void> }) {
+  const { busy, error, submit } = useSubmit();
+  return (
+    <form className="stack" aria-label="Name clashes" onSubmit={submit(onImport)}>
+      <p>You already have items with these names, so these were skipped. Import them under a prefixed name instead:</p>
+      <ul className="link-list">
+        {clashes.map((s) => (
+          <li key={s.path}>
+            <code>{s.path || '(root)'}</code> as <code>{s.prefixed}</code>
+          </li>
+        ))}
+      </ul>
+      <ErrorBox error={error} />
+      <div className="row end">
+        <button type="submit" className="btn" disabled={busy}>
+          {busy ? 'Importing…' : 'Import these with the prefix'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 const OP_LABEL: Record<imp.ImportOp, string> = { create: 'created', version: 'updated', unchanged: 'unchanged' };
 
 /** "Created 1, updated 1, unchanged 2" (ops the server reports), else the plain count. */
@@ -439,14 +531,18 @@ function ImportResultView({
   result,
   onClose,
   onImportFolders,
+  onImportPrefixed,
 }: {
   result: imp.ImportResult;
   onClose: () => void;
   /** Re-run the import with these folders mapped to a kind. */
   onImportFolders?: (picked: Record<string, imp.FolderKind>) => Promise<void>;
+  /** Re-run the import with onNameClash 'prefix'. */
+  onImportPrefixed?: () => Promise<void>;
 }) {
   const { items, skipped, source, group } = result;
   const folders = result.skippedFolders ?? [];
+  const clashes = skipped.filter((s) => s.prefixed);
   return (
     <div className="stack">
       <p>
@@ -469,9 +565,10 @@ function ImportResultView({
           (<code>{group.slug}</code>) holds the imported items as members.
         </p>
       )}
+      {clashes.length > 0 && onImportPrefixed && <PrefixOffer key={clashes.map((s) => s.path).join('\n')} clashes={clashes} onImport={onImportPrefixed} />}
       {folders.length > 0 && onImportFolders && <FolderOffer key={folders.map((f) => f.path).join('\n')} folders={folders} onImport={onImportFolders} />}
       {items.length === 0 ? (
-        <p className="muted">Nothing in that source looked like a skill, agent, command, prompt or MD.</p>
+        clashes.length === 0 && <p className="muted">Nothing in that source looked like a skill, agent, command, prompt or MD.</p>
       ) : (
         <ul className="link-list" aria-label="Imported items">
           {items.map((it) => (

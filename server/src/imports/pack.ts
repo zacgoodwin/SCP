@@ -3,7 +3,8 @@ import { requireScope } from '../auth/middleware.ts';
 import { tx, type Db } from '../db.ts';
 import { canEditGroup } from '../access.ts';
 import { addMemberTx, createGroup, getGroupRow, isMember } from '../groups/service.ts';
-import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, resolveVersion, slugify, type Lint } from '../items/service.ts';
+import { FRONTMATTER_ERRORS } from '../items/lint.ts';
+import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewItem, renameFrontmatter, resolveVersion, slugify, type CreateItemInput, type Lint } from '../items/service.ts';
 import { parseFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, MB, badRequest, notFound } from '../lib/http.ts';
 import { isJunkPath, normalizePath } from '../lib/paths.ts';
@@ -27,11 +28,24 @@ export interface Unit {
   scope?: 'tree' | 'root';
   /** A folder unit's paths (relative to it) that another unit or skip took first: a source update leaves them out (updateTree). */
   carve?: string[];
+  /** A skill's plugin folder (or the folder holding its skills/ folder): its prefix when another skill of the import shares its name (5ef6). */
+  prefix?: string;
+  /** 5ef6: the name the unit took before it was renamed (renamed); its item records what was put in front (source_prefix). */
+  bare?: string;
 }
 
 export interface Skipped {
   path: string;
   reason: string;
+  /** 5ef6: the name another source's item holds; the unit imports as this name with onNameClash 'prefix'. */
+  prefixed?: string;
+}
+
+/** 0rdh: a unit whose only lint errors are frontmatter errors, listed in a 409 frontmatter_errors. */
+export interface FrontmatterUnit {
+  path: string;
+  kind: Kind;
+  errors: string[];
 }
 
 export interface UnitResult {
@@ -92,6 +106,15 @@ export interface ImportOpts {
   defaultGroupName?: string;
   /** Import a repository's contributor tooling even when it ships a plugin or a skills/ folder (4ky8). */
   includeRepoTooling?: boolean;
+  /** 5ef6: a unit whose name another source's item holds is skipped (default), or imported as `<clashPrefix>-<name>`. */
+  onNameClash?: 'skip' | 'prefix';
+  /** The repository (or zip) name a clash across imports is prefixed with (default: rootName). */
+  clashPrefix?: string;
+  /**
+   * 0rdh: units whose only lint errors are frontmatter errors. 'ask' (default): a 409 naming them, nothing
+   * written; 'import' them anyway (errors kept as waived warnings); 'skip' them, as before.
+   */
+  frontmatterErrors?: 'ask' | 'import' | 'skip';
 }
 
 const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
@@ -359,7 +382,8 @@ export function detectUnits(
     for (const f of files) claimed.set(f.path, dir);
     // A plugin root's skill with components carved out of it (bppq) is re-detected on update too (updateTree), for components added upstream.
     const scope = carve && pluginSet.has(dir) ? 'root' : undefined;
-    units.push({ path: dir, kind: 'skill', tree: skillTree(subtree(files, dir)), fallbackName: baseOf(dir), folderName: baseOf(dir), scope, carve });
+    const prefix = prefixOf(dir);
+    units.push({ path: dir, kind: 'skill', tree: skillTree(subtree(files, dir)), fallbackName: baseOf(dir), folderName: baseOf(dir), scope, carve, ...(prefix && { prefix }) });
   };
   const fileUnit = (f: TreeFile, kind: Kind, opts: { name?: string; fallbackName?: string; path?: string } = {}) => {
     claimed.set(f.path, f.path);
@@ -386,6 +410,13 @@ export function detectUnits(
       if (pluginSet.has(path.slice(0, i))) return [path.slice(0, i), path.slice(i + 1)];
     }
     return ['', path];
+  };
+  /** 5ef6 (Unit.prefix): the plugin's folder, else the folder holding skills/; none for a port (ypmn) or under a dot folder (.claude). */
+  const prefixOf = (dir: string) => {
+    const [r] = rootOf(dir);
+    const segs = dirOf(dir).split('/');
+    const parent = r ? baseOf(r) : segs.at(-1) === 'skills' ? segs.at(-2) : undefined;
+    return parent && !parent.startsWith('.') && !portOf(dir) ? slugify(parent) || undefined : undefined;
   };
   const filesIn = (dir: string) => (dir ? (byDir.get(dir) ?? []) : tree);
   // The paths a manifest declares come first (4ky8), so a component outside SCP's folder conventions
@@ -581,13 +612,15 @@ const reasonOf = (e: HttpError) =>
  * version: a commit elsewhere in the repository moves HEAD while this path is byte-identical, and
  * re-applying it would write the stale upstream tree over a local edit made since the import. A tree
  * equal to either adds no version (op 'unchanged') but still records the commit it was checked against.
+ * Frontmatter errors are accepted when this write was asked to (waive) or the import accepted them
+ * (0rdh: the user already chose), and a prefixed item keeps its prefix (5ef6, keepPrefix).
  */
-export function versionFromSource(ctx: Ctx, p: Principal, item: ItemRow, tree: TreeFile[], source: ItemSource, note: string): UnitResult {
+export function versionFromSource(ctx: Ctx, p: Principal, item: ItemRow, tree: TreeFile[], source: ItemSource, note: string, waive = false): UnitResult {
   const { db } = ctx;
   return tx(db, () => {
     const prev = resolveVersion(db, item);
     db.exec('SAVEPOINT ver');
-    const v = addVersion(ctx, p, item, { tree, note });
+    const v = addVersion(ctx, p, item, { tree: keepPrefix(item, tree), note }, { waiveFrontmatter: waive || !!item.lint_waived });
     // Items imported before source_tree_sha256 was recorded fall back to the latest version.
     const changed = v.tree_sha256 !== prev.tree_sha256 && v.tree_sha256 !== (item.source_tree_sha256 ?? prev.tree_sha256);
     db.exec(changed ? 'RELEASE ver' : 'ROLLBACK TO ver; RELEASE ver');
@@ -638,49 +671,193 @@ export function updateTree(db: Db, item: ItemRow, tree: TreeFile[]): TreeFile[] 
 /** GitHub resolves repository names case-insensitively, and a zip's name is a file name on a case-insensitive disk. */
 const sameRepo = (a: string | null, b: string | null) => (a ?? '').toLowerCase() === (b ?? '').toLowerCase();
 
-function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts): UnitResult {
+/**
+ * `<prefix>-<name>` as a slug (5ef6); undefined past the 64-character name cap, where the unit is not
+ * prefixed: a cut name no longer ends in `-<name>` (keepPrefix), and two long names can cut to one.
+ */
+const prefixed = (prefix: string, name: string) => {
+  const s = slugify(`${prefix}-${name}`, Infinity);
+  return s.length <= 64 ? s : undefined;
+};
+const TOO_LONG = 'would exceed the 64-character name limit';
+
+/**
+ * A skill's SKILL.md or an agent's one file with its frontmatter name set to name, inserted when it
+ * names none (5ef6). Frontmatter that does not parse cannot take it: 422, the unit skipped at import and
+ * the source write refused, never stored under its bare name. what: 'prefixed name' or 'name' (supplied).
+ */
+function pinName(kind: Kind, tree: TreeFile[], name: string, what = 'prefixed name'): TreeFile[] {
+  if (kind !== 'skill' && kind !== 'agent') return tree;
+  return tree.map((f) => {
+    if (kind === 'skill' ? f.path !== 'SKILL.md' : tree.length !== 1) return f;
+    const text = renameFrontmatter(utf8.decode(f.bytes), name);
+    if (text === null) throw new HttpError(422, 'frontmatter_invalid', `its frontmatter is not valid YAML, so it cannot take the ${what} '${name}'`);
+    return { ...f, bytes: new TextEncoder().encode(text) };
+  });
+}
+
+/**
+ * u, which took the name `from`, under the name `to` (5ef6). Its frontmatter name follows, as a renamed
+ * fork's does: a skill's must match its install folder. A second rename (an in-import prefix, then a
+ * cross-source one) keeps the first `from` as the bare name.
+ */
+const renamed = (u: Unit, from: string, to: string): Unit => ({ ...u, name: to, tree: pinName(u.kind, u.tree, to), bare: u.bare ?? from });
+
+/** 5ef6: what u's renames put in front of its bare name ('fork-discord' for fork-discord-access), recorded as source_prefix. */
+const prefixOfName = (u: Unit) => (u.bare && u.name?.endsWith(`-${u.bare}`) ? u.name.slice(0, -(u.bare.length + 1)) : undefined);
+
+/** 5ef6: the item is its source's unit `bare` under the prefix it recorded at import (source_prefix); else wasPrefixed. */
+const isPrefixed = (item: ItemRow, bare: string) => (item.source_prefix ? item.name === `${item.source_prefix}-${bare}` : wasPrefixed(item, bare));
+
+/**
+ * 5ef6, for an item with no recorded source_prefix: the item is its source's unit `bare` under a prefix an
+ * import of that source gives: the repository (or zip) name for a clash across sources (clashPrefix), or a
+ * folder above the unit for one inside the import (Unit.prefix). One candidate only, so an item that took
+ * both (fork-discord-access) is not recognised. ponytail: inferred, so an unprefixed `pdf-tools` under a
+ * `pdf/` folder (or from a repository named pdf) still reads as prefixed. It serves rows from before the
+ * source_prefix column; an unprefixed row since also records null, so it is inferred the same way.
+ */
+function wasPrefixed(item: ItemRow, bare: string): boolean {
+  const repo = item.source_repo ?? '';
+  const own = item.source_kind === 'zip' ? repo.replace(/\.(zip|skill)$/i, '') : baseOf(repo);
+  return [own, ...dirOf(item.source_path ?? '').split('/')].some((px) => !!px && prefixed(px, bare) === item.name);
+}
+
+/**
+ * 5ef6: the upstream entry of a prefixed skill or agent names it bare, or nothing at all (or its YAML
+ * does not parse); it takes the item's prefixed name again, as at import (pinName refuses what it cannot set).
+ * ponytail: a nameless entry counts as prefixed only by a recorded source_prefix; a row from before the
+ * column keeps upstream's nameless entry, still installed under its prefixed folder.
+ */
+function keepPrefix(item: ItemRow, tree: TreeFile[]): TreeFile[] {
+  const entry = item.kind === 'skill' ? tree.find((f) => f.path === 'SKILL.md') : item.kind === 'agent' && tree.length === 1 ? tree[0] : undefined;
+  if (!entry) return tree;
+  const fmName = parseFrontmatter(utf8.decode(entry.bytes)).data.name;
+  const bare = typeof fmName === 'string' ? slugify(fmName) : '';
+  const pin = bare ? isPrefixed(item, bare) : !!item.source_prefix && item.name.startsWith(`${item.source_prefix}-`);
+  return pin ? pinName(item.kind, tree, item.name) : tree;
+}
+
+function unitInput(u: Unit, opts: ImportOpts): CreateItemInput & { source: ItemSource } {
   // A file path re-rooted to its name (subtree) would otherwise join to '<file>/<name>', which no update finds.
   const source: ItemSource = { ...opts.source, path: opts.pathIsFile ? opts.source.path : [opts.source.path, u.path].filter(Boolean).join('/') || null };
   // The root detection unit is the one carved from its siblings; a kind override, a folder import or any folder unit took the whole tree (updateTree).
   const sourceScope: NonNullable<ItemRow['source_scope']> = u.scope ?? (!opts.kind && u.path === '' && u.kind === 'skill' ? 'root' : 'tree');
-  const input = { kind: u.kind, name: u.name, tree: u.tree, visibility: opts.visibility, source, sourceScope, sourceCarve: u.carve, note: opts.note, fallbackName: u.fallbackName, folderName: u.folderName };
-  try {
-    return { item: createItemTx(ctx, p, input), op: 'create' };
-  } catch (e) {
-    if (!(e instanceof HttpError) || e.code !== 'name_taken') throw e;
-    const holder = ctx.db
-      .prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND name = ?')
-      .get(p.userId, u.kind, (e.details as { name: string }).name) as ItemRow | undefined;
-    // Re-import = update, only when the item holding the name is this very unit (same repo and path):
-    // a unit renamed upstream must not write its new name into the item that kept the old one.
-    if (!holder || !sameRepo(holder.source_repo, source.repo) || holder.source_path !== source.path) {
-      // Two units of one source with the same name (two marketplace plugins shipping agents/code-reviewer.md): say which one holds it.
-      // A skill under another tool's folder lost to a better-ranked copy (ypmn, detectUnits): say it is that tool's port.
-      if (holder && sameRepo(holder.source_repo, source.repo)) {
-        const port = u.kind === 'skill' ? portOf(u.path) : undefined;
-        const at = holder.source_path ?? 'the root';
-        throw new HttpError(409, 'name_taken', port ? `another copy of this skill (${at}) was imported; this one is the ${port} port` : `${e.message}, imported from ${at} of ${holder.source_repo}`, e.details);
-      }
-      // A zip is identified by its file name (docs/PLAN-v2.md D1), so a renamed download reads as a new pack: say so.
-      if (holder?.source_kind === 'zip') throw new HttpError(409, 'name_taken', `${e.message}, imported from ${holder.source_repo}; upload the file under that name to update it`, e.details);
-      throw e;
-    }
+  return { kind: u.kind, name: u.name, tree: u.tree, visibility: opts.visibility, source, sourceScope, sourceCarve: u.carve, sourcePrefix: prefixOfName(u), note: opts.note, fallbackName: u.fallbackName, folderName: u.folderName };
+}
+
+/** waive: accept the unit's frontmatter errors (0rdh). retried: this is the `<repo>-` prefixed attempt, of the name that was taken (5ef6). */
+function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: boolean, retried?: string): UnitResult {
+  const input = unitInput(u, opts);
+  const { source } = input;
+  // Re-import = update: the item of this kind from this very unit (same repo and path) under the name the
+  // unit takes, or under that name's prefix (5ef6) once the clash that forced it is gone. A unit renamed
+  // upstream must not write its new name into the item that kept the old one: it is a new unit, created
+  // beside it or skipped on the name. The oldest wins should an earlier bug have left two. A recorded
+  // prefix is matched against the unit's bare name, so fork-discord-access is found whether this import
+  // prefixes the unit inside it again (discord-access) or not (access).
+  const takes = previewItem(input, waive)?.name;
+  const bare = u.bare ?? takes;
+  const own = takes
+    ? (ctx.db.prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND source_path IS ? AND source_repo IS NOT NULL ORDER BY created_at, rowid').all(p.userId, u.kind, source.path) as unknown as ItemRow[])
+      .find((h) => sameRepo(h.source_repo, source.repo) && (h.name === takes || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes))))
+    : undefined;
+  if (own) {
     // How this import carved the unit replaces the last one's: the next source/update follows the manifest as it is now.
-    ctx.db.prepare('UPDATE items SET source_scope = ?, source_carve = ? WHERE id = ?').run(sourceScope, u.carve ? JSON.stringify(u.carve) : null, holder.id);
+    ctx.db.prepare('UPDATE items SET source_scope = ?, source_carve = ? WHERE id = ?').run(input.sourceScope ?? null, u.carve ? JSON.stringify(u.carve) : null, own.id);
     // The same commit (or the same zip) again: nothing changed upstream, so a local edit made since stays
     // the latest version. The ref still follows the one named (a tag, then the branch at the same commit).
-    if (holder.source_commit === source.commit) {
-      if (holder.source_ref !== source.ref) ctx.db.prepare('UPDATE items SET source_ref = ? WHERE id = ?').run(source.ref, holder.id);
-      return { item: getItemRow(ctx.db, holder.id)!, op: 'unchanged' };
+    if (own.source_commit === source.commit) {
+      if (own.source_ref !== source.ref) ctx.db.prepare('UPDATE items SET source_ref = ? WHERE id = ?').run(source.ref, own.id);
+      return { item: getItemRow(ctx.db, own.id)!, op: 'unchanged' };
     }
-    return versionFromSource(ctx, p, holder, u.tree, source, opts.note);
+    // Found under its prefix: the unit's tree names it takes (or bare), and the item keeps its own name.
+    return versionFromSource(ctx, p, own, own.name === takes ? u.tree : pinName(u.kind, u.tree, own.name), source, opts.note, waive);
   }
+  try {
+    return { item: createItemTx(ctx, p, input, { waiveFrontmatter: waive }), op: 'create' };
+  } catch (e) {
+    if (!(e instanceof HttpError) || e.code !== 'name_taken') throw e;
+    const taken = (e.details as { name: string }).name;
+    const holder = ctx.db.prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND name = ?').get(p.userId, u.kind, taken) as ItemRow | undefined;
+    // Two units of one source with the same name (two marketplace plugins shipping agents/code-reviewer.md): say which one holds it.
+    // A skill under another tool's folder lost to a better-ranked copy (ypmn, detectUnits): say it is that tool's port.
+    if (holder && sameRepo(holder.source_repo, source.repo)) {
+      const port = u.kind === 'skill' ? portOf(u.path) : undefined;
+      const at = holder.source_path ?? 'the root';
+      throw new HttpError(409, 'name_taken', port ? `another copy of this skill (${at}) was imported; this one is the ${port} port` : `${e.message}, imported from ${at} of ${holder.source_repo}`, e.details);
+    }
+    // 5ef6: another source's item (or a local one) holds the name. With onNameClash 'prefix' the unit
+    // takes `<repo>-<name>`; otherwise the skip offers that name.
+    const prefix = opts.clashPrefix ?? opts.rootName;
+    const name = prefixed(prefix, taken);
+    if (!retried && name && opts.onNameClash === 'prefix') return importUnit(ctx, p, renamed(u, taken, name), opts, waive, taken);
+    // The prefixed name is held too: no upload or option would import it under either, so say that.
+    if (retried) throw new HttpError(409, 'name_taken', `you already have ${aKind(u.kind)} named '${retried}', and its prefixed name '${taken}' is taken too${holder?.source_repo ? ` (imported from ${holder.source_repo})` : ''}`, e.details);
+    // Past the name cap there is no prefixed name to offer, only the reason.
+    const details = !name ? e.details : { ...(e.details as object), prefixed: name };
+    const tooLong = name ? '' : `; '${prefix}-${taken}' ${TOO_LONG}, so it cannot take the prefix`;
+    // A zip is identified by its file name (docs/PLAN-v2.md D1), so a renamed download reads as a new pack: say so.
+    if (holder?.source_kind === 'zip') throw new HttpError(409, 'name_taken', `${e.message}, imported from ${holder.source_repo}; upload the file under that name to update it${tooLong}`, details);
+    throw new HttpError(409, 'name_taken', e.message + tooLong, details);
+  }
+}
+
+/**
+ * 5ef6: skills of one import sharing a name each take their prefix (Unit.prefix), so a repository never
+ * drops its own; a copy an earlier import of this source holds under the bare name (held) keeps it, so a
+ * re-import updates that item instead of stranding it. Ports (ypmn) still give way, and are skipped when
+ * every other copy was prefixed away from the bare name. A copy whose prefixed name would pass the name
+ * cap is skipped (prefixed). Returns the indexes of the units skipped.
+ */
+function prefixClashes(units: Unit[], names: (string | undefined)[], opts: ImportOpts, skipped: Skipped[], held: (i: number, name: string) => boolean): Set<number> {
+  const byName = new Map<string, number[]>();
+  units.forEach((u, i) => {
+    const n = names[i];
+    if (u.kind !== 'skill' || !n) return;
+    const list = byName.get(n);
+    if (list) list.push(i);
+    else byName.set(n, [i]);
+  });
+  const dropped = new Set<number>();
+  // A generated name another skill of this import already carries would make that skill the clash's loser.
+  const used = new Set(byName.keys());
+  for (const [name, idx] of byName) {
+    const copies = idx.filter((i) => !portOf(units[i].path));
+    if (copies.length < 2) continue;
+    const bare = copies.filter((i) => !units[i].prefix || held(i, name));
+    for (const i of copies) {
+      if (bare.includes(i)) continue;
+      const n = prefixed(units[i].prefix!, name);
+      let why = n ? `'${n}' is the name of another skill of this import` : `'${units[i].prefix}-${name}' ${TOO_LONG}`;
+      if (n && !used.has(n)) {
+        try {
+          units[i] = renamed(units[i], name, n);
+          used.add(n);
+          continue;
+        } catch (e) {
+          if (!(e instanceof HttpError)) throw e;
+          why = e.message;
+        }
+      }
+      dropped.add(i);
+      skipped.push({ path: units[i].path, reason: `another skill of this import is named '${name}', and ${why}` });
+    }
+    if (bare.length) continue;
+    const at = unitInput(units[copies[0]], opts).source.path ?? 'the root';
+    for (const i of idx.filter((i) => portOf(units[i].path))) {
+      dropped.add(i);
+      skipped.push({ path: units[i].path, reason: `another copy of this skill (${at}) was imported; this one is the ${portOf(units[i].path)} port` });
+    }
+  }
+  return dropped;
 }
 
 /**
  * Import every unit of a tree, plus the group when asked (created, or `intoGroup` added to), in one transaction. A unit that fails
  * (lint, name taken by an unrelated item, install-path conflict) is rolled back on its own and
- * reported in `skipped`; only the group slug being taken fails the whole import.
+ * reported in `skipped`; only the group slug being taken fails the whole import, and, before anything
+ * is written, units with frontmatter errors when frontmatterErrors is 'ask' (409 frontmatter_errors, 0rdh).
  */
 export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: ImportOpts): ImportOutcome {
   requireScope(p, 'write');
@@ -691,7 +868,8 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   if (opts.kind === 'artifact') throw badRequest(ARTIFACT_FROM_TREE);
   let skippedFolders: SkippedFolder[] = [];
   // A kind override makes the tree one item, except a single-file kind on a folder (jwz6): one item per .md.
-  if (opts.kind && (!SINGLE_FILE.has(opts.kind) || opts.pathIsFile)) units = [{ path: '', kind: opts.kind, tree, name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
+  // A supplied name is the entry's frontmatter name too (5ef6 pinName), as a prefixed one is.
+  if (opts.kind && (!SINGLE_FILE.has(opts.kind) || opts.pathIsFile)) units = [{ path: '', kind: opts.kind, tree: opts.name === undefined ? tree : pinName(opts.kind, tree, opts.name, 'name'), name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
   else {
     if (opts.kind) units = fileUnits(tree, opts.kind, opts.rootName, skipped);
     else {
@@ -703,7 +881,7 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
     }
     if (opts.name !== undefined) {
       if (units.length !== 1) throw badRequest(`name applies to an import of exactly one item (found ${units.length})`);
-      units[0].name = opts.name;
+      units[0] = { ...units[0], name: opts.name, tree: pinName(units[0].kind, units[0].tree, opts.name, 'name') };
     }
   }
   const meta = opts.group ? pluginMeta(tree) : null;
@@ -717,6 +895,33 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   const maxItems = importLimit(ctx, 'maxItems');
   if (units.length > maxItems) throw new HttpError(400, 'too_many_items', `at most ${maxItems} item${maxItems === 1 ? '' : 's'} per import (found ${units.length})`);
   const { db } = ctx;
+  // A one-file import's unit is the root of its one-file tree (''): it is reported at the file's path.
+  const at = (u: Unit) => (opts.pathIsFile && opts.source.path) || u.path;
+  // Each unit named and linted as createItemTx will see it, before anything is written (5ef6, 0rdh).
+  const mode = opts.frontmatterErrors ?? 'ask';
+  const previews = units.map((u) => previewItem(unitInput(u, opts), mode === 'import'));
+  const fmErrors = previews.map((pv) => {
+    const errs = pv?.lint.filter((l) => l.level === 'error') ?? [];
+    return errs.length > 0 && errs.every((l) => FRONTMATTER_ERRORS.has(l.code)) ? errs : null;
+  });
+  // A unit an earlier import of this source took with its frontmatter errors is taken again without asking (0rdh).
+  const waivedBefore = db.prepare('SELECT 1 FROM items WHERE owner_id = ? AND kind = ? AND lower(source_repo) = lower(?) AND source_path IS ? AND lint_waived = 1');
+  const waive = units.map((u, i) => mode === 'import' || (!!fmErrors[i] && !!waivedBefore.get(p.userId, u.kind, opts.source.repo, unitInput(u, opts).source.path)));
+  if (mode === 'ask') {
+    const asked: FrontmatterUnit[] = units.flatMap((u, i) => (fmErrors[i] && !waive[i] ? [{ path: at(u), kind: u.kind, errors: fmErrors[i].map((l) => l.message) }] : []));
+    // Nothing is written yet, so no group either: the UI re-posts with the user's choice.
+    if (asked.length) {
+      throw new HttpError(409, 'frontmatter_errors', `${asked.length} of ${units.length} units have frontmatter errors: send frontmatterErrors 'import' to import them anyway or 'skip' to skip them`, asked);
+    }
+  }
+  const holds = db.prepare('SELECT 1 FROM items WHERE owner_id = ? AND kind = ? AND name = ? AND lower(source_repo) = lower(?) AND source_path IS ?');
+  const held = (i: number, name: string) => !!holds.get(p.userId, units[i].kind, name, opts.source.repo, unitInput(units[i], opts).source.path);
+  // A unit its lint will refuse never imports, so its name forces no prefix on a twin that does.
+  const imports = (i: number) => {
+    const errs = previews[i]?.lint.filter((l) => l.level === 'error' && !l.waived) ?? [];
+    return !errs.length || (waive[i] && errs.every((l) => FRONTMATTER_ERRORS.has(l.code)));
+  };
+  const dropped = prefixClashes(units, previews.map((pv, i) => (imports(i) ? pv?.name : undefined)), opts, skipped, held);
   return tx(db, () => {
     // intoGroup is re-read here: the route resolved it before a GitHub download that can take a minute,
     // and a group deleted meanwhile would fail every member insert on its foreign key (a 500).
@@ -727,10 +932,11 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
       : (into || null);
     const results: UnitResult[] = [];
     let added = 0;
-    for (const u of units) {
+    for (const [i, u] of units.entries()) {
+      if (dropped.has(i)) continue;
       db.exec('SAVEPOINT unit');
       try {
-        const r = importUnit(ctx, p, u, opts);
+        const r = importUnit(ctx, p, u, opts, waive[i]);
         // A re-import into the same group versions its members; they stay members once (p2wf).
         if (group && !isMember(db, group.id, r.item.id)) {
           addMemberTx(ctx, p, group, { itemId: r.item.id });
@@ -741,7 +947,8 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
       } catch (e) {
         if (!(e instanceof HttpError)) throw e;
         db.exec('ROLLBACK TO unit; RELEASE unit');
-        skipped.push({ path: u.path, reason: reasonOf(e) });
+        const offer = e.code === 'name_taken' ? (e.details as { prefixed?: string } | undefined)?.prefixed : undefined;
+        skipped.push({ path: at(u), reason: reasonOf(e), ...(offer && { prefixed: offer }) });
       }
     }
     // Nothing imported is a failure, not a 201 with an empty list a script would record as success; and no

@@ -43,6 +43,8 @@ const groupFields = {
   intoGroup: z.string().min(1).max(100).optional(),
   kind: z.enum(KINDS).optional(),
   folderKinds: folderKinds.optional(),
+  onNameClash: z.enum(['skip', 'prefix']).optional(),
+  frontmatterErrors: z.enum(['ask', 'import', 'skip']).optional(),
 };
 const packFields = z.object({ ...groupFields, includeRepoTooling: z.enum(['true', 'false']).optional() });
 const githubBody = z.object({
@@ -163,10 +165,20 @@ importRoutes.post('/items/import/pack', archiveBody, async (c) => {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const name = baseOf(file.name) || 'pack.zip';
   const { files, top, links } = unpack(bytes, undefined, packLimits(c.var.ctx));
-  const rootName = top ?? name.replace(/\.(zip|skill)$/i, '');
+  const zipName = name.replace(/\.(zip|skill)$/i, '');
   const source: ItemSource = { kind: 'zip', repo: name, ref: null, path: null, commit: sha256Hex(bytes) };
   // A stripped wrapper folder (`zip -r my-skill.zip my-skill/`) is one folder, so its SKILL.md is the whole folder's.
-  const out = importTree(c.var.ctx, p, files, { ...opts, intoGroup, includeRepoTooling: includeRepoTooling === 'true', source, rootName, folderRoot: top !== null, skipped: linkSkips(links), note: `import zip ${name}` });
+  const out = importTree(c.var.ctx, p, files, {
+    ...opts,
+    intoGroup,
+    includeRepoTooling: includeRepoTooling === 'true',
+    source,
+    rootName: top ?? zipName,
+    clashPrefix: zipName,
+    folderRoot: top !== null,
+    skipped: linkSkips(links),
+    note: `import zip ${name}`,
+  });
   return respond(c, p, out, source);
 });
 
@@ -207,6 +219,9 @@ importRoutes.post('/items/import/github', async (c) => {
       folderKinds: body.folderKinds,
       defaultGroupName: repo,
       includeRepoTooling: body.includeRepoTooling,
+      onNameClash: body.onNameClash,
+      clashPrefix: repo.split('/')[1],
+      frontmatterErrors: body.frontmatterErrors,
       note: `import github ${repo}@${short(sha)} ${src.path ?? ''}`.trimEnd(),
     });
     return respond(c, p, out, source);

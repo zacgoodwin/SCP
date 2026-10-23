@@ -129,6 +129,8 @@ function ItemView({ id }: { id: string }) {
     ['lint', `Lint${version?.lint.length ? ` (${version.lint.length})` : ''}`],
     ['groups', `Groups (${item.groups.length})`],
   ];
+  // 0rdh: frontmatter errors the import accepted, kept on the version as waived warnings.
+  const waived = version?.lint.filter((l) => l.waived) ?? [];
   const seqs = versions.length ? versions.map((v) => v.seq) : [item.latestSeq];
   const seq = version?.seq ?? item.latestSeq;
 
@@ -173,6 +175,22 @@ function ItemView({ id }: { id: string }) {
           )}
         </div>
       </header>
+
+      {waived.length > 0 && (
+        <details className="stack">
+          <summary>
+            <span className="badge badge-shared">frontmatter errors</span>{' '}
+            <span className="muted">imported anyway; Claude Code may fall back to the folder name or the first paragraph</span>
+          </summary>
+          <ul className="lint-rows">
+            {waived.map((l, i) => (
+              <li key={i}>
+                <code>{l.code}</code> {l.message}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
 
       {editingMeta ? (
         <MetaEditor
