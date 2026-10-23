@@ -220,6 +220,10 @@ When SCP supplied the item's frontmatter on import, a **Frontmatter supplied by 
 
 The dashboard lists **Your groups** and **Shared with you** (groups other users shared with you or made public), each with owner, plane counts and a Connect link. An admin reads every group, so for them the second card is **Other users' groups** and says so.
 
+### Bulk actions on item lists
+
+On the Skills, Prompts & MDs and Artifacts pages, tick items (or **Select all on this page**; Shift-click ticks a range, Esc clears) to get a selection bar with **Add to group…** (your groups; every group for an admin), **Visibility…** and **Delete…** (an inline confirmation listing the count and names). Only items you can edit have a live checkbox. Each action runs the single-item request per item, four at a time, and reports a summary such as "12 updated, 2 failed: name: reason"; the list then reloads its first page, and the failed items on it stay selected for a retry (ones further down are named in the summary but deselected). A panel opens only when you click its button: clearing the selection closes it.
+
 ## Nested groups
 
 A group can include other groups (`PUT /api/v1/groups/:slug/includes {includes: [slug]}`, `POST .../includes {slug}`, `DELETE .../includes/:slug`). Everything an included group serves flows into the including one: its own members first, then each include's members in order, up to 4 levels deep. An item that appears more than once is served once, from the first place it appears, with the version pin and "Install as" of that row. Cycles are refused (409 `include_cycle`), a fifth level is 400 `include_too_deep`.
