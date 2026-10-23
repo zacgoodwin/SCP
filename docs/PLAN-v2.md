@@ -133,8 +133,8 @@ API: `GET /admin/settings` reports `clientSecretSet: true`, `tokenSet: true`.
 ## D1 imports (`server/src/imports/*`, tests `server/test/imports.test.ts`)
 
 ```
-POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName]        -> 201 ImportResult
-POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?  -> 201 ImportResult
+POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [includeRepoTooling=true]  -> 201 ImportResult
+POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, includeRepoTooling?  -> 201 ImportResult
 POST /items/:id/source/check                                                                     -> {source, upToDate, latestCommit}
 POST /items/:id/source/update  {note?}                                                           -> {item, skipped}  (new version; 409 up_to_date when nothing changed; skipped: the path's symlinks)
 ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason}], source: ItemSource | null}
@@ -204,6 +204,51 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   Nothing recognised at all is 400 `nothing_to_import`, with the skip reasons as `details` when
   there are any. Each returned item carries `op` (`create` | `version` | `unchanged`). At most 200
   items per import by default (`import.max_items`; 400 `too_many_items` naming the cap).
+- Nested plugins (v3 bppq, `pack.ts pluginRoots`): every folder holding `.claude-plugin/plugin.json`,
+  plus every same-repository `source` (`./x`, normalised, inside the tree) a root
+  `.claude-plugin/marketplace.json` lists, is a plugin root. Each root's `skills/*/SKILL.md`,
+  `agents/*.md`, `commands/*.md`, `prompts/*.md` (and the `.claude/` variants) are detected first,
+  deepest root first so a nested plugin claims its own files, then the repository root's as above.
+  A source naming another repository (an object source, a URL, a path without `./`) or escaping the
+  tree is never followed and lands in `skipped` against `marketplace.json`; so does a marketplace
+  file that is not a JSON object. An `.md` at any depth in an `agents/` or `commands/` folder outside every plugin
+  root and below the repository root (`antigravity/x/agents/<name>/agent.md`) is told it is imported only inside a plugin. Two plugins of one
+  source shipping the same name: the second is skipped as `name_taken`, naming the path that holds
+  it. `updateTree` runs the same detection, so a nested plugin's agent updates like a root one.
+- Unsupported plugin components (v3 dnxq part 1): inside a plugin root, `hooks/`, `.mcp.json`,
+  `output-styles/`, `settings.json`, `.lsp.json` and `monitors/` are never stored or served; each
+  lands in `skipped` once (`plugin <component> is not supported by SCP; it was not imported`), not
+  file by file. Outside a plugin these are ordinary files. Part 2, whether SCP should store and serve
+  hooks and MCP servers at all, is pending a human decision (options: never; admin-published only;
+  any owner with an install-time warning; each widens who can run code on subscriber machines).
+  Until it is taken SCP is report-only (docs/PLAN-v3.md "Decisions taken"). The plugin.zip SCP
+  builds carries only its own `.mcp.json`.
+- Manifest component paths (v3 4ky8, `pack.ts declaredPath`), detected before every convention
+  pass: a plugin root's `plugin.json`, or its same-repository `marketplace.json` entry, may name
+  `skills`, `agents` and `commands` (a string or a list). Each path is resolved against the plugin
+  root; an absolute one, one escaping the plugin root, one SCP would not store (`normalizePath`) or
+  one holding no `SKILL.md` / `.md` lands in `skipped` against the manifest, and the rest imports. A
+  `skills` path is one skill folder (its own `SKILL.md`) or a folder of them; an `agents`/`commands`
+  path is one `.md` or a folder of them. Declared files are claimed first, so conventions add only
+  what is left, never a duplicate. Remote marketplace sources are never fetched (bppq above).
+  Manifest problems (here and bppq's marketplace sources) are listed up to 500 per import, the rest
+  counted in one entry; a list or object where a path belongs shows as `[...]` / `{...}`.
+- Maintainer tooling (v3 4ky8 part 2): when the tree has a plugin root, or `skills/*/SKILL.md` at the
+  root, `.claude/skills|agents|commands`, `.agents/skills`, `.gemini/skills` and `.opencode/skills`
+  are skipped, once per folder, as `maintainer tooling (repo ships a plugin)` (or `a skills/
+  folder`). With a plugin root the root `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` are skipped too (a
+  Claude Code plugin ships no instructions); with only a `skills/` folder they import as before,
+  since a skills repository's `AGENTS.md` may be the product. `includeRepoTooling: true` (GitHub
+  body; pack form field `includeRepoTooling=true`) restores the old detection. `updateTree` runs the
+  same detection without the flag, so an update never pulls skipped tooling into a root skill.
+- Which copy of a skill wins (v3 ypmn): the "any other `*/SKILL.md`" pass takes the outermost skill
+  folders only (a nested one stays its parent's file) and orders them inside a non-root plugin root
+  or a `.claude` folder first, then under a `skills` folder, then neutral, and last under a folder
+  named for another tool (`.openclaw`, `.opencode`, `.gemini`, `.cursor`, `.kiro`, `.windsurf`,
+  `.codex`, `antigravity`, `codex`, `openclaw`, `opencode`, `cursor`, `gemini`; a skill's own folder
+  name never counts); depth, then path, within a rank. A port that loses its name to a better copy of
+  the same import is skipped as `another copy of this skill (<path>) was imported; this one is the
+  <tool> port`. Re-import and `updateTree` detect the same way, so the kept copy stays the same.
 - Reuse `items/import.ts importUpload` / `items/service.ts createItemTx` for each unit; pass
   `source` on every item. `name` collisions with the user's existing items of that kind: 409
   `name_taken` per unit goes to `skipped`, except when the existing item has the same
@@ -213,7 +258,13 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   came from a zip under another file name, the reason names that file ("upload the file under
   that name to update it"): the zip's identity is its file name.
 - `group`: when given, create the group (`groups/service.ts createGroup`, 409 if taken) with all
-  imported items as members; `groupName` defaults to the repo or zip name. The whole import is one
+  imported items as members; `groupName` defaults to the manifest's `displayName`, then its `name`,
+  then the repo or zip name, and the description comes from the manifest (v3 5w3w,
+  `imports/manifest.ts pluginMeta`: `.claude-plugin/plugin.json`, else a `marketplace.json` listing
+  exactly one plugin, else `.codex-plugin/plugin.json`; read only when `group` is given). plugin.zip
+  writes the slug as its `name` and the group's description. The manifest is untrusted JSON (1 MB cap, an object, string fields trimmed and held
+  to the group limits of 100 and 2000 characters): a bad manifest or field is ignored and listed in
+  `skipped`, never a failed import. The whole import is one
   transaction: group + items + members, or nothing (apart from `skipped`). Every unit skipped is
   422 `nothing_imported` with `skipped` as `details`, never a 201 with `items: []`; with a group
   requested the group rolls back and its slug is not burnt. `kind: artifact` is 400 (a tree has no
@@ -221,7 +272,8 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
 - Provenance: `source_kind`, `source_repo` (`owner/repo` as GitHub's `full_name` spells it, zip: the
   file name), `source_ref`, `source_path`, `source_commit` (zip: sha256 of the zip bytes),
   `source_tree_sha256` (the tree the source last wrote), `source_scope` (`root` for a root
-  `SKILL.md` detection unit, `tree` for a folder unit or a `kind` override). Version note
+  `SKILL.md` detection unit, `tree` for a folder unit or a `kind` override), `source_carve` (v3: the
+  paths inside a folder unit that another unit or skip took first). Version note
   `import github owner/repo@<7sha> <path>` / `import zip <name>`.
 - `source/check`: GitHub only (404 otherwise). Resolves `ref` again (a sha ref is always up to
   date), compares to `source_commit`. `source/update` re-imports that path at the latest commit as
@@ -230,8 +282,12 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   update never writes the upstream tree over a local edit: not while check says up to date, and not
   when a commit elsewhere in the repository moved HEAD while this path stayed the same).
   A skill is carved the way its import carved it (`updateTree`, by `source_scope`): a root `SKILL.md`
-  import leaves sibling units (`AGENTS.md`, `agents/*.md`) to their own items, a `skills/<name>/`
-  folder or a `kind` override keeps the whole folder. Rows from before `source_scope` was recorded
+  import leaves sibling units (`AGENTS.md`, `agents/*.md`) to their own items, as does a `SKILL.md` at
+  a nested plugin root for that plugin's components (bppq), while a `skills/<name>/` folder, a folder
+  import or a `kind` override keeps the whole folder. What another unit carved out of a skill folder
+  (`source_carve`: a nested declared skill path, a marketplace entry's `agents`, a nested plugin's
+  components) stays out, since the folder's subtree shows neither the marketplace.json nor the other
+  declared paths; a re-import records the carve afresh. Rows from before `source_scope` was recorded
   infer it from the stored version (it holds none of the carved files exactly when the import carved
   them). A lone loose `.md` the md-only fallback re-homed (`design.md` -> `DESIGN.md`, `skill.md` ->
   `SKILL.md`) is re-homed the same way on update.

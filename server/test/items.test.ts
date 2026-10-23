@@ -204,7 +204,7 @@ test('insertRow takes column names only from its fixed lists', () => {
   const row = {
     id: 'x1', owner_id: u.id, kind: 'skill', name: 'n', title: '', description: '', category: '', tags: '[]',
     visibility: 'private', format: null, latest_seq: 0, source_repo: null, source_ref: null, source_path: null,
-    source_kind: null, source_commit: null, source_tree_sha256: null, source_scope: null, forked_from: null, created_at: 'now', updated_at: 'now',
+    source_kind: null, source_commit: null, source_tree_sha256: null, source_scope: null, source_carve: null, forked_from: null, created_at: 'now', updated_at: 'now',
   };
   assert.throws(() => insertRow(t.db, 'items', { ...row, 'name) VALUES (1); DROP TABLE users; --': 1 }), /do not match/);
   assert.throws(() => insertRow(t.db, 'items', { id: 'x2' }), /do not match/);

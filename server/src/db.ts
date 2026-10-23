@@ -261,6 +261,8 @@ const MIGRATIONS: string[] = [
    CREATE INDEX oauth_codes_client ON oauth_codes(client_id);
    CREATE INDEX oauth_codes_expires ON oauth_codes(expires_at);`,
   UNDOUBLE_SOURCE_PATHS,
+  // v3 4ky8/bppq: what another unit of the import carved out of a skill folder (imports/pack.ts updateTree).
+  `ALTER TABLE items ADD COLUMN source_carve TEXT;`,
 ];
 
 export function openDb(path: string): Db {

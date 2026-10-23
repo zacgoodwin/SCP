@@ -92,6 +92,9 @@ const SLUG = /^[a-z0-9][a-z0-9-]{1,63}$/;
 /** Members per group, and files across their versions: every manifest, bundle and add walks them all. */
 export const MAX_MEMBERS = 500;
 export const MAX_GROUP_FILES = 20_000;
+/** Display name and description lengths: the routes.ts body schema, and an import's plugin manifest (imports/manifest.ts). */
+export const MAX_GROUP_NAME = 100;
+export const MAX_GROUP_DESCRIPTION = 2000;
 /**
  * Direct includes per group, and groups in one effective set: every listing walks each listed group's
  * whole include DAG (a member-count query per effective group), so a public hub over thousands of
