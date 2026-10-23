@@ -1,12 +1,12 @@
-# syntax=docker/dockerfile:1
-FROM node:24.22.1-bookworm-slim AS web
+# Base image pinned by digest (multi-arch index) so a re-pushed tag cannot change the build; Dependabot bumps it.
+FROM node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS web
 WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/ ./
 RUN npm run build
 
-FROM node:24.22.1-bookworm-slim
+FROM node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
 ENV NODE_ENV=production \
     PORT=8080 \
     SCP_ARTIFACT_PORT=8081 \
