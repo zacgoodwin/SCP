@@ -203,6 +203,20 @@ function VisibilitySelect({ value, onChange }: { value: api.Visibility; onChange
   );
 }
 
+/** jcfm: the description SCP writes as frontmatter when the one imported file has none. */
+function DescriptionField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <label className="field">
+      <span>Description</span>
+      <textarea rows={2} maxLength={1024} value={value} placeholder="Optional" onChange={(e) => onChange(e.target.value)} />
+      <small className="muted">
+        For an import of one item whose file has no frontmatter (a plain .md imported as a skill, say): SCP adds this description (and a skill's or agent's name) as its
+        frontmatter, and adds it again on every update from the source. A file with frontmatter of its own keeps it.
+      </small>
+    </label>
+  );
+}
+
 /** The group a pack or GitHub import lands in: none, a new one (slug + name), or an existing one the user owns. */
 interface GroupChoice {
   mode: 'none' | 'new' | 'existing';
@@ -302,12 +316,13 @@ function PackForm({ limits, intoGroup, onCancel, onRun }: { limits: imp.ImportLi
   const [file, setFile] = useState<File | null>(null);
   const [visibility, setVisibility] = useState<api.Visibility>('private');
   const [group, setGroup] = useState(() => initialGroup(intoGroup));
+  const [description, setDescription] = useState('');
   const { busy, error, submit } = useSubmit();
 
   const go = submit(async () => {
     if (!file) return;
     if (limits) imp.refuseOversize(file, limits.maxArchiveMb);
-    const opts = { visibility, ...groupOpts(group) };
+    const opts = { visibility, description: description.trim() || undefined, ...groupOpts(group) };
     await onRun((more) => imp.importOrSkipped(imp.importPack(file, { ...opts, ...more })));
   });
 
@@ -326,6 +341,7 @@ function PackForm({ limits, intoGroup, onCancel, onRun }: { limits: imp.ImportLi
         </small>
       </label>
       <VisibilitySelect value={visibility} onChange={setVisibility} />
+      <DescriptionField value={description} onChange={setDescription} />
       <GroupFields value={group} onChange={setGroup} />
       <ErrorBox error={error} />
       <Actions busy={busy} label="Import pack" disabled={!file} onCancel={onCancel} />
@@ -343,6 +359,7 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
   const [kind, setKind] = useState<api.Kind | ''>('');
   const [visibility, setVisibility] = useState<api.Visibility>('private');
   const [group, setGroup] = useState(() => initialGroup(intoGroup));
+  const [description, setDescription] = useState('');
   const { busy, error, submit } = useSubmit();
 
   const byUrl = url.trim() !== '';
@@ -350,7 +367,7 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
 
   const go = submit(async () => {
     const where: imp.GithubImport = byUrl ? { url: url.trim() } : { repo: repo.trim(), ref: ref.trim() || undefined, path: path.trim() || undefined };
-    const body: imp.GithubImport = { ...where, kind: kind || undefined, visibility, ...groupOpts(group) };
+    const body: imp.GithubImport = { ...where, kind: kind || undefined, visibility, description: description.trim() || undefined, ...groupOpts(group) };
     await onRun((more) => imp.importOrSkipped(imp.importGithub({ ...body, ...more })));
   });
 
@@ -398,9 +415,11 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
         </select>
         <small className="muted">
           Picking a type turns detection off. Agent, command, prompt and instructions: each .md file directly in the folder (not in subfolders) becomes its own item of that type (README-style docs are
-          left out). Skill, design and package: the whole folder becomes one item holding every file. A repo of many kinds of items needs detection.
+          left out). Skill, design and package: the whole folder becomes one item holding every file; a Path naming one .md file as a skill makes that file its SKILL.md.
+          A repo of many kinds of items needs detection.
         </small>
       </label>
+      <DescriptionField value={description} onChange={setDescription} />
       <VisibilitySelect value={visibility} onChange={setVisibility} />
       <GroupFields value={group} onChange={setGroup} />
       <p className="muted">Fetched through the GitHub API at the ref's current commit, which is pinned on every item for update checks.</p>

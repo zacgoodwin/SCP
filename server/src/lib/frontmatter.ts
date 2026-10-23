@@ -1,4 +1,4 @@
-import { isScalar, parseDocument, visit } from 'yaml';
+import { isScalar, parseDocument, stringify, visit } from 'yaml';
 
 /** Larger fenced blocks are a lint error, not parsed: a parse is ~1 ms per KB and runs on reads too. */
 export const MAX_FRONTMATTER = 64 * 1024;
@@ -31,6 +31,18 @@ export function parseFrontmatter(src: string): Frontmatter {
     if (nl === -1) return { data: {}, body: text, hasFrontmatter: true, error: 'frontmatter is not closed' };
     pos = nl + 1;
   }
+}
+
+/**
+ * jcfm: src with a frontmatter block of `fields` put in front, or null when src has a block of its own
+ * (upstream's wins). The block is emitted by yaml, never concatenated, so any user value (`:`, `#`,
+ * newlines) round-trips; the same fields always give the same bytes. A leading BOM is dropped: Claude
+ * Code needs `---` as the very first bytes.
+ */
+export function prependFrontmatter(src: string, fields: Record<string, string | undefined>): string | null {
+  const fm = parseFrontmatter(src);
+  if (fm.hasFrontmatter) return null;
+  return `---\n${stringify(fields, { lineWidth: 0 })}---\n${fm.body}`;
 }
 
 function parseYaml(src: string, body: string): Frontmatter {

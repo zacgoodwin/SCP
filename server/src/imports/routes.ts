@@ -12,7 +12,22 @@ import { AUTH_LIMITS, rateLimited, spend, take } from '../lib/ratelimit.ts';
 import type { TreeFile } from '../lib/tree.ts';
 import { KINDS, type AppEnv, type GroupRow, type ItemRow, type ItemSource, type Principal } from '../types.ts';
 import { SHA_REF, archiveTooLarge, badSource, fetchFolder, fetchZipball, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
-import { ARTIFACT_FROM_TREE, FOLDER_KINDS, importTree, linkSkips, packLimits, subtree, underPath, unpack, updateTree, versionFromSource, type ImportOutcome, type Skipped } from './pack.ts';
+import {
+  ARTIFACT_FROM_TREE,
+  FOLDER_KINDS,
+  editSupplied,
+  fileSkillName,
+  importTree,
+  linkSkips,
+  packLimits,
+  subtree,
+  underPath,
+  unpack,
+  updateTree,
+  versionFromSource,
+  type ImportOutcome,
+  type Skipped,
+} from './pack.ts';
 
 const isTreePath = (k: string) => {
   try {
@@ -35,6 +50,11 @@ const folderKinds = z.preprocess(
     .record(z.string().refine(isTreePath, 'a folder path inside the tree (no ../, no leading /)'), z.enum(FOLDER_KINDS))
     .refine((m) => Object.keys(m).length <= 100, 'at most 100 folders'),
 );
+const description = z
+  .string()
+  .trim()
+  .max(1024)
+  .transform((s) => s || undefined);
 // An empty slug is a 400, never "absent" (intoGroupOf tests truthiness); the pack form maps '' to absent before parsing.
 const groupFields = {
   visibility: z.enum(['private', 'public']).optional(),
@@ -45,6 +65,8 @@ const groupFields = {
   folderKinds: folderKinds.optional(),
   onNameClash: z.enum(['skip', 'prefix']).optional(),
   frontmatterErrors: z.enum(['ask', 'import', 'skip']).optional(),
+  // jcfm: capped at lint's description limit; blank is none.
+  description: description.optional(),
 };
 const packFields = z.object({ ...groupFields, includeRepoTooling: z.enum(['true', 'false']).optional() });
 const githubBody = z.object({
@@ -57,6 +79,7 @@ const githubBody = z.object({
   name: z.string().max(64).optional(),
 });
 const updateBody = z.object({ note: z.string().max(1000).optional() });
+const suppliedBody = z.object({ description: z.string().trim().min(1).max(1024) });
 
 const baseOf = (p: string) => p.slice(Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')) + 1);
 const short = (sha: string) => sha.slice(0, 7);
@@ -201,7 +224,9 @@ importRoutes.post('/items/import/github', async (c) => {
     // The archive can take up to a minute to arrive; the key may have been revoked meanwhile.
     const p = reauthenticate(c);
     const source: ItemSource = { kind: 'github', repo, ref, path: src.path, commit: sha };
-    const rootName = src.path ? baseOf(src.path) : repo.split('/')[1];
+    const repoName = repo.split('/')[1];
+    // mas4: one .md file as a skill is named for the file, or for the repository when the file name is generic (skills.md).
+    const rootName = !src.path ? repoName : pathIsFile && body.kind === 'skill' ? fileSkillName(baseOf(src.path), repoName) : baseOf(src.path);
     const out = importTree(ctx, p, tree, {
       source,
       rootName,
@@ -220,8 +245,9 @@ importRoutes.post('/items/import/github', async (c) => {
       defaultGroupName: repo,
       includeRepoTooling: body.includeRepoTooling,
       onNameClash: body.onNameClash,
-      clashPrefix: repo.split('/')[1],
+      clashPrefix: repoName,
       frontmatterErrors: body.frontmatterErrors,
+      description: body.description,
       note: `import github ${repo}@${short(sha)} ${src.path ?? ''}`.trimEnd(),
     });
     return respond(c, p, out, source);
@@ -271,4 +297,15 @@ importRoutes.post('/items/:id/source/update', async (c) => {
     audit(c, p, { action: 'item.version', targetType: 'item', targetId: item.id, detail: { kind: item.kind, name: item.name, seq: r.item.latest_seq, via: 'github', commit: sha } });
     return c.json({ item: itemDetail(ctx.db, p, r.item), skipped });
   });
+});
+
+/** jcfm: edit the description SCP supplied on import (a new version while the supplied block is in use). */
+importRoutes.put('/items/:id/source/frontmatter', async (c) => {
+  const { db } = c.var.ctx;
+  const item = loadEditableItem(db, requireUser(c), c.req.param('id'));
+  const body = await parseJson(c, suppliedBody);
+  const p = reauthenticate(c);
+  const next = editSupplied(c.var.ctx, p, item, body.description);
+  audit(c, p, { action: 'item.update', targetType: 'item', targetId: item.id, detail: { kind: item.kind, name: item.name, fields: ['suppliedFrontmatter'], seq: next.latest_seq } });
+  return c.json({ item: itemDetail(db, p, next) });
 });

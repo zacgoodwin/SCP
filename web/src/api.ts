@@ -106,6 +106,10 @@ export interface ItemSummary {
 export interface ItemDetail extends ItemSummary {
   createdAt: string;
   source: ItemSource | null;
+  /** jcfm: frontmatter SCP supplied on import (upstream had none), re-applied on every source update. */
+  suppliedFrontmatter?: { name?: string; description: string } | null;
+  /** jcfm: upstream now ships its own frontmatter, so the supplied fields wait as a fallback. */
+  upstreamFrontmatter?: boolean;
   forkedFrom: string | null;
   version: VersionDetail;
   groups: { slug: string; name: string }[];

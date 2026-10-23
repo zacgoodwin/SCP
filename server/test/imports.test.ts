@@ -3048,3 +3048,411 @@ test("0rdh: GitHub, silent-failure-hunter's plugin folder (a YAML error) is aske
   assert.equal(again.status, 201, again.text);
   assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['clean', 'unchanged'], ['silent-failure-hunter', 'version']]);
 });
+
+type Supplied = Omit<Out, 'version'> & { suppliedFrontmatter: { name?: string; description: string } | null; upstreamFrontmatter: boolean; latestSeq: number; version: { frontmatter: Record<string, unknown>; lint: { level: string }[] } };
+/** The frontmatter block a file opens with ('' when none). */
+const blockOf = (text: string) => (text.startsWith('---\n') ? text.slice(0, text.indexOf('\n---\n', 3) + 5) : '');
+const HOSTILE = 'Use when: reviewing code # not a comment\nsecond line: "quoted"';
+
+test('jcfm: a description becomes the frontmatter of a file with none and is stored; a file with its own keeps it and stores nothing; one description on many items is a 400', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'my-skill.zip', { 'my-skill/SKILL.md': '# My skill\n\nDoes things.\n' }, { description: 'Does things: well.' });
+  assert.equal(r.status, 201, r.text);
+  const it = r.json.items[0] as Supplied;
+  assert.equal(it.name, 'my-skill');
+  assert.deepEqual(it.suppliedFrontmatter, { name: 'my-skill', description: 'Does things: well.' });
+  assert.equal(it.upstreamFrontmatter, false);
+  assert.equal(await fileText(t, h, it.id, 'SKILL.md'), '---\nname: my-skill\ndescription: "Does things: well."\n---\n# My skill\n\nDoes things.\n');
+  assert.equal(it.version.lint.filter((l) => l.level === 'error').length, 0);
+
+  const own = await pack(t, h, 'own.zip', { 'own/SKILL.md': skill('own') }, { description: 'ignored' });
+  assert.equal(own.status, 201, own.text);
+  assert.equal((own.json.items[0] as Supplied).suppliedFrontmatter, null);
+  assert.equal(await fileText(t, h, own.json.items[0].id, 'SKILL.md'), skill('own'));
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items WHERE supplied_frontmatter IS NOT NULL'), 1);
+
+  const before = count(t, 'SELECT COUNT(*) AS n FROM items');
+  const many = await pack(t, h, 'many.zip', { 'skills/a/SKILL.md': skill('a'), 'skills/b/SKILL.md': skill('b') }, { description: 'one for all' });
+  assert.equal(many.status, 400, many.text);
+  assert.match(many.json.error.message, /exactly one item \(found 2\)/);
+  gh.repos['acme/two'] = { default_branch: 'main', refs: { main: sha2('ce') }, trees: { [sha2('ce')]: { 'skills/a/SKILL.md': skill('a'), 'skills/b/SKILL.md': skill('b') } } };
+  const manyGh = await github(t, h, { repo: 'acme/two', description: 'one for all' });
+  assert.equal(manyGh.status, 400, manyGh.text);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), before, 'nothing written');
+  // Over lint's 1024-char cap is refused; blank is no description at all.
+  assert.equal((await pack(t, h, 'long.zip', { 'long/SKILL.md': '# L\n' }, { description: 'x'.repeat(1025) })).status, 400);
+  const blank = await github(t, h, { repo: 'acme/two', path: 'skills/a', description: '   ' });
+  assert.equal(blank.status, 201, blank.text);
+  assert.equal((blank.json.items[0] as Supplied).suppliedFrontmatter, null);
+});
+
+test('jcfm: source/update and re-import re-apply the stored frontmatter byte for byte; upstream adding its own wins and the item says so; YAML-special values round-trip', async () => {
+  const body = (n: string) => `You help with step ${n}.\n`;
+  const own = '---\nname: helper\ndescription: Upstream now describes it.\n---\nYou help, upstream.\n';
+  gh.repos['acme/nofm'] = {
+    default_branch: 'main',
+    refs: { main: sha2('ca') },
+    trees: { [sha2('ca')]: { 'agents/helper.md': body('1') }, [sha2('cb')]: { 'agents/helper.md': body('2') }, [sha2('c9')]: { 'agents/helper.md': body('3') }, [sha2('cd')]: { 'agents/helper.md': own } },
+  };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/nofm', path: 'agents/helper.md', kind: 'agent', name: 'helper', description: HOSTILE });
+  assert.equal(r.status, 201, r.text);
+  const it = r.json.items[0] as Supplied;
+  assert.deepEqual(it.suppliedFrontmatter, { name: 'helper', description: HOSTILE });
+  assert.deepEqual(it.version.frontmatter, { name: 'helper', description: HOSTILE }, 'the special characters parse back exactly');
+  const first = await fileText(t, h, it.id, 'helper.md');
+  const block = blockOf(first);
+  assert.ok(block && first === block + body('1'), first);
+
+  gh.repos['acme/nofm'].refs.main = sha2('cb');
+  const up = await t.req('POST', `${API}/items/${it.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.latestSeq, 2);
+  assert.equal(await fileText(t, h, it.id, 'helper.md'), block + body('2'), 'the same block, byte for byte');
+
+  // A re-import without a description takes the stored fields too: nothing to ask about, the same block.
+  gh.repos['acme/nofm'].refs.main = sha2('c9');
+  const again = await github(t, h, { repo: 'acme/nofm', path: 'agents/helper.md', kind: 'agent', name: 'helper' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual([again.json.items[0].id, again.json.items[0].op], [it.id, 'version']);
+  assert.equal(await fileText(t, h, it.id, 'helper.md'), block + body('3'));
+
+  gh.repos['acme/nofm'].refs.main = sha2('cd');
+  const ownUp = await t.req('POST', `${API}/items/${it.id}/source/update`, { headers: h });
+  assert.equal(ownUp.status, 200, ownUp.text);
+  assert.equal(await fileText(t, h, it.id, 'helper.md'), own, "upstream's frontmatter, untouched");
+  assert.equal((ownUp.json.item as Supplied).upstreamFrontmatter, true);
+  assert.deepEqual((ownUp.json.item as Supplied).suppliedFrontmatter, { name: 'helper', description: HOSTILE }, 'kept as the fallback');
+  // Upstream dropping it again brings the fallback back.
+  gh.repos['acme/nofm'].refs.main = sha2('cb');
+  const back = await t.req('POST', `${API}/items/${it.id}/source/update`, { headers: h });
+  assert.equal(back.status, 200, back.text);
+  assert.equal((back.json.item as Supplied).upstreamFrontmatter, false);
+  assert.equal(await fileText(t, h, it.id, 'helper.md'), block + body('2'));
+});
+
+test('jcfm: a re-import at the same commit that brings a description writes the block and stores it; without one it stays unchanged', async () => {
+  const guide = '# Stax agent guide\n\nUse `st`.\n';
+  gh.repos['acme/samec'] = { default_branch: 'main', refs: { main: sha2('e4') }, trees: { [sha2('e4')]: { 'skills.md': guide } } };
+  const { t, h } = setup();
+  const body = { repo: 'acme/samec', path: 'skills.md', kind: 'skill', frontmatterErrors: 'import' };
+  const r = await github(t, h, body);
+  assert.equal(r.status, 201, r.text);
+  const it = r.json.items[0] as Supplied;
+  assert.deepEqual([it.op, it.suppliedFrontmatter], ['create', null]);
+
+  const again = await github(t, h, { ...body, description: 'Stax.' });
+  assert.equal(again.status, 201, again.text);
+  const v = again.json.items[0] as Supplied;
+  assert.deepEqual([v.id, v.op, v.suppliedFrontmatter, v.latestSeq], [it.id, 'version', { name: it.name, description: 'Stax.' }, 2]);
+  assert.equal(await fileText(t, h, it.id, 'SKILL.md'), `---\nname: ${it.name}\ndescription: Stax.\n---\n${guide}`);
+  // The same description again, or none (the stored one): nothing new.
+  for (const b of [{ ...body, description: 'Stax.' }, body]) {
+    const same = await github(t, h, b);
+    assert.equal(same.status, 201, same.text);
+    assert.deepEqual([same.json.items[0].op, same.json.items[0].latestSeq], ['unchanged', 2]);
+  }
+});
+
+test('jcfm: the item page edits the supplied description: a new version with the new block; only the fallback while upstream has its own; a hand-edited block is a 409', async () => {
+  gh.repos['acme/edit'] = {
+    default_branch: 'main',
+    refs: { main: sha2('cf') },
+    trees: { [sha2('cf')]: { 'p.md': 'Body.\n', 'q.md': '# Q\n' }, [sha2('ea')]: { 'p.md': '---\nname: p\ndescription: Upstream.\n---\nBody.\n' } },
+  };
+  const { t, u, h } = setup();
+  const r = await github(t, h, { repo: 'acme/edit', path: 'p.md', kind: 'agent', name: 'p', description: 'Old.' });
+  assert.equal(r.status, 201, r.text);
+  const id = r.json.items[0].id;
+  const edit = (description: string, headers = h) => t.req('PUT', `${API}/items/${id}/source/frontmatter`, { headers, json: { description } });
+  const e1 = await edit('New: with a colon.');
+  assert.equal(e1.status, 200, e1.text);
+  assert.equal(e1.json.item.latestSeq, 2);
+  assert.deepEqual(e1.json.item.suppliedFrontmatter, { name: 'p', description: 'New: with a colon.' });
+  assert.equal(await fileText(t, h, id, 'p.md'), '---\nname: p\ndescription: "New: with a colon."\n---\nBody.\n');
+  assert.equal((await edit('  ')).status, 400);
+  // Another account cannot edit it (404, it cannot read it); a read-only key cannot either.
+  const other = t.createUser();
+  assert.equal((await edit('x', t.key(other).headers)).status, 404);
+  assert.equal((await edit('x', t.key(u, { scopes: ['read'] }).headers)).status, 403);
+  // Upstream ships its own: the edit changes only the stored fallback.
+  gh.repos['acme/edit'].refs.main = sha2('ea');
+  assert.equal((await t.req('POST', `${API}/items/${id}/source/update`, { headers: h })).status, 200);
+  const e2 = await edit('Fallback.');
+  assert.equal(e2.status, 200, e2.text);
+  assert.equal(e2.json.item.latestSeq, 3, 'no new version');
+  assert.equal(e2.json.item.suppliedFrontmatter.description, 'Fallback.');
+  // A block edited by hand is not overwritten.
+  gh.repos['acme/edit'].refs.main = sha2('cf');
+  assert.equal((await t.req('POST', `${API}/items/${id}/source/update`, { headers: h })).status, 200);
+  assert.equal(await fileText(t, h, id, 'p.md'), '---\nname: p\ndescription: Fallback.\n---\nBody.\n');
+  assert.equal((await t.req('POST', `${API}/items/${id}/versions`, { headers: h, json: { content: '---\nname: p\ndescription: Mine.\n---\nBody.\n' } })).status, 201);
+  const e3 = await edit('Again.');
+  assert.equal(e3.status, 409, e3.text);
+  assert.equal(e3.json.error.code, 'frontmatter_edited');
+  // An item SCP supplied nothing to has nothing to edit.
+  const plain = await github(t, h, { repo: 'acme/edit', path: 'q.md' });
+  assert.equal((await t.req('PUT', `${API}/items/${plain.json.items[0].id}/source/frontmatter`, { headers: h, json: { description: 'x' } })).status, 404);
+});
+
+test('jcfm: the stored supplied fields always describe the block the latest version carries, across edits and same-commit re-imports', async () => {
+  // f6 moves HEAD with p.md byte-identical (a commit elsewhere in the repository).
+  gh.repos['acme/rv'] = { default_branch: 'main', refs: { main: sha2('f5') }, trees: { [sha2('f5')]: { 'p.md': 'Body.\n' }, [sha2('f6')]: { 'p.md': 'Body.\n', 'x.md': '# X\n' } } };
+  const { t, h } = setup();
+  const body = { repo: 'acme/rv', path: 'p.md', kind: 'agent', name: 'p' };
+  const r = await github(t, h, { ...body, description: 'Old.' });
+  assert.equal(r.status, 201, r.text);
+  const id = r.json.items[0].id;
+  const holds = async (description: string, text = 'Body.\n') => {
+    const item = (await t.req('GET', `${API}/items/${id}`, { headers: h })).json.item as Supplied;
+    assert.deepEqual([item.suppliedFrontmatter, item.upstreamFrontmatter], [{ name: 'p', description }, false]);
+    assert.equal(await fileText(t, h, id, 'p.md'), `---\nname: p\ndescription: ${description}\n---\n${text}`);
+  };
+  const edit = (description: string) => t.req('PUT', `${API}/items/${id}/source/frontmatter`, { headers: h, json: { description } });
+  await holds('Old.');
+  assert.equal((await edit('New.')).status, 200);
+  await holds('New.');
+  // The same commit again with the pre-edit description: it is what the user asked for now, so it lands.
+  const old = await github(t, h, { ...body, description: 'Old.' });
+  assert.equal(old.status, 201, old.text);
+  assert.equal(old.json.items[0].op, 'version');
+  await holds('Old.');
+  const e = await edit('Newer.');
+  assert.equal(e.status, 200, e.text);
+  await holds('Newer.');
+  // Without a description it is the stored one: nothing new, at this commit or one that left p.md alone.
+  assert.equal((await github(t, h, body)).json.items[0].op, 'unchanged');
+  gh.repos['acme/rv'].refs.main = sha2('f6');
+  assert.equal((await t.req('POST', `${API}/items/${id}/source/update`, { headers: h })).status, 409);
+  await holds('Newer.');
+
+  // A local edit made before an edit of the description survives a commit that left the file alone.
+  gh.repos['acme/rv2'] = { default_branch: 'main', refs: { main: sha2('f7') }, trees: { [sha2('f7')]: { 'p.md': 'Body.\n' }, [sha2('f8')]: { 'p.md': 'Body.\n', 'x.md': '# X\n' } } };
+  const { t: t2, h: h2 } = setup();
+  const r2 = await github(t2, h2, { ...body, repo: 'acme/rv2', description: 'Old.' });
+  const id2 = r2.json.items[0].id;
+  assert.equal((await t2.req('POST', `${API}/items/${id2}/versions`, { headers: h2, json: { content: '---\nname: p\ndescription: Old.\n---\nMine.\n' } })).status, 201);
+  assert.equal((await t2.req('PUT', `${API}/items/${id2}/source/frontmatter`, { headers: h2, json: { description: 'New.' } })).status, 200);
+  gh.repos['acme/rv2'].refs.main = sha2('f8');
+  const up = await t2.req('POST', `${API}/items/${id2}/source/update`, { headers: h2 });
+  assert.equal(up.status, 409, up.text);
+  assert.equal(await fileText(t2, h2, id2, 'p.md'), '---\nname: p\ndescription: New.\n---\nMine.\n');
+});
+
+test('jcfm: a same-commit re-import whose only news is the description swaps the block on a local edit, never the upstream body over it', async () => {
+  // e6 moves HEAD with p.md byte-identical (a commit elsewhere in the repository).
+  gh.repos['acme/sc'] = { default_branch: 'main', refs: { main: sha2('e5') }, trees: { [sha2('e5')]: { 'p.md': 'Body.\n' }, [sha2('e6')]: { 'p.md': 'Body.\n', 'x.md': '# X\n' } } };
+  const body = { repo: 'acme/sc', path: 'p.md', kind: 'agent', name: 'p' };
+  const holds = async (t: TestCtx, h: H, id: string, description: string, text: string) => {
+    const item = (await t.req('GET', `${API}/items/${id}`, { headers: h })).json.item as Supplied;
+    assert.deepEqual([item.suppliedFrontmatter, item.upstreamFrontmatter], [{ name: 'p', description }, false]);
+    assert.equal(await fileText(t, h, id, 'p.md'), `---\nname: p\ndescription: ${description}\n---\n${text}`);
+  };
+  // With a supplied block: the local body stays, the block becomes the new one.
+  const { t, h } = setup();
+  const r = await github(t, h, { ...body, description: 'Old.' });
+  assert.equal(r.status, 201, r.text);
+  const id = r.json.items[0].id;
+  assert.equal((await t.req('POST', `${API}/items/${id}/versions`, { headers: h, json: { content: '---\nname: p\ndescription: Old.\n---\nMine.\n' } })).status, 201);
+  const again = await github(t, h, { ...body, description: 'New.' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual([again.json.items[0].id, again.json.items[0].op, again.json.items[0].latestSeq], [id, 'version', 3]);
+  await holds(t, h, id, 'New.', 'Mine.\n');
+  // What the source last wrote took the new block too: a commit that left p.md alone is still no change.
+  gh.repos['acme/sc'].refs.main = sha2('e6');
+  assert.equal((await github(t, h, body)).json.items[0].op, 'unchanged');
+  await holds(t, h, id, 'New.', 'Mine.\n');
+
+  // Imported without one, edited locally, then re-imported with one: the block goes in front of the local body.
+  // A command, since a skill or agent without frontmatter cannot be edited locally (lint).
+  gh.repos['acme/sc'].refs.main = sha2('e5');
+  const { t: t2, h: h2 } = setup();
+  const cmd = { ...body, kind: 'command' };
+  const r2 = await github(t2, h2, cmd);
+  assert.equal(r2.status, 201, r2.text);
+  const id2 = r2.json.items[0].id;
+  assert.equal((await t2.req('POST', `${API}/items/${id2}/versions`, { headers: h2, json: { content: 'Mine.\n' } })).status, 201);
+  const add = await github(t2, h2, { ...cmd, description: 'New.' });
+  assert.equal(add.status, 201, add.text);
+  assert.deepEqual([add.json.items[0].op, add.json.items[0].latestSeq, add.json.items[0].suppliedFrontmatter], ['version', 3, { description: 'New.' }]);
+  assert.equal(await fileText(t2, h2, id2, 'p.md'), '---\ndescription: New.\n---\nMine.\n');
+  gh.repos['acme/sc'].refs.main = sha2('e6');
+  assert.equal((await github(t2, h2, cmd)).json.items[0].op, 'unchanged');
+  assert.equal(await fileText(t2, h2, id2, 'p.md'), '---\ndescription: New.\n---\nMine.\n');
+});
+
+test('jcfm: a same-commit re-import with a new description and no local edit writes the upstream body with the new block', async () => {
+  gh.repos['acme/sc2'] = { default_branch: 'main', refs: { main: sha2('e8') }, trees: { [sha2('e8')]: { 'p.md': 'Body.\n' } } };
+  const { t, h } = setup();
+  const body = { repo: 'acme/sc2', path: 'p.md', kind: 'agent', name: 'p' };
+  const r = await github(t, h, { ...body, description: 'Old.' });
+  assert.equal(r.status, 201, r.text);
+  const id = r.json.items[0].id;
+  const again = await github(t, h, { ...body, description: 'New.' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual([again.json.items[0].op, again.json.items[0].latestSeq, again.json.items[0].suppliedFrontmatter], ['version', 2, { name: 'p', description: 'New.' }]);
+  assert.equal(await fileText(t, h, id, 'p.md'), '---\nname: p\ndescription: New.\n---\nBody.\n');
+  // The same again is nothing new.
+  assert.equal((await github(t, h, { ...body, description: 'New.' })).json.items[0].op, 'unchanged');
+});
+
+test('jcfm: a new commit that left the file alone and a new description swap the block on a local edit, never the upstream body over it', async () => {
+  // n2 and n3 move HEAD with p.md byte-identical (commits elsewhere); n4 changes it.
+  gh.repos['acme/nc'] = {
+    default_branch: 'main',
+    refs: { main: sha2('a1') },
+    trees: { [sha2('a1')]: { 'p.md': 'Body.\n' }, [sha2('a2')]: { 'p.md': 'Body.\n', 'x.md': '# X\n' }, [sha2('a3')]: { 'p.md': 'Body.\n', 'y.md': '# Y\n' }, [sha2('a4')]: { 'p.md': 'Body 2.\n' } },
+  };
+  const { t, h } = setup();
+  const body = { repo: 'acme/nc', path: 'p.md', kind: 'agent', name: 'p' };
+  const r = await github(t, h, { ...body, description: 'Old.' });
+  assert.equal(r.status, 201, r.text);
+  const id = r.json.items[0].id;
+  assert.equal((await t.req('POST', `${API}/items/${id}/versions`, { headers: h, json: { content: '---\nname: p\ndescription: Old.\n---\nMine.\n' } })).status, 201);
+  gh.repos['acme/nc'].refs.main = sha2('a2');
+  const again = await github(t, h, { ...body, description: 'New.' });
+  assert.equal(again.status, 201, again.text);
+  const v = again.json.items[0] as Supplied;
+  assert.deepEqual([v.op, v.latestSeq, v.suppliedFrontmatter, again.json.items[0].source.commit], ['version', 3, { name: 'p', description: 'New.' }, sha2('a2')]);
+  assert.equal(await fileText(t, h, id, 'p.md'), '---\nname: p\ndescription: New.\n---\nMine.\n', 'the local body stays');
+  // What the source last wrote took the new block: another commit that leaves p.md alone is still no change.
+  gh.repos['acme/nc'].refs.main = sha2('a3');
+  const same = await github(t, h, body);
+  assert.deepEqual([same.json.items[0].op, same.json.items[0].latestSeq, same.json.items[0].source.commit], ['unchanged', 3, sha2('a3')]);
+  // An upstream change is a new version, with the new block.
+  gh.repos['acme/nc'].refs.main = sha2('a4');
+  const up = await t.req('POST', `${API}/items/${id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(await fileText(t, h, id, 'p.md'), '---\nname: p\ndescription: New.\n---\nBody 2.\n');
+
+  // Without a local edit: the upstream body with the new block.
+  gh.repos['acme/nc'].refs.main = sha2('a1');
+  const { t: t2, h: h2 } = setup();
+  const r2 = await github(t2, h2, { ...body, description: 'Old.' });
+  gh.repos['acme/nc'].refs.main = sha2('a2');
+  const plain = await github(t2, h2, { ...body, description: 'New.' });
+  assert.equal(plain.status, 201, plain.text);
+  assert.deepEqual([plain.json.items[0].op, plain.json.items[0].latestSeq], ['version', 2]);
+  assert.equal(await fileText(t2, h2, r2.json.items[0].id, 'p.md'), '---\nname: p\ndescription: New.\n---\nBody.\n');
+});
+
+test('jcfm: a description for a unit whose local version has frontmatter written by hand skips the unit, at the same commit or one that left the file alone, as the item page edit refuses it', async () => {
+  gh.repos['acme/hand'] = { default_branch: 'main', refs: { main: sha2('b1') }, trees: { [sha2('b1')]: { 'p.md': 'Body.\n' }, [sha2('b2')]: { 'p.md': 'Body.\n', 'x.md': '# X\n' } } };
+  const { t, h } = setup();
+  const cmd = { repo: 'acme/hand', path: 'p.md', kind: 'command', name: 'p' };
+  const r = await github(t, h, cmd);
+  assert.equal(r.status, 201, r.text);
+  const id = r.json.items[0].id;
+  const mine = '---\ndescription: Mine.\n---\nMine.\n';
+  assert.equal((await t.req('POST', `${API}/items/${id}/versions`, { headers: h, json: { content: mine } })).status, 201);
+  for (const ref of ['b1', 'b2']) {
+    gh.repos['acme/hand'].refs.main = sha2(ref);
+    const add = await github(t, h, { ...cmd, description: 'New.' });
+    assert.equal(add.status, 422, add.text);
+    assert.equal(add.json.error.code, 'nothing_imported');
+    assert.match(add.json.error.details[0].reason, /frontmatter was written by hand/);
+    assert.equal(await fileText(t, h, id, 'p.md'), mine, 'the hand edit stays');
+    const item = (await t.req('GET', `${API}/items/${id}`, { headers: h })).json.item as Supplied;
+    assert.deepEqual([item.latestSeq, item.suppliedFrontmatter, (item as unknown as { source: { commit: string } }).source.commit], [2, null, sha2('b1')]);
+  }
+  // Without a description it is no update, as before.
+  assert.equal((await github(t, h, cmd)).json.items[0].op, 'unchanged');
+});
+
+test('mas4: upstream adding frontmatter with a name of its own wins for everything but the name, which stays the item name (its install folder)', async () => {
+  const guide = '# Stax agent guide\n\nUse `st`.\n';
+  const ownFm = (n: string) => `---\nname: stax-guide\ndescription: Upstream describes stax.\n---\n# Stax agent guide (rev ${n})\n`;
+  gh.repos['acme/stax'] = {
+    default_branch: 'main',
+    refs: { main: sha2('c1') },
+    trees: { [sha2('c1')]: { 'skills.md': guide }, [sha2('c2')]: { 'skills.md': ownFm('2') }, [sha2('c3')]: { 'skills.md': ownFm('3') } },
+  };
+  const { t, h } = setup();
+  const body = { repo: 'acme/stax', path: 'skills.md', kind: 'skill' };
+  const r = await github(t, h, { ...body, description: 'Stacked branches.' });
+  assert.equal(r.status, 201, r.text);
+  const it = r.json.items[0] as Supplied;
+  assert.equal(it.name, 'stax');
+  gh.repos['acme/stax'].refs.main = sha2('c2');
+  const up = await t.req('POST', `${API}/items/${it.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  const item = up.json.item as Supplied;
+  assert.deepEqual([item.latestSeq, item.upstreamFrontmatter, up.json.item.description], [2, true, 'Upstream describes stax.']);
+  assert.equal(await fileText(t, h, it.id, 'SKILL.md'), ownFm('2').replace('name: stax-guide', 'name: stax'));
+  // A re-import at the next upstream change does the same.
+  gh.repos['acme/stax'].refs.main = sha2('c3');
+  const again = await github(t, h, body);
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual([again.json.items[0].id, again.json.items[0].op, again.json.items[0].name], [it.id, 'version', 'stax']);
+  assert.equal(await fileText(t, h, it.id, 'SKILL.md'), ownFm('3').replace('name: stax-guide', 'name: stax'));
+
+  // An agent the same way: its supplied name is its item name.
+  gh.repos['acme/agentfm'] = { default_branch: 'main', refs: { main: sha2('c4') }, trees: { [sha2('c4')]: { 'helper.md': 'You help.\n' }, [sha2('c5')]: { 'helper.md': '---\nname: upstream-helper\ndescription: Upstream.\n---\nYou help.\n' } } };
+  const a = await github(t, h, { repo: 'acme/agentfm', path: 'helper.md', kind: 'agent', name: 'helper', description: 'Helps.' });
+  assert.equal(a.status, 201, a.text);
+  gh.repos['acme/agentfm'].refs.main = sha2('c5');
+  const aUp = await github(t, h, { repo: 'acme/agentfm', path: 'helper.md', kind: 'agent', name: 'helper' });
+  assert.equal(aUp.status, 201, aUp.text);
+  assert.deepEqual([aUp.json.items[0].op, (aUp.json.items[0] as Supplied).upstreamFrontmatter], ['version', true]);
+  assert.equal(await fileText(t, h, a.json.items[0].id, 'helper.md'), '---\nname: helper\ndescription: Upstream.\n---\nYou help.\n');
+});
+
+test('jcfm: a description on a package import is a 400 before anything is written (a package has no one entry file)', async () => {
+  const { t, h } = setup();
+  const before = count(t, 'SELECT COUNT(*) AS n FROM items');
+  const p = await pack(t, h, 'manual.zip', { 'manual/a.md': 'a', 'manual/b.md': 'b' }, { kind: 'package', description: 'A manual.' });
+  assert.equal(p.status, 400, p.text);
+  assert.match(p.json.error.message, /skill, agent, command, prompt, instructions or design/);
+  const kit = { 'README.md': '# Kit\n', 'docs/a.md': '# A\n' };
+  const folder = await pack(t, h, 'kit.zip', kit, { folderKinds: JSON.stringify({ docs: 'package' }), description: 'Docs.' });
+  assert.equal(folder.status, 400, folder.text);
+  assert.match(folder.json.error.message, /a package has none/);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), before, 'nothing written');
+  // Without the description both import.
+  assert.equal((await pack(t, h, 'kit.zip', kit, { folderKinds: JSON.stringify({ docs: 'package' }) })).status, 201);
+});
+
+test('mas4: one GitHub .md file as a skill: named for the repository when the file name is generic, SCP supplies the frontmatter, source/update re-applies it, upstream frontmatter wins', async () => {
+  const guide = (n: string) => `# Stax agent guide\n\nUse \`st\` to stack branches (rev ${n}).\n`;
+  const ownFm = '---\nname: stax\ndescription: Upstream describes stax itself.\n---\n# Stax agent guide\n';
+  gh.repos['cesarferreira/stax'] = {
+    default_branch: 'main',
+    refs: { main: sha2('da') },
+    trees: { [sha2('da')]: { 'skills.md': guide('1'), 'docs/git-flow.md': '# Flow\n', 'src/main.rs': 'fn main() {}' }, [sha2('db')]: { 'skills.md': guide('2') }, [sha2('dc')]: { 'skills.md': ownFm } },
+  };
+  const { t, h } = setup();
+  const desc = 'Stacked branches with stax: create, submit, restack.';
+  // Without kind skill the file imports as today: a prompt, named by its heading.
+  const asPrompt = await github(t, h, { repo: 'cesarferreira/stax', path: 'skills.md' });
+  assert.equal(asPrompt.status, 201, asPrompt.text);
+  assert.deepEqual(names(asPrompt.json.items), ['prompt:stax-agent-guide']);
+  // Without a description the missing frontmatter is asked about (0rdh), nothing written.
+  const ask = await github(t, h, { repo: 'cesarferreira/stax', path: 'skills.md', kind: 'skill' });
+  assert.equal(ask.status, 409, ask.text);
+
+  const r = await github(t, h, { repo: 'cesarferreira/stax', path: 'skills.md', kind: 'skill', description: desc });
+  assert.equal(r.status, 201, r.text);
+  const it = r.json.items[0] as Supplied;
+  assert.deepEqual([it.kind, it.name, it.source.path], ['skill', 'stax', 'skills.md']);
+  assert.deepEqual(filePaths(r.json.items[0]), ['SKILL.md']);
+  assert.deepEqual(it.version.lint.filter((l) => l.level === 'error'), [], 'passes lint');
+  const first = await fileText(t, h, it.id, 'SKILL.md');
+  assert.equal(first, `---\nname: stax\ndescription: "${desc}"\n---\n${guide('1')}`);
+  // A file name that is not generic names the skill.
+  const flow = await github(t, h, { repo: 'cesarferreira/stax', path: 'docs/git-flow.md', kind: 'skill', description: 'Flow.' });
+  assert.equal(flow.status, 201, flow.text);
+  assert.deepEqual(names(flow.json.items), ['skill:git-flow']);
+
+  gh.repos['cesarferreira/stax'].refs.main = sha2('db');
+  const up = await t.req('POST', `${API}/items/${it.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.latestSeq, 2);
+  assert.equal(await fileText(t, h, it.id, 'SKILL.md'), blockOf(first) + guide('2'), 'new body, the same supplied frontmatter');
+
+  gh.repos['cesarferreira/stax'].refs.main = sha2('dc');
+  const own = await t.req('POST', `${API}/items/${it.id}/source/update`, { headers: h });
+  assert.equal(own.status, 200, own.text);
+  assert.equal(await fileText(t, h, it.id, 'SKILL.md'), ownFm);
+  assert.equal((own.json.item as Supplied).upstreamFrontmatter, true, 'the item shows the notice');
+  assert.equal(own.json.item.description, 'Upstream describes stax itself.');
+});

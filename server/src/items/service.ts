@@ -11,7 +11,7 @@ import { LIMITS, checkLimits, stripTopFolder, tooLarge, treeSha256, type TreeFil
 import { sweepBlobs } from './gc.ts';
 import { FRONTMATTER_ERRORS, lintVersion, type Lint } from './lint.ts';
 import { touchGroupsOfItem } from '../groups/touch.ts';
-import { FORMATS, KINDS, aKind, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
+import { FORMATS, KINDS, aKind, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type SuppliedFrontmatter, type VersionRow } from '../types.ts';
 
 export { isTextPath, mediaTypeFor };
 export type { Lint, TreeFile };
@@ -51,6 +51,8 @@ export interface CreateItemInput {
   sourceCarve?: string[];
   /** With source: the prefix the import put in front of the unit's bare name (ItemRow.source_prefix). */
   sourcePrefix?: string;
+  /** With source: the frontmatter the import put in front of the entry (jcfm), stored to re-apply on source writes. */
+  suppliedFrontmatter?: SuppliedFrontmatter;
 }
 
 export interface VersionInput {
@@ -112,6 +114,9 @@ export interface VersionDetail extends VersionSummary {
 export interface ItemDetail extends ItemSummary {
   createdAt: string;
   source: ItemSource | null;
+  /** jcfm: frontmatter SCP supplied on import; upstreamFrontmatter: upstream now ships its own, so these wait as a fallback. */
+  suppliedFrontmatter: SuppliedFrontmatter | null;
+  upstreamFrontmatter: boolean;
   forkedFrom: string | null;
   version: VersionDetail;
   groups: { slug: string; name: string }[];
@@ -240,6 +245,8 @@ export function itemDetail(db: Db, p: Principal, row: ItemRow, seq?: number): It
     ...itemSummary(db, row),
     createdAt: row.created_at,
     source: itemSource(row),
+    suppliedFrontmatter: suppliedOf(row),
+    upstreamFrontmatter: !!row.upstream_frontmatter,
     forkedFrom: row.forked_from,
     version: versionDetail(db, resolveVersion(db, row, seq)),
     groups: groups.map((r) => ({ slug: r.slug, name: r.name })),
@@ -250,6 +257,9 @@ export function itemDetail(db: Db, p: Principal, row: ItemRow, seq?: number): It
 /** Provenance of an imported item, null for items created in SCP. */
 export const itemSource = (row: ItemRow): ItemSource | null =>
   row.source_kind ? { kind: row.source_kind, repo: row.source_repo, ref: row.source_ref, path: row.source_path, commit: row.source_commit } : null;
+
+/** jcfm: the frontmatter fields an import supplied, null when it supplied none. */
+export const suppliedOf = (row: ItemRow): SuppliedFrontmatter | null => (row.supplied_frontmatter ? (JSON.parse(row.supplied_frontmatter) as SuppliedFrontmatter) : null);
 
 /** At most this many distinct words of a query are searched. */
 export const MAX_FTS_TERMS = 8;
@@ -397,6 +407,12 @@ function placeEntry(s: Shaped, kind: Kind, name: string, format: Format | null):
   return { ...s, entryPath, files: [{ ...s.files[0], path: entryPath }] };
 }
 
+/** The tree_sha256 addVersion would give `tree` as a version of item: shaped and placed the same way, not stored. */
+export function versionSha(item: ItemRow, tree: TreeFile[]): string {
+  const s = placeEntry(shapeTree(item.kind, item.format, tree, 'entry'), item.kind, item.name, item.format);
+  return treeSha256(s.files.map((f) => ({ path: f.path, mode: f.mode, sha256: sha256Hex(f.bytes) })));
+}
+
 /** waive: frontmatter errors (FRONTMATTER_ERRORS) are kept as waived warnings, for an import that accepted them (0rdh). */
 function lintShaped(kind: Kind, name: string, s: Shaped, waive = false): Lint[] {
   const lint = lintVersion(kind, name, s.files, s.fm, { path: s.entryPath, text: s.entryText });
@@ -466,7 +482,7 @@ function checkVisibility(v: unknown): void {
 // steered by whatever keys a row happens to carry.
 const INSERT_COLUMNS = {
   items: ['id', 'owner_id', 'kind', 'name', 'title', 'description', 'category', 'tags', 'visibility', 'format',
-    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'lint_waived', 'source_prefix', 'forked_from', 'created_at', 'updated_at'],
+    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'lint_waived', 'source_prefix', 'supplied_frontmatter', 'upstream_frontmatter', 'forked_from', 'created_at', 'updated_at'],
   item_versions: ['id', 'item_id', 'seq', 'entry_path', 'tree_sha256', 'frontmatter', 'lint', 'total_bytes', 'note',
     'created_by_user', 'created_by_key', 'created_by_client', 'created_at'],
 } as const;
@@ -602,6 +618,8 @@ export function createItemTx(
     source_carve: input.source && input.sourceCarve?.length ? JSON.stringify(input.sourceCarve) : null,
     lint_waived: waived ? 1 : 0,
     source_prefix: (input.source && input.sourcePrefix) || null,
+    supplied_frontmatter: input.source && input.suppliedFrontmatter ? JSON.stringify(input.suppliedFrontmatter) : null,
+    upstream_frontmatter: 0,
     forked_from: input.forkedFrom ?? null,
     created_at: ts,
     updated_at: ts,
