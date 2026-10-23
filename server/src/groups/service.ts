@@ -129,6 +129,15 @@ export function loadEditableGroup(db: Db, p: Principal, slug: string): GroupRow 
   return row;
 }
 
+/** A group p can edit, else 404 whether or not p can read it: an import's target (p2wf) says nothing about groups p cannot use. */
+export function loadEditableGroupOr404(db: Db, p: Principal, slug: string): GroupRow {
+  const row = loadReadableGroup(db, p, slug);
+  if (!canEditGroup(p, row)) throw notFound('group');
+  return row;
+}
+
+export const isMember = (db: Db, groupId: string, itemId: string) => !!db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND item_id = ?').get(groupId, itemId);
+
 /**
  * One page of the groups p can read, the caller's own first. Paged in SQL and summarized per page:
  * any account can create public groups, so "every readable group" is attacker-sized.

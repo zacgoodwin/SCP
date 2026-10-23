@@ -115,7 +115,7 @@ export interface ItemDetail extends ItemSummary {
   canEdit: boolean;
 }
 
-const SINGLE_FILE = new Set<Kind>(['agent', 'command', 'prompt', 'instructions', 'artifact']);
+export const SINGLE_FILE = new Set<Kind>(['agent', 'command', 'prompt', 'instructions', 'artifact']);
 const ARTIFACT_ENTRY: Record<Format, string> = {
   html: 'index.html',
   markdown: 'index.md',

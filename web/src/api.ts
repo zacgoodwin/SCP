@@ -250,6 +250,8 @@ export class ApiError extends Error {
   status: number;
   code: string;
   details?: unknown;
+  /** The response's whole error object, for fields beside details (an import's skippedFolders). */
+  raw?: Record<string, unknown>;
   constructor(status: number, code: string, message: string, details?: unknown) {
     super(message);
     this.status = status;
@@ -261,7 +263,7 @@ export class ApiError extends Error {
 async function toError(res: Response): Promise<ApiError> {
   try {
     const body = (await res.json()) as { error?: { code?: string; message?: string; details?: unknown } };
-    if (body.error) return new ApiError(res.status, body.error.code ?? 'error', body.error.message ?? res.statusText, body.error.details);
+    if (body.error) return Object.assign(new ApiError(res.status, body.error.code ?? 'error', body.error.message ?? res.statusText, body.error.details), { raw: body.error });
   } catch {
     // non-JSON error body (proxy, server down): fall through
   }

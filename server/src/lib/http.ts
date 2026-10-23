@@ -16,6 +16,8 @@ export class HttpError extends Error {
   status: ContentfulStatusCode;
   code: string;
   details?: unknown;
+  /** More fields for the error body, beside details (an import's skippedFolders). */
+  extra?: Record<string, unknown>;
   constructor(status: ContentfulStatusCode, code: string, message: string, details?: unknown) {
     super(message);
     this.status = status;
@@ -31,7 +33,7 @@ export const conflict = (message: string, details?: unknown) => new HttpError(40
 
 export function errorHandler(err: Error, c: Context) {
   if (err instanceof HttpError) {
-    const body: { error: { code: string; message: string; details?: unknown } } = { error: { code: err.code, message: err.message } };
+    const body: { error: { code: string; message: string; details?: unknown } } = { error: { ...err.extra, code: err.code, message: err.message } };
     if (err.details !== undefined) body.error.details = err.details;
     // A 503 that names when to retry (imports/github.ts withZipballSlot) says so in the header too.
     const retryAfter = (err.details as { retryAfter?: unknown } | undefined)?.retryAfter;

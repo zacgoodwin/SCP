@@ -5,6 +5,7 @@ import * as nested from '../api-groups.ts';
 import { useAuth, useUser } from '../auth.tsx';
 import { CopyBlock } from '../components/CopyBlock.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
+import { ImportDialog } from '../components/ImportDialog.tsx';
 import { KindBadges } from '../components/ItemCard.tsx';
 import { Modal } from '../components/Modal.tsx';
 import { Tabs } from '../components/Tabs.tsx';
@@ -48,6 +49,7 @@ function GroupView({ slug }: { slug: string }) {
   const [manifest, setManifest] = useState<api.Manifest | null>(null);
   const [manifestError, setManifestError] = useState<unknown>(null);
   const [editOpen, setEditOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   // The manifest's install paths and conflicts depend on the bundle target picked in ConnectSection.
   const [target, setTarget] = useState<api.BundleTarget>('claude-code');
 
@@ -134,9 +136,14 @@ function GroupView({ slug }: { slug: string }) {
         </div>
         <div className="page-actions">
           {group.canEdit && (
-            <button type="button" className="btn" onClick={() => setEditOpen(true)}>
-              Edit details
-            </button>
+            <>
+              <button type="button" className="btn" onClick={() => setEditOpen(true)}>
+                Edit details
+              </button>
+              <button type="button" className="btn" onClick={() => setImportOpen(true)}>
+                Import into this group
+              </button>
+            </>
           )}
           <a className="btn btn-primary" href="#connect">
             Connect
@@ -179,6 +186,14 @@ function GroupView({ slug }: { slug: string }) {
           }}
         />
       </Modal>
+      {group.canEdit && (
+        <ImportDialog
+          open={importOpen}
+          intoGroup={group.slug}
+          onClose={() => setImportOpen(false)}
+          onImported={() => api.getGroup(slug).then((r) => onChange(r.group), () => {})}
+        />
+      )}
     </div>
   );
 }

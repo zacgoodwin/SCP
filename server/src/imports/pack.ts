@@ -1,15 +1,16 @@
 import { importLimit } from '../admin/settings.ts';
 import { requireScope } from '../auth/middleware.ts';
 import { tx, type Db } from '../db.ts';
-import { addMemberTx, createGroup } from '../groups/service.ts';
-import { addVersion, createItemTx, getItemRow, listFiles, resolveVersion, slugify, type Lint } from '../items/service.ts';
+import { canEditGroup } from '../access.ts';
+import { addMemberTx, createGroup, getGroupRow, isMember } from '../groups/service.ts';
+import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, resolveVersion, slugify, type Lint } from '../items/service.ts';
 import { parseFrontmatter } from '../lib/frontmatter.ts';
-import { HttpError, MB, badRequest } from '../lib/http.ts';
+import { HttpError, MB, badRequest, notFound } from '../lib/http.ts';
 import { isJunkPath, normalizePath } from '../lib/paths.ts';
 import { stripTopFolder, type TreeFile } from '../lib/tree.ts';
 import { PACK_LIMITS, safeUnzip, type ZipLimits, type ZipLink } from '../lib/zip.ts';
 import { MARKETPLACE_JSON, PLUGIN_JSON, isObject, marketplaceIgnored, parseManifest, pluginMeta, shownValue } from './manifest.ts';
-import type { Ctx, GroupRow, ItemRow, ItemSource, Kind, Principal } from '../types.ts';
+import { aKind, type Ctx, type GroupRow, type ItemRow, type ItemSource, type Kind, type Principal } from '../types.ts';
 
 export const ARTIFACT_FROM_TREE = 'an artifact imports from a single file, not from a repository or pack';
 
@@ -38,10 +39,25 @@ export interface UnitResult {
   op: 'create' | 'version' | 'unchanged';
 }
 
+/** A folder whose loose .md files detection passed over (mvfp): the UI offers to import them as a kind (`folderKinds`). '' is the root. */
+export interface SkippedFolder {
+  path: string;
+  count: number;
+}
+
+/** What `folderKinds` may map a folder to: each .md one item of that kind, or the folder one package. */
+export const FOLDER_KINDS = ['agent', 'command', 'prompt', 'instructions', 'design', 'package'] as const;
+export type FolderKind = (typeof FOLDER_KINDS)[number];
+
 export interface ImportOutcome {
   group: GroupRow | null;
+  /** The group was created by this import, not an existing one it added to (p2wf). */
+  groupCreated: boolean;
+  /** Members this import added to the group. */
+  added: number;
   results: UnitResult[];
   skipped: Skipped[];
+  skippedFolders: SkippedFolder[];
 }
 
 export interface ImportOpts {
@@ -59,10 +75,17 @@ export interface ImportOpts {
   skipped?: Skipped[];
   note: string;
   visibility?: 'private' | 'public';
-  /** Treat the whole tree as one item of this kind (no detection). */
+  /**
+   * No detection: the whole tree is one item of this kind, or for a single-file kind (agent, command,
+   * prompt, instructions) each .md in it is one item of that kind (jwz6).
+   */
   kind?: Kind;
   name?: string;
   group?: string;
+  /** An existing group (resolved editable by the route) every imported item joins (p2wf). Exclusive with `group`. */
+  intoGroup?: GroupRow;
+  /** Folders whose loose .md files import as a kind instead of being skipped (mvfp). Keys are validated tree paths, '' the root. */
+  folderKinds?: Record<string, FolderKind>;
   /** The request's own group name: it wins over the plugin manifest's (pluginMeta). */
   groupName?: string;
   /** The group's name when neither the request nor the manifest names it (default: rootName). */
@@ -263,6 +286,34 @@ function mdKind(file: string, text: string): { kind: Kind; path: string } {
 }
 
 /**
+ * One .md as an item of a kind the user chose (jwz6 `kind`, mvfp `folderKinds`): commands and prompts
+ * are named by file, like FILE_DIRS; a design's entry is DESIGN.md.
+ */
+function chosenUnit(f: TreeFile, kind: Kind): Unit {
+  const file = baseOf(f.path);
+  const name = kind === 'command' || kind === 'prompt' ? slugify(stem(file)) || undefined : undefined;
+  return { path: f.path, kind, tree: [{ ...f, path: kind === 'design' ? 'DESIGN.md' : file }], name, fallbackName: stem(file) };
+}
+
+/**
+ * jwz6: `kind` of a single-file kind on a folder: each .md directly in it (README-style docs never) is
+ * one item of that kind; subfolders' files are skipped, as their names could collide. A folder of one
+ * .md stays the one item named after the folder, source path the folder, as before jwz6, so
+ * re-importing an item made then versions it.
+ */
+function fileUnits(tree: TreeFile[], kind: Kind, rootName: string, skipped: Skipped[]): Unit[] {
+  const mds: TreeFile[] = [];
+  for (const f of tree) {
+    if (!isMd(f.path)) skipped.push({ path: f.path, reason: `not a .md file: ${aKind(kind)} is one .md` });
+    else if (dirOf(f.path)) skipped.push({ path: f.path, reason: `in a subfolder: only the folder's own .md files are each ${aKind(kind)}` });
+    else if (REPO_DOCS.test(f.path)) skipped.push({ path: f.path, reason: NOT_AN_ITEM });
+    else mds.push(f);
+  }
+  if (mds.length === 1) return [{ path: '', kind, tree: mds, fallbackName: rootName, folderName: rootName }];
+  return mds.map((f) => chosenUnit(f, kind));
+}
+
+/**
  * Pack layout detection (docs/PLAN-v2.md D1), in order; a file belongs to the first unit that claims it.
  * Plugin (`.claude-plugin/plugin.json`) and `.claude/` layouts share the same folders. The plugin marker
  * makes its folder a plugin root (pluginRoots), whose layout folders are read like the repository
@@ -274,7 +325,11 @@ function mdKind(file: string, text: string): { kind: Kind; path: string } {
  * of CLAUDE.md or agents/*.md into items of their own. `pluginFolder` says the tree is a plugin root
  * whose SKILL.md a whole-repository import made one skill (updateTree): only the plugin passes carve.
  */
-export function detectUnits(tree: TreeFile[], rootName: string, opts: { layoutDir?: string; folderRoot?: boolean; includeRepoTooling?: boolean; pluginFolder?: boolean } = {}): { units: Unit[]; skipped: Skipped[] } {
+export function detectUnits(
+  tree: TreeFile[],
+  rootName: string,
+  opts: { layoutDir?: string; folderRoot?: boolean; includeRepoTooling?: boolean; pluginFolder?: boolean; folderKinds?: Record<string, FolderKind> } = {},
+): { units: Unit[]; skipped: Skipped[]; skippedFolders: SkippedFolder[] } {
   const units: Unit[] = [];
   const skipped: Skipped[] = [];
   /** Each claimed file's owner: the folder unit holding it, else the file itself (a file unit, a skip). */
@@ -282,7 +337,7 @@ export function detectUnits(tree: TreeFile[], rootName: string, opts: { layoutDi
   const free = () => tree.filter((f) => !claimed.has(f.path));
   const under = (f: TreeFile, dir: string) => (f.path.startsWith(dir + '/') ? f.path.slice(dir.length + 1).split('/') : null);
   const rootSkillMd = tree.find((f) => !f.path.includes('/') && isSkillMd(f.path));
-  if (opts.folderRoot && rootSkillMd) return { units: [{ path: '', kind: 'skill', tree: skillTree(tree), fallbackName: rootName, folderName: rootName, scope: 'tree' }], skipped };
+  if (opts.folderRoot && rootSkillMd) return { units: [{ path: '', kind: 'skill', tree: skillTree(tree), fallbackName: rootName, folderName: rootName, scope: 'tree' }], skipped, skippedFolders: [] };
   // The files under every folder (each ancestor), indexed once in tree order: a folder unit that
   // filtered the whole tree made detection O(folders x files), tens of seconds of blocked event loop
   // for a pack of 10,000 skill folders, before the item cap was even checked.
@@ -416,7 +471,7 @@ export function detectUnits(tree: TreeFile[], rootName: string, opts: { layoutDi
   // As in the whole repository, the plugin root's skill keeps everything else: nested skill folders, CLAUDE.md.
   if (opts.pluginFolder && rootSkillMd && !claimed.has(rootSkillMd.path)) {
     units.push({ path: '', kind: 'skill', tree: skillTree(free()), fallbackName: rootName, folderName: rootName });
-    return { units, skipped };
+    return { units, skipped, skippedFolders: [] };
   }
   const hinted = opts.layoutDir ? FILE_DIRS.find(([dir]) => baseOf(dir) === opts.layoutDir) : undefined;
   if (hinted) {
@@ -454,7 +509,19 @@ export function detectUnits(tree: TreeFile[], rootName: string, opts: { layoutDi
     for (const f of files) claimed.set(f.path, '');
     units.push({ path: '', kind: 'skill', tree: skillTree(files), fallbackName: rootName, folderName: rootName });
   }
+  // Folders the user mapped to a kind after an import offered them (mvfp): last, so only what every
+  // pass above left is taken. Their loose .md files (README-style docs never) become one item each,
+  // or the whole folder one package.
+  for (const [dir, kind] of Object.entries(opts.folderKinds ?? {})) {
+    const files = filesIn(dir).filter((f) => !claimed.has(f.path));
+    const loose = kind === 'package' ? files : files.filter((f) => dirOf(f.path) === dir && isMd(f.path) && !REPO_DOCS.test(baseOf(f.path)));
+    for (const f of loose) claimed.set(f.path, kind === 'package' ? dir : f.path);
+    if (!loose.length) skipped.push({ path: dir, reason: 'folderKinds: no unrecognised files in this folder; ignored' });
+    else if (kind === 'package') units.push({ path: dir, kind, tree: subtree(loose, dir), fallbackName: baseOf(dir) || rootName, scope: 'tree' });
+    else units.push(...loose.map((f) => chosenUnit(f, kind)));
+  }
   const rest = free();
+  const looseMd = new Map<string, number>();
   if (!units.length && rest.length && rest.every((f) => isMd(f.path))) {
     for (const f of rest) {
       if (REPO_DOCS.test(baseOf(f.path))) skipped.push({ path: f.path, reason: NOT_AN_ITEM });
@@ -494,12 +561,13 @@ export function detectUnits(tree: TreeFile[], rootName: string, opts: { layoutDi
               : `${parent}/ below the repository root is imported only inside a plugin (.claude-plugin/plugin.json)`
             : 'not inside a recognised layout folder';
         skipped.push({ path: f.path, reason });
+        looseMd.set(dirOf(f.path), (looseMd.get(dirOf(f.path)) ?? 0) + 1);
       }
     }
     for (const folder of folders) skipped.push({ path: folder, reason: 'no SKILL.md in this folder' });
     for (const [path, c] of components) skipped.push({ path, reason: `plugin ${c} is not supported by SCP; it was not imported` });
   }
-  return { units, skipped };
+  return { units, skipped, skippedFolders: [...looseMd].map(([path, count]) => ({ path, count })) };
 }
 
 const reasonOf = (e: HttpError) =>
@@ -544,6 +612,8 @@ export function updateTree(db: Db, item: ItemRow, tree: TreeFile[]): TreeFile[] 
   if (tree.length === 1 && !tree[0].path.includes('/')) {
     const { kind, path } = mdKind(tree[0].path, utf8.decode(tree[0].bytes));
     if (kind === item.kind) return [{ ...tree[0], path }];
+    // A loose .md imported as a design (mvfp folderKinds) holds it as DESIGN.md.
+    if (item.kind === 'design' && isMd(tree[0].path)) return [{ ...tree[0], path: 'DESIGN.md' }];
   }
   if (item.kind !== 'skill') return tree;
   const cut = new Set<string>(item.source_carve ? JSON.parse(item.source_carve) : []);
@@ -608,7 +678,7 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts): UnitResu
 }
 
 /**
- * Import every unit of a tree, plus the group when asked, in one transaction. A unit that fails
+ * Import every unit of a tree, plus the group when asked (created, or `intoGroup` added to), in one transaction. A unit that fails
  * (lint, name taken by an unrelated item, install-path conflict) is rolled back on its own and
  * reported in `skipped`; only the group slug being taken fails the whole import.
  */
@@ -619,11 +689,18 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   const skipped: Skipped[] = [...(opts.skipped ?? [])];
   // A tree has no format, which every artifact needs (checkFormat): the single-file import is the way in.
   if (opts.kind === 'artifact') throw badRequest(ARTIFACT_FROM_TREE);
-  if (opts.kind) units = [{ path: '', kind: opts.kind, tree, name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
+  let skippedFolders: SkippedFolder[] = [];
+  // A kind override makes the tree one item, except a single-file kind on a folder (jwz6): one item per .md.
+  if (opts.kind && (!SINGLE_FILE.has(opts.kind) || opts.pathIsFile)) units = [{ path: '', kind: opts.kind, tree, name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
   else {
-    const detected = detectUnits(tree, opts.rootName, { layoutDir: opts.layoutDir, folderRoot: opts.folderRoot, includeRepoTooling: opts.includeRepoTooling });
-    units = detected.units;
-    skipped.push(...detected.skipped);
+    if (opts.kind) units = fileUnits(tree, opts.kind, opts.rootName, skipped);
+    else {
+      const { folderKinds, layoutDir, folderRoot, includeRepoTooling } = opts;
+      const detected = detectUnits(tree, opts.rootName, { layoutDir, folderRoot, includeRepoTooling, folderKinds });
+      units = detected.units;
+      skipped.push(...detected.skipped);
+      skippedFolders = detected.skippedFolders;
+    }
     if (opts.name !== undefined) {
       if (units.length !== 1) throw badRequest(`name applies to an import of exactly one item (found ${units.length})`);
       units[0].name = opts.name;
@@ -632,21 +709,33 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   const meta = opts.group ? pluginMeta(tree) : null;
   // Detection reports a bad marketplace.json too, when its plugin pass ran (not for a kind override or a folder's SKILL.md): listed once.
   if (meta) skipped.push(...meta.skipped.filter((s) => !skipped.some((x) => x.path === s.path && x.reason === s.reason)));
-  // The skip reasons travel as details, like the 422 below, so the UI can list what was passed over and why.
-  if (!units.length) throw new HttpError(400, 'nothing_to_import', 'no skills, agents, commands, prompts, instructions or design files found', skipped.length ? skipped : undefined);
+  // The skip reasons travel as details, like the 422 below, so the UI can list what was passed over and
+  // why, and the offered folders (mvfp) alongside: a code repository's docs/prompts/ is the case to ask about.
+  const failed = (status: 400 | 422, code: string, message: string, details?: Skipped[]) =>
+    Object.assign(new HttpError(status, code, message, details), { extra: skippedFolders.length ? { skippedFolders } : undefined });
+  if (!units.length) throw failed(400, 'nothing_to_import', 'no skills, agents, commands, prompts, instructions or design files found', skipped.length ? skipped : undefined);
   const maxItems = importLimit(ctx, 'maxItems');
   if (units.length > maxItems) throw new HttpError(400, 'too_many_items', `at most ${maxItems} item${maxItems === 1 ? '' : 's'} per import (found ${units.length})`);
   const { db } = ctx;
   return tx(db, () => {
+    // intoGroup is re-read here: the route resolved it before a GitHub download that can take a minute,
+    // and a group deleted meanwhile would fail every member insert on its foreign key (a 500).
+    const into = opts.intoGroup && (getGroupRow(db, opts.intoGroup.id) as GroupRow | undefined);
+    if (opts.intoGroup && !(into && canEditGroup(p, into))) throw notFound('group');
     const group = opts.group
       ? createGroup(ctx, p, { slug: opts.group, name: opts.groupName ?? meta?.name ?? opts.defaultGroupName ?? opts.rootName, description: meta?.description })
-      : null;
+      : (into || null);
     const results: UnitResult[] = [];
+    let added = 0;
     for (const u of units) {
       db.exec('SAVEPOINT unit');
       try {
         const r = importUnit(ctx, p, u, opts);
-        if (group) addMemberTx(ctx, p, group, { itemId: r.item.id });
+        // A re-import into the same group versions its members; they stay members once (p2wf).
+        if (group && !isMember(db, group.id, r.item.id)) {
+          addMemberTx(ctx, p, group, { itemId: r.item.id });
+          added++;
+        }
         db.exec('RELEASE unit');
         results.push(r);
       } catch (e) {
@@ -658,7 +747,7 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
     // Nothing imported is a failure, not a 201 with an empty list a script would record as success; and no
     // group either: an empty one would commit, burn its slug (deleted_group_slugs) and send the UI away
     // from the skip reasons, which travel in the error details instead.
-    if (!results.length) throw new HttpError(422, 'nothing_imported', group ? 'every unit was skipped, so the group was not created' : 'every unit was skipped', skipped);
-    return { group, results, skipped };
+    if (!results.length) throw failed(422, 'nothing_imported', opts.group ? 'every unit was skipped, so the group was not created' : 'every unit was skipped', skipped);
+    return { group, groupCreated: !!opts.group, added, results, skipped, skippedFolders };
   });
 }
