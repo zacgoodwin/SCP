@@ -58,8 +58,8 @@ test('installPath table and overlap rule', () => {
   assert.equal(installPath('skill', 'pdf', 'SKILL.md', cc), '.claude/skills/pdf/');
   assert.equal(installPath('agent', 'rev', 'rev.md', cc), '.claude/agents/rev.md');
   assert.equal(installPath('command', 'ship', 'ship.md', cc), '.claude/commands/ship.md');
-  assert.equal(installPath('instructions', 'r', 'AGENTS.md', cc), 'AGENTS.md');
-  assert.equal(installPath('instructions', 'r', 'AGENTS.md', { ...cc, installAs: 'CLAUDE.md' }), 'CLAUDE.md');
+  assert.equal(installPath('instructions', 'r', 'AGENTS.md', cc), 'CLAUDE.md', 'Claude Code loads CLAUDE.md, not AGENTS.md');
+  assert.equal(installPath('instructions', 'r', 'AGENTS.md', { ...cc, installAs: 'docs/RULES.md' }), 'docs/RULES.md', 'installAs wins');
   assert.equal(installPath('design', 'b', 'DESIGN.md', cc), 'DESIGN.md');
   assert.equal(installPath('prompt', 'p', 'p.md', cc), '.scp/prompts/p.md');
   assert.equal(installPath('package', 'k', 'README.md', cc), '.scp/packages/k/');
@@ -100,14 +100,14 @@ test('bundle.zip claude-code project: exact tree, modes, bytes, lock, instructio
     '.scp/design/brand/tokens.css',
     '.scp/groups/kit/INSTRUCTIONS.md',
     '.scp/prompts/summarize.md',
-    'AGENTS.md',
+    'CLAUDE.md',
     'DESIGN.md',
     'scp.lock.json',
   ]);
   assert.equal(files.get('.claude/skills/pdf/scripts/run.sh')!.mode, 493, 'exec bit preserved');
   assert.equal(files.get('.claude/skills/pdf/SKILL.md')!.mode, 420);
   assert.deepEqual(files.get('.claude/agents/reviewer.md')!.bytes, new TextEncoder().encode(AGENT_MD), 'byte-identical, CRLF kept');
-  assert.equal(text(files.get('AGENTS.md')), '# Rules\nBe terse.\n');
+  assert.equal(text(files.get('CLAUDE.md')), '# Rules\nBe terse.\n');
   assert.equal(text(files.get('DESIGN.md')), '## Overview\nCalm.\n');
   assert.equal(text(files.get('.scp/artifacts/dash/index.html')), '<h1>dash</h1>');
   assert.equal(text(files.get('.scp/groups/kit/INSTRUCTIONS.md')), 'Start with pdf.\n');
@@ -126,6 +126,7 @@ test('bundle.zip claude-code project: exact tree, modes, bytes, lock, instructio
     assert.equal(l.owner, 'alice');
   }
   assert.equal((byName.get('pdf') as { path: string }).path, '.claude/skills/pdf/');
+  assert.equal((byName.get('rules') as { path: string }).path, 'CLAUDE.md', 'the lock records where the instructions landed');
   const ev = t.db.prepare("SELECT detail FROM audit WHERE action = 'bundle.download'").get() as { detail: string };
   assert.deepEqual(JSON.parse(ev.detail), { slug: 'kit', target: 'claude-code', scope: 'project', items: 6 });
 });

@@ -21,6 +21,8 @@ export interface Ctx {
   config: Config;
   /** HMAC secret for signed preview URLs; persisted in settings. */
   secret: string;
+  /** Test seam, unset in production: POST /auth/password awaits it between its scrypts and its write. */
+  beforePasswordWrite?: () => Promise<void>;
 }
 
 export type AppEnv = {
@@ -32,6 +34,8 @@ export type AppEnv = {
 
 export const KINDS = ['skill', 'agent', 'command', 'instructions', 'prompt', 'design', 'package', 'artifact'] as const;
 export type Kind = (typeof KINDS)[number];
+/** A kind with its article, for messages: 'an agent', 'an instructions item', 'a skill'. */
+export const aKind = (kind: Kind): string => (kind === 'instructions' ? 'an instructions item' : `${/^[aeiou]/.test(kind) ? 'an' : 'a'} ${kind}`);
 export const MD_KINDS = ['agent', 'command', 'instructions', 'prompt', 'design', 'package'] as const;
 export type Plane = 'skill' | 'md' | 'artifact';
 export const planeOf = (kind: Kind): Plane => (kind === 'skill' ? 'skill' : kind === 'artifact' ? 'artifact' : 'md');

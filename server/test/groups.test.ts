@@ -267,8 +267,8 @@ test('path conflicts on add, installAs resolves them; PUT replaces in order, all
   const c = await addMember(t, h, 'pack', { itemId: b.id });
   assert.equal(c.status, 409);
   assert.equal(c.json.error.code, 'path_conflict');
-  assert.match(c.json.error.message, /'house-rules' and 'team-rules' both install to 'AGENTS.md'/);
-  assert.equal((await addMember(t, h, 'pack', { itemId: b.id, installAs: 'CLAUDE.md' })).status, 201);
+  assert.match(c.json.error.message, /'house-rules' and 'team-rules' both install to 'CLAUDE.md'/);
+  assert.equal((await addMember(t, h, 'pack', { itemId: b.id, installAs: 'TEAM.md' })).status, 201);
   // a file path inside a skill folder is a conflict too, case-insensitively
   assert.equal((await addMember(t, h, 'pack', { itemId: s.id })).status, 201);
   const p = await item(t, h, { kind: 'prompt', name: 'p1', content: 'x' });
@@ -285,7 +285,7 @@ test('path conflicts on add, installAs resolves them; PUT replaces in order, all
   assert.deepEqual(rows.map((x) => x.position), [0, 1, 2]);
   // a bad list changes nothing
   const before = (await t.req('GET', `${API}/groups/pack`, { headers: h })).json.group.members.map((m: { item: { id: string } }) => m.item.id);
-  assert.equal((await put([{ itemId: a.id }, { itemId: b.id }])).status, 409, 'two AGENTS.md');
+  assert.equal((await put([{ itemId: a.id }, { itemId: b.id }])).status, 409, 'two CLAUDE.md');
   assert.equal((await put([{ itemId: a.id }, { itemId: a.id }])).status, 409, 'duplicate');
   assert.equal((await put([{ itemId: a.id }, { itemId: 'missing' }])).status, 404);
   const after = (await t.req('GET', `${API}/groups/pack`, { headers: h })).json.group.members.map((m: { item: { id: string } }) => m.item.id);

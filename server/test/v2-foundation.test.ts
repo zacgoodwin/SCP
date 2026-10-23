@@ -25,14 +25,14 @@ test('migration 4 adds the v2 tables and columns, and upgrades a v3 database', (
   for (const index of ['oauth_tokens_expires', 'oauth_tokens_revoked', 'oauth_clients_sweep', 'oauth_codes_client', 'oauth_codes_expires']) {
     assert.ok(t.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index), index);
   }
-  assert.equal((t.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+  assert.equal((t.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
 
   // migrate() is idempotent and a fresh database lands on the same version.
   const fresh = new DatabaseSync(':memory:');
   fresh.exec('PRAGMA foreign_keys = ON');
   migrate(fresh);
   migrate(fresh);
-  assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+  assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
   assert.throws(() => t.db.prepare('INSERT INTO group_includes (group_id, included_id, added_at) VALUES (?, ?, ?)').run('a', 'a', 'now'), /CHECK/);
 });
 

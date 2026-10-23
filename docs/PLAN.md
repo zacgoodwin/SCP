@@ -252,7 +252,7 @@ Bundle paths (`target=claude-code`; `generic` uses `skills/ agents/ commands/ pr
 | skill | `.claude/skills/<name>/...` |
 | agent | `.claude/agents/<name>.md` |
 | command | `.claude/commands/<name>.md` |
-| instructions | `installAs` or `AGENTS.md` (user scope: `.claude/CLAUDE.md`) |
+| instructions | `installAs` or `CLAUDE.md` (user scope: `.claude/CLAUDE.md`); stored as `AGENTS.md`, which `codex` installs |
 | design | `installAs` or `DESIGN.md`; its other files always go under `.scp/design/<name>/` |
 | prompt | `.scp/prompts/<name>.md` |
 | package | `.scp/packages/<name>/...` |

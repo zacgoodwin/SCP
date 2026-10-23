@@ -22,7 +22,7 @@ import { addMemberTx, listReadableGroups } from '../groups/service.ts';
 import { INSTALL_SCOPES, TARGETS, buildManifest } from '../groups/bundle.ts';
 import { asText, catalogEntry, catalogText, clip, entryText, memberEntry, memberInstallPath, resolveTarget, type McpScope } from './scope.ts';
 import { VIEWER_URI } from './viewer.ts';
-import { FORMATS, KINDS, MD_KINDS, type GroupRow, type ItemRow, type Kind } from '../types.ts';
+import { FORMATS, KINDS, MD_KINDS, aKind, type GroupRow, type ItemRow, type Kind } from '../types.ts';
 
 /**
  * Max characters of a body per call; longer bodies page with `offset`. Claude Code refuses tool
@@ -664,7 +664,7 @@ export function registerTools(server: McpServer, s: McpScope): void {
    */
   function editableArtifact(itemId: string): ItemRow {
     const item = loadEditableItem(db, p, itemId);
-    if (item.kind !== 'artifact') throw new HttpError(400, 'wrong_kind', `'${item.name}' is a ${item.kind}, not an artifact`);
+    if (item.kind !== 'artifact') throw new HttpError(400, 'wrong_kind', `'${item.name}' is ${aKind(item.kind)}, not an artifact`);
     return item;
   }
 

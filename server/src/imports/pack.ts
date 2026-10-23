@@ -6,10 +6,11 @@ import { parseFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, badRequest } from '../lib/http.ts';
 import { isJunkPath } from '../lib/paths.ts';
 import { stripTopFolder, type TreeFile } from '../lib/tree.ts';
-import { PACK_LIMITS, safeUnzip } from '../lib/zip.ts';
+import { PACK_LIMITS, safeUnzip, type ZipLink } from '../lib/zip.ts';
 import type { Ctx, GroupRow, ItemRow, ItemSource, Kind, Principal } from '../types.ts';
 
 export const MAX_ITEMS = 200;
+export const ARTIFACT_FROM_TREE = 'an artifact imports from a single file, not from a repository or pack';
 
 /** One item-to-be inside an imported tree. */
 export interface Unit {
@@ -49,6 +50,10 @@ export interface ImportOpts {
   layoutDir?: string;
   /** The tree is one folder (a GitHub `path`, a zip's stripped wrapper), not a repository root: a SKILL.md in it is the whole folder's. */
   folderRoot?: boolean;
+  /** `source.path` names a file (a GitHub `path` that is one), so it is every unit's source path, not joined to the unit's. */
+  pathIsFile?: boolean;
+  /** Passed over before detection (a pack's symlinks, linkSkips): reported first in `skipped`. */
+  skipped?: Skipped[];
   note: string;
   visibility?: 'private' | 'public';
   /** Treat the whole tree as one item of this kind (no detection). */
@@ -59,7 +64,7 @@ export interface ImportOpts {
 }
 
 const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
-const INSTRUCTION_FILES = new Set(['agents.md', 'claude.md', 'gemini.md']);
+const INSTRUCTION_FILES = new Set(['agents.md', 'claude.md', 'gemini.md', 'instructions.md']);
 /** README/LICENSE-style names, with a locale or variant suffix (README.de.md), never a stem that merely starts so (security-review.md). */
 const REPO_DOCS = /^(readme|licen[cs]e|changelog|contributing|code_of_conduct|security)(\.[^/]*)?\.md$/i;
 const SKILL_DIRS = ['.claude/skills', 'skills'];
@@ -71,7 +76,8 @@ const FILE_DIRS: [string, Kind, boolean][] = [
   ['commands', 'command', true],
   ['prompts', 'prompt', true],
 ];
-const ROOT_FILES: [string, Kind][] = [['AGENTS.md', 'instructions'], ['CLAUDE.md', 'instructions'], ['DESIGN.md', 'design']];
+// INSTRUCTIONS.md: the real file behind `CLAUDE.md -> INSTRUCTIONS.md`-style links (neuledge/context).
+const ROOT_FILES: [string, Kind][] = [['AGENTS.md', 'instructions'], ['CLAUDE.md', 'instructions'], ['INSTRUCTIONS.md', 'instructions'], ['DESIGN.md', 'design']];
 /** A lone top folder with one of these names is the layout, not packaging (`zip -r commands.zip commands/`). */
 const LAYOUT_DIRS = new Set(['skills', 'agents', 'commands', 'prompts', '.claude', '.claude-plugin']);
 
@@ -88,12 +94,20 @@ const NOT_AN_ITEM = 'repository documentation, not an item';
 /**
  * Unzip an untrusted pack: junk dropped, one wrapper folder stripped (GitHub always adds one) unless it
  * is a layout folder. Pack caps, not a version's: each unit is held to those as it becomes an item.
+ * Symlinks (`CLAUDE.md -> AGENTS.md`, `.agents/skills -> ../.claude/skills`) are left out and returned
+ * in `links`, re-rooted with the files, for the import to report (linkSkips).
  */
-export function unpack(bytes: Uint8Array, keep?: (name: string) => boolean): { files: TreeFile[]; top: string | null } {
-  const files = safeUnzip(bytes, keep, PACK_LIMITS).filter((f) => !isJunkPath(f.path));
-  const stripped = stripTopFolder(files);
-  return stripped.top && LAYOUT_DIRS.has(stripped.top) ? { files, top: null } : stripped;
+export function unpack(bytes: Uint8Array, keep?: (name: string) => boolean): { files: TreeFile[]; top: string | null; links: ZipLink[] } {
+  const links: ZipLink[] = [];
+  const entries: (TreeFile | ZipLink)[] = [...safeUnzip(bytes, keep, PACK_LIMITS, links), ...links].filter((f) => !isJunkPath(f.path));
+  let { files: all, top } = stripTopFolder(entries);
+  if (top && LAYOUT_DIRS.has(top)) [all, top] = [entries, null];
+  const isLink = (f: TreeFile | ZipLink): f is ZipLink => 'target' in f;
+  return { files: all.filter((f): f is TreeFile => !isLink(f)), top, links: all.filter(isLink) };
 }
+
+/** A pack's symlinks as skip reasons. */
+export const linkSkips = (links: ZipLink[]): Skipped[] => links.map((l) => ({ path: l.path, reason: `symlink to '${l.target}', not imported` }));
 
 /**
  * safeUnzip predicate for a GitHub zipball: the entries at or under `path` below the one top folder
@@ -110,9 +124,9 @@ export function underPath(path: string | null): ((name: string) => boolean) | un
 }
 
 /** The files at or under path, re-rooted there; the whole tree when path is null. */
-export function subtree(tree: TreeFile[], path: string | null): TreeFile[] {
+export function subtree<T extends { path: string }>(tree: T[], path: string | null): T[] {
   if (!path) return tree;
-  const out: TreeFile[] = [];
+  const out: T[] = [];
   for (const f of tree) {
     if (f.path === path) out.push({ ...f, path: baseOf(f.path) });
     else if (f.path.startsWith(path + '/')) out.push({ ...f, path: f.path.slice(path.length + 1) });
@@ -301,7 +315,8 @@ export function updateTree(db: Db, item: ItemRow, tree: TreeFile[]): TreeFile[] 
 const sameRepo = (a: string | null, b: string | null) => (a ?? '').toLowerCase() === (b ?? '').toLowerCase();
 
 function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts): UnitResult {
-  const source: ItemSource = { ...opts.source, path: [opts.source.path, u.path].filter(Boolean).join('/') || null };
+  // A file path re-rooted to its name (subtree) would otherwise join to '<file>/<name>', which no update finds.
+  const source: ItemSource = { ...opts.source, path: opts.pathIsFile ? opts.source.path : [opts.source.path, u.path].filter(Boolean).join('/') || null };
   // The root detection unit is the one carved from its siblings; a kind override, a folder import or any folder unit took the whole tree (updateTree).
   const sourceScope: NonNullable<ItemRow['source_scope']> = u.scope ?? (!opts.kind && u.path === '' && u.kind === 'skill' ? 'root' : 'tree');
   const input = { kind: u.kind, name: u.name, tree: u.tree, visibility: opts.visibility, source, sourceScope, note: opts.note, fallbackName: u.fallbackName, folderName: u.folderName };
@@ -338,12 +353,14 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   requireScope(p, 'write');
   if (p.groupIds) throw new HttpError(403, 'restricted_key', 'a group-restricted API key cannot import items');
   let units: Unit[];
-  let skipped: Skipped[] = [];
+  const skipped: Skipped[] = [...(opts.skipped ?? [])];
   // A tree has no format, which every artifact needs (checkFormat): the single-file import is the way in.
-  if (opts.kind === 'artifact') throw badRequest('an artifact imports from a single file, not from a repository or pack');
+  if (opts.kind === 'artifact') throw badRequest(ARTIFACT_FROM_TREE);
   if (opts.kind) units = [{ path: '', kind: opts.kind, tree, name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
   else {
-    ({ units, skipped } = detectUnits(tree, opts.rootName, { layoutDir: opts.layoutDir, folderRoot: opts.folderRoot }));
+    const detected = detectUnits(tree, opts.rootName, { layoutDir: opts.layoutDir, folderRoot: opts.folderRoot });
+    units = detected.units;
+    skipped.push(...detected.skipped);
     if (opts.name !== undefined) {
       if (units.length !== 1) throw badRequest(`name applies to an import of exactly one item (found ${units.length})`);
       units[0].name = opts.name;

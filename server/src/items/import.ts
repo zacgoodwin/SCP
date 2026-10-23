@@ -15,7 +15,7 @@ export interface ImportInput {
 }
 
 const ARTIFACT_EXT: Record<string, Format> = { html: 'html', htm: 'html', svg: 'svg', mmd: 'mermaid', jsx: 'react', tsx: 'react' };
-const INSTRUCTION_FILES = new Set(['agents.md', 'claude.md', 'gemini.md']);
+const INSTRUCTION_FILES = new Set(['agents.md', 'claude.md', 'gemini.md', 'instructions.md']);
 
 /** Detect the kind of one uploaded file (.md, .zip/.skill, or an artifact source) and create it. */
 export function importUpload(ctx: Ctx, p: Principal, u: ImportInput): ItemRow {

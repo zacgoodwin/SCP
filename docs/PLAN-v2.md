@@ -127,14 +127,17 @@ API: `GET /admin/settings` reports `clientSecretSet: true`, `tokenSet: true`.
 POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName]        -> 201 ImportResult
 POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?  -> 201 ImportResult
 POST /items/:id/source/check                                                                     -> {source, upToDate, latestCommit}
-POST /items/:id/source/update  {note?}                                                           -> {item}  (new version; 409 up_to_date when nothing changed)
+POST /items/:id/source/update  {note?}                                                           -> {item, skipped}  (new version; 409 up_to_date when nothing changed; skipped: the path's symlinks)
 ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason}], source: ItemSource | null}
 ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: string|null, commit: string|null}
 ```
 
 - `url` forms: `https://github.com/{o}/{r}`, `.../tree/{ref}/{path}`, `.../blob/{ref}/{path}/SKILL.md`
-  (the file's folder). `repo` is `owner/repo`; `ref` a branch, tag or 7-40 hex sha (default: the
-  repo's default branch); `path` a folder (default root). Owner/repo `^[A-Za-z0-9_.-]{1,100}$`, ref
+  (the file's folder); host `github.com` or `www.github.com` (any case), `https:` or `http:`, or no
+  scheme at all (`github.com/o/r`, v3 hs8z). `repo` is `owner/repo`; `ref` a branch, tag or 7-40 hex sha (default: the
+  repo's default branch); `path` a folder (default root) or one file, which is then the unit and
+  every unit's `source_path` as is (`pathIsFile`; v3 kgtx: it was stored as `<file>/<name>`, and
+  a v3 migration, `db.ts` `UNDOUBLE_SOURCE_PATHS`, cuts such rows back). Owner/repo `^[A-Za-z0-9_.-]{1,100}$`, ref
   `^[A-Za-z0-9_./-]{1,200}$` without `..`. Anything else is 400 `bad_source`.
 - GitHub fetch via the API only, no clone, no code execution: `GET {githubApiUrl}/repos/{o}/{r}/commits/{ref}`
   (-> full sha; 404 -> 400 `bad_source`), then `GET {githubApiUrl}/repos/{o}/{r}/zipball/{sha}`
@@ -145,7 +148,12 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   unit meets the per-version caps (1000 files, 30 MB) in `createItemTx` as it becomes an item, so a
   150-skill repository imports and an oversize unit alone lands in `skipped`, one over the 10 MB
   per-file cap included (`PACK_LIMITS.fileBytes` is the 64 MB total, never a version's cap). Then
-  strip the one top folder GitHub adds. Header
+  strip the one top folder GitHub adds. Pack and repository imports (and `source/update`) unzip in
+  skip mode (v3 a51r): a symlink entry is never imported, resolved or followed; it lands in
+  `skipped` as `symlink to '<target>', not imported` (the target is the entry's stored bytes,
+  capped at 255 characters) and the rest of the tree imports, so `CLAUDE.md -> AGENTS.md` no longer
+  fails a whole repository. The single-file `POST /items/import` still refuses a zip holding one.
+  Entry names have `\` read as `/` first (Windows `Compress-Archive`, v3 31bp). Header
   `Authorization: Bearer <token>` when `github.token` is set (env `SCP_GITHUB_TOKEN` first, then the
   setting). `resolveCommit` always reads `GET /repos/{o}/{r}` and refuses `private: true` for a
   non-admin principal (400 `bad_source`): the instance token must not make every account a reader
@@ -155,8 +163,8 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   `.claude-plugin/plugin.json` (plugin: `skills/*/SKILL.md`, `agents/*.md`, `commands/*.md`),
   `.claude/skills/*/SKILL.md`, `.claude/agents/*.md`, `.claude/commands/*.md`, `skills/*/SKILL.md`,
   `agents/*.md`, `commands/*.md`, `prompts/*.md`, any other `*/SKILL.md` (its folder), `SKILL.md`
-  at the root in any case (one skill over every remaining file), `AGENTS.md`/`CLAUDE.md`
-  (instructions), `DESIGN.md` (design). A folder's `skill.md` in any case is the entry, stored as
+  at the root in any case (one skill over every remaining file), `AGENTS.md`/`CLAUDE.md`/
+  `INSTRUCTIONS.md` (instructions), `DESIGN.md` (design). A folder's `skill.md` in any case is the entry, stored as
   `SKILL.md`. A folder import (`folderRoot`: a GitHub `path`, or a zip whose one wrapper folder was
   stripped) holding a root `SKILL.md` is that one skill over the whole tree (`source_scope`
   `tree`), `CLAUDE.md` and `agents/*.md` included, as the same folder is under `skills/` in a
@@ -184,7 +192,8 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   imported items as members; `groupName` defaults to the repo or zip name. The whole import is one
   transaction: group + items + members, or nothing (apart from `skipped`). Every unit skipped is
   422 `nothing_imported` with `skipped` as `details`, never a 201 with `items: []`; with a group
-  requested the group rolls back and its slug is not burnt. `kind: artifact` is 400 (a tree has no format).
+  requested the group rolls back and its slug is not burnt. `kind: artifact` is 400 (a tree has no
+  format), on the GitHub route before anything is fetched or the rate bucket charged (v3 xksr).
 - Provenance: `source_kind`, `source_repo` (`owner/repo` as GitHub's `full_name` spells it, zip: the
   file name), `source_ref`, `source_path`, `source_commit` (zip: sha256 of the zip bytes),
   `source_tree_sha256` (the tree the source last wrote), `source_scope` (`root` for a root

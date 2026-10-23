@@ -222,6 +222,7 @@ test('import detection and rejection', async () => {
   assert.deepEqual(await kindOf('reviewer.md', AGENT_MD), ['agent', 'reviewer', null]);
   assert.deepEqual(await kindOf('CLAUDE.md', '# Rules\n'), ['instructions', 'rules', null], 'heading title beats file name');
   assert.deepEqual(await kindOf('GEMINI.md', 'Be terse.\n'), ['instructions', 'gemini', null]);
+  assert.deepEqual(await kindOf('INSTRUCTIONS.md', 'Be terse.\n'), ['instructions', 'instructions', null], 'as a pack import detects it');
   assert.deepEqual(await kindOf('DESIGN.md', '---\nname: Example Notes\n---\n## Overview\n'), ['design', 'example-notes', null]);
   assert.deepEqual(await kindOf('Snippet.md', 'Summarize {{text}}'), ['prompt', 'snippet', null]);
   assert.deepEqual(await kindOf('notes.md', 'x', { kind: 'command', name: 'notes-cmd' }), ['command', 'notes-cmd', null]);

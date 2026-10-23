@@ -256,7 +256,9 @@ function GithubForm({ plane, onCancel, onDone }: { plane?: api.Plane; onCancel: 
       <label className="field">
         <span>GitHub URL</span>
         <input
-          type="url"
+          // text, not url: type=url makes the browser refuse github.com/o/r before the server, which accepts it (hs8z).
+          type="text"
+          inputMode="url"
           value={url}
           spellCheck={false}
           placeholder="https://github.com/owner/repo/tree/main/skills"

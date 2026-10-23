@@ -58,20 +58,24 @@ const decode = (s: string) => {
 };
 
 /**
- * `{url}` or `{repo, ref?, path?}` -> a validated source. URL forms: `https://github.com/{o}/{r}`,
+ * `{url}` or `{repo, ref?, path?}` -> a validated source. URL forms: `https://github.com/{o}/{r}` (also
+ * `www.github.com`, `http:` or no scheme at all),
  * `.../tree/{ref}/{path}` and `.../blob/{ref}/{path}/FILE.md` (the file's folder). Owner, repo and ref
  * are restricted to characters that cannot steer the API path (no `..`, `?`, `#`, `@`, `:`).
  */
 export function parseGithubSource(input: { url?: string; repo?: string; ref?: string; path?: string }): GithubSource {
   let { repo, ref, path } = input;
   if (input.url !== undefined) {
+    // The shapes people paste: no scheme, www., http: (only the web URL's path is read, never fetched).
+    const raw = input.url.trim();
     let u: URL;
     try {
-      u = new URL(input.url.trim());
+      u = new URL(/^(www\.)?github\.com\//i.test(raw) ? `https://${raw}` : raw);
     } catch {
       throw badSource('not a URL');
     }
-    if (u.protocol !== 'https:' || u.hostname.toLowerCase() !== 'github.com') throw badSource('only https://github.com URLs are supported');
+    const host = u.hostname.toLowerCase();
+    if ((u.protocol !== 'https:' && u.protocol !== 'http:') || (host !== 'github.com' && host !== 'www.github.com')) throw badSource('only https://github.com URLs are supported');
     const segs = u.pathname.split('/').filter(Boolean).map(decode);
     if (segs.length < 2) throw badSource('URL must name owner/repo');
     repo = `${segs[0]}/${segs[1].replace(/\.git$/, '')}`;

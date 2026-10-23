@@ -10,7 +10,7 @@ import { LIMITS, checkLimits, stripTopFolder, tooLarge, treeSha256, type TreeFil
 import { sweepBlobs } from './gc.ts';
 import { lintVersion, type Lint } from './lint.ts';
 import { touchGroupsOfItem } from '../groups/touch.ts';
-import { FORMATS, KINDS, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
+import { FORMATS, KINDS, aKind, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
 
 export { isTextPath, mediaTypeFor };
 export type { Lint, TreeFile };
@@ -365,7 +365,7 @@ function shapeTree(kind: Kind, format: Format | null, raw: TreeFile[], unwrap: '
   checkLimits(files);
   let entryPath: string;
   if (SINGLE_FILE.has(kind)) {
-    if (files.length !== 1) throw badRequest(`a ${kind} holds exactly one file`);
+    if (files.length !== 1) throw badRequest(`${aKind(kind)} holds exactly one file`);
     entryPath = files[0].path; // re-homed to the entry path once the name is known
     if (kind === 'artifact' && files[0].bytes.length > LIMITS.artifactEntryBytes) throw tooLarge('artifact content is over 5 MB');
   } else {
@@ -376,7 +376,7 @@ function shapeTree(kind: Kind, format: Format | null, raw: TreeFile[], unwrap: '
     if (kind === 'package' && !files.some((f) => f.path === entryPath)) {
       entryPath = files.map((f) => f.path).filter((p) => p.toLowerCase().endsWith('.md')).sort()[0] ?? entryPath;
     }
-    if (!files.some((f) => f.path === entryPath)) throw badRequest(`a ${kind} needs ${entryPath} at the root`);
+    if (!files.some((f) => f.path === entryPath)) throw badRequest(`${aKind(kind)} needs ${entryPath} at the root`);
   }
   assertNoCollisions(files.map((f) => f.path));
   const entry = files.find((f) => f.path === entryPath)!;
@@ -566,7 +566,7 @@ export function createItemTx(
     try {
       insertRow(db, 'items', row);
     } catch (e) {
-      if (isUniqueViolation(e)) throw new HttpError(409, 'name_taken', `you already have a ${kind} named '${name}'`, { name });
+      if (isUniqueViolation(e)) throw new HttpError(409, 'name_taken', `you already have ${aKind(kind)} named '${name}'`, { name });
       throw e;
     }
     const v = insertVersion(db, p, row.id, 1, s, lint, input.note);

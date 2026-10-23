@@ -3,6 +3,8 @@ import { newId, now, openDb } from '../src/db.ts';
 import { buildApp } from '../src/app.ts';
 import { hashPassword, randomToken, sha256Hex } from '../src/lib/crypto.ts';
 import type { Ctx, Scope } from '../src/types.ts';
+import type { Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 
 export interface TestUser {
   id: string;
@@ -18,6 +20,25 @@ export interface Res {
   text: string;
   json: any;
   bytes: Uint8Array;
+}
+
+/**
+ * The WHATWG fetch "bad ports" at or above 1024 (listen(0) never hands out a lower one). fetch refuses
+ * them before connecting (undici: TypeError, cause "bad port"). An ephemeral range that starts at 1024
+ * (this Windows box: 1024-65535, handed out sequentially machine-wide) gives them to listen(0) whenever
+ * the counter sweeps past, and a fake server there looks like an upstream that "did not respond".
+ * ponytail: copied from undici's list (Node 24); the oidc test checks fetch still refuses each one.
+ */
+export const FETCH_BLOCKED_PORTS = new Set([1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080]);
+
+/** Listen on a free 127.0.0.1 port that fetch will connect to; returns the port. Every fake upstream a test fetches from starts here. */
+export async function listenLocal(server: Server): Promise<number> {
+  for (;;) {
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address() as AddressInfo;
+    if (!FETCH_BLOCKED_PORTS.has(port)) return port;
+    await new Promise<void>((r) => server.close(() => r()));
+  }
 }
 
 // scrypt is slow on purpose; hash the shared test password once.

@@ -1,14 +1,14 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
-import type { AddressInfo } from 'node:net';
 import { strToU8, zipSync } from 'fflate';
-import { makeTestCtx, type TestCtx } from './helpers.ts';
+import { listenLocal, makeTestCtx, type TestCtx } from './helpers.ts';
 import { buildZip } from '../src/lib/zip.ts';
 import { sha256Hex } from '../src/lib/crypto.ts';
 import { HttpError } from '../src/lib/http.ts';
 import { MAX_ZIPBALL, ZIPBALL_SLOTS, parseGithubSource, withZipballSlot } from '../src/imports/github.ts';
-import { detectUnits, subtree, unpack } from '../src/imports/pack.ts';
+import { ARTIFACT_FROM_TREE, detectUnits, subtree, unpack } from '../src/imports/pack.ts';
+import { UNDOUBLE_SOURCE_PATHS } from '../src/db.ts';
 
 const API = '/api/v1';
 type H = Record<string, string>;
@@ -33,6 +33,11 @@ const SHA_HUGE = 'f'.repeat(40);
 const sha = (ch: string) => ch.repeat(40);
 /** More unique shas: a two-hex-digit pattern, so 'a0' never collides with SHA_A. */
 const sha2 = (pair: string) => pair.repeat(20);
+/** A Files value that is a symlink to `target` (fake zipballs and pack()). */
+const LINK = '\u0000symlink:';
+const link = (target: string) => LINK + target;
+const zipEntry = (text: string): Uint8Array | [Uint8Array, { os: number; attrs: number }] =>
+  text.startsWith(LINK) ? [strToU8(text.slice(LINK.length)), { os: 3, attrs: (0o120777 << 16) >>> 0 }] : strToU8(text);
 
 interface Repo {
   default_branch: string;
@@ -67,7 +72,14 @@ async function fakeGithub() {
       const owner = Object.values(repos).find((r) => r.trees[zip[1]]);
       if (!owner) return json(404, { message: 'Not Found' });
       const files = owner.trees[zip[1]];
-      const bytes = buildZip(Object.entries(files).map(([path, text]) => ({ path: `owner-repo-${zip[1].slice(0, 7)}/${path}`, bytes: strToU8(text), mode: path.endsWith('.sh') ? 493 : 420 })));
+      // Like `git archive`: a symlink is a mode 120000 entry holding its target.
+      const bytes = buildZip(
+        Object.entries(files).map(([path, text]) => ({
+          path: `owner-repo-${zip[1].slice(0, 7)}/${path}`,
+          bytes: strToU8(text.startsWith(LINK) ? text.slice(LINK.length) : text),
+          mode: text.startsWith(LINK) ? 0o120777 : path.endsWith('.sh') ? 493 : 420,
+        })),
+      );
       return res.writeHead(200, { 'content-type': 'application/zip' }).end(bytes);
     }
     // GitHub's quota exhausted: 403 with the rate-limit headers (the anonymous 60/h, or the token's 5,000/h).
@@ -86,8 +98,7 @@ async function fakeGithub() {
     }
     return res.writeHead(302, { location: `/zip/${m[3]}` }).end();
   });
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const base = `http://127.0.0.1:${await listenLocal(server)}`;
   return { base, repos, requests, server };
 }
 
@@ -108,7 +119,7 @@ const github = (t: TestCtx, h: H, json: unknown) => t.req('POST', `${API}/items/
 /** `files` may be prebuilt zip bytes, so one archive can be uploaded twice byte for byte. */
 function pack(t: TestCtx, h: H, filename: string, files: Files | Uint8Array, fields: Record<string, string> = {}) {
   const fd = new FormData();
-  const zip = files instanceof Uint8Array ? files : zipSync(Object.fromEntries(Object.entries(files).map(([k, v]) => [k, strToU8(v)])));
+  const zip = files instanceof Uint8Array ? files : zipSync(Object.fromEntries(Object.entries(files).map(([k, v]) => [k, zipEntry(v)])));
   fd.set('file', new File([zip as Uint8Array<ArrayBuffer>], filename));
   for (const [k, v] of Object.entries(fields)) fd.set(k, v);
   return t.req('POST', `${API}/items/import/pack`, { headers: h, body: fd });
@@ -127,7 +138,6 @@ test('parseGithubSource: url forms, repo/ref/path fields, and what is refused', 
   assert.deepEqual(parseGithubSource({ repo: ' o/r ', ref: 'abc1234', path: '/skills/' }), { repo: 'o/r', ref: 'abc1234', path: 'skills' });
   for (const bad of [
     { url: 'https://evil.com/o/r' },
-    { url: 'http://github.com/o/r' },
     { url: 'https://github.com/o' },
     { url: 'https://github.com/o/r/pulls/1' },
     { url: 'not a url' },
@@ -143,6 +153,18 @@ test('parseGithubSource: url forms, repo/ref/path fields, and what is refused', 
     {},
   ]) {
     assert.throws(() => parseGithubSource(bad), { code: 'bad_source' }, JSON.stringify(bad));
+  }
+});
+
+test('parseGithubSource: www., scheme-less and http: GitHub URLs parse like the canonical one; other hosts are still refused', () => {
+  const canonical = parseGithubSource({ url: 'https://github.com/o/r' });
+  for (const url of ['github.com/o/r', 'www.github.com/o/r', 'https://www.github.com/o/r', 'http://github.com/o/r', 'HTTP://WWW.GitHub.com/o/r/', ' github.com/o/r.git ']) {
+    assert.deepEqual(parseGithubSource({ url }), canonical, url);
+  }
+  assert.deepEqual(parseGithubSource({ url: 'https://www.github.com/o/r/tree/main/skills' }), parseGithubSource({ url: 'https://github.com/o/r/tree/main/skills' }));
+  assert.deepEqual(parseGithubSource({ url: 'github.com/o/r/blob/v1/skills/pdf/SKILL.md' }), { repo: 'o/r', ref: 'v1', path: 'skills/pdf' });
+  for (const url of ['https://gitlab.com/o/r', 'https://github.com.evil.example/o/r', 'https://raw.githubusercontent.com/o/r/main/x', 'https://gist.github.com/o/r', 'github.com.evil.example/o/r', 'ftp://github.com/o/r', 'http://www.github.com.evil.example/o/r']) {
+    assert.throws(() => parseGithubSource({ url }), { code: 'bad_source' }, url);
   }
 });
 
@@ -640,11 +662,11 @@ test('github errors: unknown repo or ref is bad_source, no request ever leaves f
 
 test('zip pack re-import: same file name and path adds a version; the zip hash is the commit', async () => {
   const { t, h } = setup();
-  const v1 = { 'tools/SKILL.md': skill('tools', 'v1') };
-  const a = await pack(t, h, 'tools.zip', v1);
+  // Built once and uploaded as is: zipSync stamps the current time, so a rebuilt zip can differ by a second.
+  const zipA = zipSync({ 'tools/SKILL.md': strToU8(skill('tools', 'v1')) });
+  const a = await pack(t, h, 'tools.zip', zipA);
   assert.equal(a.status, 201, a.text);
   assert.equal(a.json.items[0].op, 'create');
-  const zipA = zipSync(Object.fromEntries(Object.entries(v1).map(([k, v]) => [k, strToU8(v)])));
   assert.equal(a.json.source.commit, sha256Hex(zipA));
   // Each item says what the import did to it, so the identical pack again does not read as "1 item imported".
   const same = await pack(t, h, 'tools.zip', zipA);
@@ -976,4 +998,226 @@ test('400 nothing_to_import carries the detection skip reasons, and a .md nested
   const code = await pack(t, h, 'code.zip', { 'src/a.ts': 'x' });
   assert.equal(code.status, 400);
   assert.equal(code.json.error.details, undefined);
+});
+
+// ---------- v3 import fixes ----------
+
+const filePaths = (it: { version: { files: { path: string }[] } }) => it.version.files.map((f) => f.path);
+const importOne = (t: TestCtx, h: H, filename: string, bytes: Uint8Array) => {
+  const fd = new FormData();
+  fd.set('file', new File([bytes as Uint8Array<ArrayBuffer>], filename));
+  return t.req('POST', `${API}/items/import`, { headers: h, body: fd });
+};
+
+test('31bp: a zip from Windows Compress-Archive (backslash separators, no directory entries) imports through the pack and single-file routes', async () => {
+  const win = zipSync({ 'stax\\SKILL.md': strToU8(skill('stax-tool')), 'stax\\scripts\\run.sh': strToU8('echo') });
+  const { t, h } = setup();
+  const r = await pack(t, h, 'stax-skill.zip', win);
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:stax-tool'], 'named from its frontmatter');
+  assert.deepEqual(filePaths(r.json.items[0]), ['SKILL.md', 'scripts/run.sh'], 'the stax folder is the wrapper');
+  assert.equal(r.json.items[0].source.path, null);
+  const t2 = setup();
+  const one = await importOne(t2.t, t2.h, 'stax-skill.zip', win);
+  assert.equal(one.status, 201, one.text);
+  assert.deepEqual([one.json.item.kind, one.json.item.name, filePaths(one.json.item)], ['skill', 'stax-tool', ['SKILL.md', 'scripts/run.sh']]);
+  for (const bad of ['..\\evil.md', 'C:\\evil.md', '\\abs.md']) {
+    const z = zipSync({ 'stax\\SKILL.md': strToU8(skill('stax')), [bad]: strToU8('x') });
+    assert.equal((await pack(t, h, 'bad.zip', z)).status, 400, bad);
+    assert.equal((await importOne(t, h, 'bad.zip', z)).status, 400, bad);
+  }
+  const dup = await pack(t, h, 'dup.zip', zipSync({ 'a\\b.md': strToU8('1'), 'a/b.md': strToU8('2') }));
+  assert.equal(dup.status, 400);
+  assert.match(dup.json.error.message, /duplicate zip entry 'a\/b\.md'/);
+});
+
+test('a51r: a pack with symlinks imports everything else; each link is listed in skipped with its target, never followed', async () => {
+  const { t, h } = setup();
+  const reason = (target: string) => `symlink to '${target}', not imported`;
+  const kata = await pack(t, h, 'kata.zip', { 'CLAUDE.md': link('AGENTS.md'), 'AGENTS.md': '# Rules\n', 'skills/pdf/SKILL.md': skill('pdf') });
+  assert.equal(kata.status, 201, kata.text);
+  assert.deepEqual(names(kata.json.items), ['instructions:rules', 'skill:pdf']);
+  assert.deepEqual(kata.json.skipped, [{ path: 'CLAUDE.md', reason: reason('AGENTS.md') }]);
+  // A directory symlink: the real folder imports once, no duplicate unit.
+  const dir = await pack(t, h, 'wt.zip', { '.claude/skills/wt/SKILL.md': skill('wt'), '.claude/skills/wt/ref.md': 'ref', '.agents/skills': link('../.claude/skills') });
+  assert.equal(dir.status, 201, dir.text);
+  assert.deepEqual(names(dir.json.items), ['skill:wt']);
+  assert.deepEqual(filePaths(dir.json.items[0]), ['SKILL.md', 'ref.md']);
+  assert.deepEqual(dir.json.skipped, [{ path: '.agents/skills', reason: reason('../.claude/skills') }]);
+  // Targets that escape the tree are only reported: the link's stored bytes, nothing read from disk.
+  const esc = await pack(t, h, 'esc.zip', { 'skills/esc/SKILL.md': skill('esc'), 'skills/esc/passwd': link('/etc/passwd'), up: link('../../etc/passwd') });
+  assert.equal(esc.status, 201, esc.text);
+  assert.deepEqual(filePaths(esc.json.items[0]), ['SKILL.md']);
+  assert.deepEqual(esc.json.skipped, [{ path: 'skills/esc/passwd', reason: reason('/etc/passwd') }, { path: 'up', reason: reason('../../etc/passwd') }]);
+  // A wrapper folder is stripped from the links too.
+  const wrapped = await pack(t, h, 'kit.zip', { 'kit/SKILL.md': skill('kit'), 'kit/CLAUDE.md': link('SKILL.md') });
+  assert.equal(wrapped.status, 201, wrapped.text);
+  assert.deepEqual(wrapped.json.skipped, [{ path: 'CLAUDE.md', reason: reason('SKILL.md') }]);
+  // Only links (and code): the existing 400, with the links as its details.
+  const only = await pack(t, h, 'only.zip', { 'CLAUDE.md': link('AGENTS.md'), 'src/a.ts': 'x' });
+  assert.equal(only.status, 400, only.text);
+  assert.equal(only.json.error.code, 'nothing_to_import');
+  assert.deepEqual(only.json.error.details, [{ path: 'CLAUDE.md', reason: reason('AGENTS.md') }]);
+  // The single-item zip import still refuses them.
+  const single = await importOne(t, h, 'x.zip', zipSync({ 'x/SKILL.md': strToU8(skill('x')), 'x/link': zipEntry(link('SKILL.md')) }));
+  assert.equal(single.status, 400, single.text);
+  assert.equal(single.json.error.message, "symlinks are not allowed: 'x/link'");
+});
+
+test('a51r: GitHub repositories of the 2026-10-22 survey shapes import with their links skipped; a link inside a folder import too; source/update reports them', async () => {
+  const survey: [string, Files, string][] = [
+    ['kenn-io/kata', { 'AGENTS.md': '# Rules\n', 'CLAUDE.md': link('AGENTS.md'), 'skills/kata/SKILL.md': skill('kata') }, 'CLAUDE.md'],
+    ['max-sixty/worktrunk', { '.claude/skills/wt/SKILL.md': skill('wt'), '.agents/skills': link('../.claude/skills') }, '.agents/skills'],
+    ['kunchenguid/firstmate', { '.claude/skills/firstmate-calm/SKILL.md': skill('firstmate-calm'), '.agents/skills/firstmate-calm': link('../../.claude/skills/firstmate-calm') }, '.agents/skills/firstmate-calm'],
+    ['EricTechPro/super-board', { 'skills/board/SKILL.md': skill('board'), 'evals/_stubs/bin/git': link('../../../stub.sh') }, 'evals/_stubs/bin/git'],
+  ];
+  const { t, h } = setup();
+  survey.forEach(([repo, files], i) => (gh.repos[repo] = { default_branch: 'main', refs: { main: sha2(`4${'abcde'[i]}`) }, trees: { [sha2(`4${'abcde'[i]}`)]: files } }));
+  for (const [repo, , first] of survey) {
+    const r = await github(t, h, { repo });
+    assert.equal(r.status, 201, `${repo}: ${r.text}`);
+    assert.ok(r.json.items.length >= 1, repo);
+    assert.deepEqual(r.json.skipped.map((s: { path: string }) => s.path), [first], repo);
+  }
+  // neuledge/context at 1d829a4 (a sample of its real tree): INSTRUCTIONS.md is the only real
+  // instructions file; .clinerules, .cursorrules, CLAUDE.md and README.md all link to it.
+  const toInstr = link('INSTRUCTIONS.md');
+  gh.repos['neuledge/context'] = { default_branch: 'main', refs: { main: sha2('4f') }, trees: { [sha2('4f')]: {
+    '.agents/registry/AGENT.md': '# Registry agent\n', '.changeset/config.json': '{}', '.clinerules': toInstr, '.cursorrules': toInstr,
+    'CLAUDE.md': toInstr, 'INSTRUCTIONS.md': '# Context\n', LICENSE: 'MIT', 'README.md': toInstr, 'SERVER_SPEC.md': '# Spec\n', 'package.json': '{}',
+    'packages/context/CHANGELOG.md': '# Changelog\n', 'packages/context/README.md': '# context\n', 'packages/context/src/index.ts': 'x',
+    'packages/context/src/fixtures/retrieval/csharp-signals.md': '# Signals\n', 'registry/README.md': '# Registry\n', 'registry/npm/ai.yaml': 'name: ai',
+  } } };
+  const ctx = await github(t, h, { repo: 'neuledge/context' });
+  assert.equal(ctx.status, 201, ctx.text);
+  assert.deepEqual(names(ctx.json.items), ['instructions:context']);
+  assert.deepEqual(filePaths(ctx.json.items[0]), ['AGENTS.md'], 'stored at the instructions entry path');
+  assert.deepEqual(ctx.json.skipped.slice(0, 4), ['.clinerules', '.cursorrules', 'CLAUDE.md', 'README.md'].map((path) => ({ path, reason: "symlink to 'INSTRUCTIONS.md', not imported" })));
+  assert.deepEqual(ctx.json.skipped.slice(4).map((s: { path: string }) => s.path), ['.agents/registry/AGENT.md', 'SERVER_SPEC.md', 'packages/context/src/fixtures/retrieval/csharp-signals.md']);
+  // Arize-ai/phoenix: the link sits inside the plugin folder the import names. Reported relative to that folder.
+  const plugin = (desc: string): Files => ({
+    'plugins/claude/arize-phoenix/skills/phoenix/SKILL.md': skill('phoenix', desc),
+    'plugins/claude/arize-phoenix/skills/phoenix/bin': link('../../../../../bin'),
+    'plugins/claude/arize-phoenix/skills/phoenix-cli': link('../../../../cli/skill'),
+    'cli/skill/SKILL.md': skill('phoenix-cli'),
+  });
+  gh.repos['Arize-ai/phoenix'] = { default_branch: 'main', refs: { main: sha2('5a') }, trees: { [sha2('5a')]: plugin('v1'), [sha2('5b')]: plugin('v2') } };
+  const ph = await github(t, h, { repo: 'Arize-ai/phoenix', path: 'plugins/claude/arize-phoenix' });
+  assert.equal(ph.status, 201, ph.text);
+  assert.deepEqual(names(ph.json.items), ['skill:phoenix']);
+  assert.deepEqual(ph.json.skipped, [
+    { path: 'skills/phoenix/bin', reason: "symlink to '../../../../../bin', not imported" },
+    { path: 'skills/phoenix-cli', reason: "symlink to '../../../../cli/skill', not imported" },
+  ]);
+  gh.repos['Arize-ai/phoenix'].refs.main = sha2('5b');
+  const up = await t.req('POST', `${API}/items/${ph.json.items[0].id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.description, 'v2');
+  // The item's own folder (skills/phoenix): its link, not the sibling's.
+  assert.deepEqual(up.json.skipped, [{ path: 'bin', reason: "symlink to '../../../../../bin', not imported" }]);
+});
+
+test('xksr: GitHub import with kind artifact is refused before GitHub is contacted and costs no rate-limit take', async () => {
+  gh.repos['acme/art2'] = { default_branch: 'main', refs: { main: sha2('5c') }, trees: { [sha2('5c')]: { 'SKILL.md': skill('art2') } } };
+  const { t, h } = setup();
+  const before = gh.requests.length;
+  for (let i = 0; i < 11; i++) {
+    const r = await github(t, h, { repo: 'acme/art2', kind: 'artifact' });
+    assert.equal(r.status, 400, r.text);
+    assert.equal(r.json.error.message, ARTIFACT_FROM_TREE);
+  }
+  assert.equal(gh.requests.length, before, 'no GitHub request left');
+  assert.equal((await github(t, h, { repo: 'acme/art2' })).status, 201, 'eleven refusals, and the bucket (a burst of 10) still has room');
+});
+
+test('kgtx: a GitHub import of one file stores that file as source_path, so source/update works; a doubled path stored before the fix is repaired', async () => {
+  const v = (n: string): Files => ({ 'skills.md': `# Stax\n\nversion ${n}\n`, 'docs/x.md': `# Do x\n\nversion ${n}\n`, 'README.md': '# r\n' });
+  gh.repos['acme/onefile'] = { default_branch: 'main', refs: { main: sha2('6a'), old: sha2('6a') }, trees: { [sha2('6a')]: v('1'), [sha2('6b')]: v('2'), [sha2('6c')]: { 'README.md': '# r\n' } } };
+  const { t, h } = setup();
+  const root = await github(t, h, { repo: 'acme/onefile', path: 'skills.md' });
+  assert.equal(root.status, 201, root.text);
+  assert.equal(root.json.items[0].source.path, 'skills.md');
+  assert.equal(root.json.source.path, 'skills.md');
+  const nested = await github(t, h, { repo: 'acme/onefile', path: 'docs/x.md' });
+  assert.equal(nested.status, 201, nested.text);
+  assert.equal(nested.json.items[0].source.path, 'docs/x.md');
+  const body = (it: { version: { files: { content?: string }[] } }) => JSON.stringify(it.version.files);
+  const update = (id: string) => t.req('POST', `${API}/items/${id}/source/update`, { headers: h });
+  // Upstream moves: check says so, update writes a version holding the upstream file.
+  gh.repos['acme/onefile'].refs.main = sha2('6b');
+  for (const it of [root.json.items[0], nested.json.items[0]]) {
+    assert.equal((await t.req('POST', `${API}/items/${it.id}/source/check`, { headers: h })).json.upToDate, false);
+    const up = await update(it.id);
+    assert.equal(up.status, 200, up.text);
+    assert.equal(up.json.item.latestSeq, 2);
+    const raw = await t.req('GET', `${API}/items/${it.id}/files/${up.json.item.version.entryPath}`, { headers: h });
+    assert.match(raw.text, /version 2/, body(up.json.item));
+  }
+  // Re-import at another ref versions the same item, no duplicate.
+  const again = await github(t, h, { repo: 'acme/onefile', ref: 'old', path: 'docs/x.md' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual([again.json.items[0].id, again.json.items[0].op, again.json.items[0].latestSeq], [nested.json.items[0].id, 'version', 3]);
+  assert.equal((t.db.prepare('SELECT COUNT(*) AS n FROM items').get() as { n: number }).n, 2);
+  // The file deleted upstream: the existing 400.
+  gh.repos['acme/onefile'].refs.main = sha2('6c');
+  const gone = await update(root.json.items[0].id);
+  assert.equal(gone.status, 400, gone.text);
+  assert.equal(gone.json.error.message, `'skills.md' no longer exists in acme/onefile@${sha2('6c').slice(0, 7)}`);
+
+  // A row stored with the doubled path (the bug) cannot update; the v3 migration repairs it.
+  gh.repos['acme/onefile2'] = { default_branch: 'main', refs: { main: sha2('6d') }, trees: { [sha2('6d')]: v('1'), [sha2('6e')]: v('2') } };
+  const t2 = setup();
+  const old = await github(t2.t, t2.h, { repo: 'acme/onefile2', path: 'docs/x.md' });
+  assert.equal(old.status, 201, old.text);
+  const id = old.json.items[0].id;
+  t2.t.db.prepare('UPDATE items SET source_path = ? WHERE id = ?').run('docs/x.md/x.md', id);
+  gh.repos['acme/onefile2'].refs.main = sha2('6e');
+  const broken = await t2.t.req('POST', `${API}/items/${id}/source/update`, { headers: t2.h });
+  assert.equal(broken.status, 400, 'the bug');
+  assert.match(broken.json.error.message, /'docs\/x\.md\/x\.md' no longer exists/);
+  t2.t.db.exec(UNDOUBLE_SOURCE_PATHS);
+  const fixed = await t2.t.req('POST', `${API}/items/${id}/source/update`, { headers: t2.h });
+  assert.equal(fixed.status, 200, fixed.text);
+  assert.equal(fixed.json.item.source.path, 'docs/x.md');
+  assert.equal(fixed.json.item.latestSeq, 2);
+});
+
+test('kgtx: the source-path repair touches only GitHub single-file rows whose last two segments repeat', async () => {
+  const { t, h } = setup();
+  const rows: [string, string, string | null, string | null][] = [
+    // kind, source_kind, stored path, expected after
+    ['prompt', 'github', 'skills.md/skills.md', 'skills.md'],
+    ['agent', 'github', 'docs/x.md/x.md', 'docs/x.md'],
+    ['instructions', 'github', 'CLAUDE.md/CLAUDE.md', 'CLAUDE.md'],
+    ['design', 'github', 'brand/design.md/design.md', 'brand/design.md'],
+    ['prompt', 'github', 'a/bx.md/x.md', 'a/bx.md/x.md'],
+    ['prompt', 'github', 'commands/ship.md', 'commands/ship.md'],
+    ['prompt', 'zip', 'x.md/x.md', 'x.md/x.md'],
+    ['skill', 'github', 'x.md/x.md', 'x.md/x.md'],
+    ['prompt', 'github', null, null],
+  ];
+  const ids: string[] = [];
+  for (const [kind] of rows) {
+    const content = kind === 'skill' ? skill(`s${ids.length}`) : kind === 'agent' ? AGENT.replace('reviewer', `a${ids.length}`) : `# P${ids.length}\n`;
+    const r = await t.req('POST', `${API}/items`, { headers: h, json: { kind, name: kind === 'skill' || kind === 'agent' ? undefined : `p${ids.length}`, content } });
+    assert.equal(r.status, 201, r.text);
+    ids.push(r.json.item.id);
+  }
+  rows.forEach(([, sk, path], i) => t.db.prepare('UPDATE items SET source_kind = ?, source_path = ? WHERE id = ?').run(sk, path, ids[i]));
+  t.db.exec(UNDOUBLE_SOURCE_PATHS);
+  const after = ids.map((id) => (t.db.prepare('SELECT source_path FROM items WHERE id = ?').get(id) as { source_path: string | null }).source_path);
+  assert.deepEqual(after, rows.map((r) => r[3]));
+});
+
+test('qarz: the name clash reads with the right article for every kind', async () => {
+  const { t, h } = setup();
+  const want: Record<string, string> = { agent: 'an agent', instructions: 'an instructions item', artifact: 'an artifact', skill: 'a skill', command: 'a command', prompt: 'a prompt' };
+  for (const [kind, phrase] of Object.entries(want)) {
+    const json =
+      kind === 'skill' ? { kind, content: skill('dup') } : kind === 'agent' ? { kind, content: AGENT.replace('reviewer', 'dup') } : kind === 'artifact' ? { kind, name: 'dup', format: 'html', content: '<p>x</p>' } : { kind, name: 'dup', content: 'x' };
+    assert.equal((await t.req('POST', `${API}/items`, { headers: h, json })).status, 201, kind);
+    const clash = await t.req('POST', `${API}/items`, { headers: h, json });
+    assert.equal(clash.status, 409, kind);
+    assert.equal(clash.json.error.message, `you already have ${phrase} named 'dup'`);
+  }
 });
