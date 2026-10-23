@@ -3,11 +3,14 @@ import { json, qs, type AuditEvent, type User } from './api.ts';
 
 export type SettingSource = 'env' | 'settings' | 'none';
 export type OidcField = 'issuer' | 'clientId' | 'clientSecret' | 'autoRegister' | 'label';
+export type ImportField = 'maxItems' | 'maxArchiveMb' | 'maxPackMb';
 
 export interface AdminSettings {
   /** `envFields`: set by the environment, read-only; `source` 'env' only when an IdP value (issuer, client id, secret) is. */
   oidc: { issuer: string | null; clientId: string | null; clientSecretSet: boolean; autoRegister: boolean; label: string; source: SettingSource; envFields: OidcField[] };
   github: { tokenSet: boolean; source: SettingSource };
+  /** Effective import limits; `envFields` are set by the environment (SCP_IMPORT_*), read-only. */
+  imports: Record<ImportField, number> & { envFields: ImportField[] };
   registration: { enabled: boolean; source: 'env' };
   storage: { blobs: number; blobBytes: number; orphanBlobs: number; orphanBytes: number; items: number; versions: number; users: number; groups: number };
 }
@@ -16,6 +19,7 @@ export interface AdminSettings {
 export interface SettingsPatch {
   oidc?: { issuer?: string; clientId?: string; clientSecret?: string; autoRegister?: boolean | ''; label?: string };
   github?: { token?: string };
+  imports?: Partial<Record<ImportField, number | ''>>;
 }
 
 export interface SweepResult {

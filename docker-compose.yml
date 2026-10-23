@@ -26,6 +26,10 @@ services:
       SCP_GITHUB_TOKEN: ${SCP_GITHUB_TOKEN:-}
       # GitHub REST API origin (GitHub Enterprise Server). Empty = https://api.github.com.
       SCP_GITHUB_API: ${SCP_GITHUB_API:-}
+      # Import limits (items per import 1-2000, archive and unpacked pack MB 1-256). Empty = the admin setting, else 200 / 35 / 64.
+      SCP_IMPORT_MAX_ITEMS: ${SCP_IMPORT_MAX_ITEMS:-}
+      SCP_IMPORT_MAX_ARCHIVE_MB: ${SCP_IMPORT_MAX_ARCHIVE_MB:-}
+      SCP_IMPORT_MAX_PACK_MB: ${SCP_IMPORT_MAX_PACK_MB:-}
       # OIDC login. Issuer + client id + secret enable it; values set here override the admin settings.
       SCP_OIDC_ISSUER: ${SCP_OIDC_ISSUER:-}
       SCP_OIDC_CLIENT_ID: ${SCP_OIDC_CLIENT_ID:-}

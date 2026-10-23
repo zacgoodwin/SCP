@@ -7,7 +7,7 @@ import { ErrorBox } from '../components/ErrorBox.tsx';
 import { useToast } from '../components/Toast.tsx';
 import { bytes, dateTime, timeAgo } from '../format.ts';
 
-/** D4 (docs/PLAN-v2.md): OIDC, GitHub token, storage and OAuth clients. */
+/** D4 (docs/PLAN-v2.md): OIDC, GitHub token, import limits, storage and OAuth clients. */
 export function AdminSettingsPage() {
   const me = useUser();
   if (!me.isAdmin) {
@@ -47,6 +47,7 @@ function Settings() {
         <>
           <OidcCard settings={settings} onSaved={setSettings} />
           <GithubCard settings={settings} onSaved={setSettings} />
+          <ImportsCard settings={settings} onSaved={setSettings} />
           <StorageCard settings={settings} onSwept={setSettings} />
           <OAuthClientsCard />
         </>
@@ -218,6 +219,85 @@ function GithubCard({ settings, onSaved }: { settings: admin.AdminSettings; onSa
           </div>
         </form>
       )}
+    </section>
+  );
+}
+
+/** [field, label, unit, default, max]: the server's config.ts IMPORT_LIMITS. */
+const IMPORT_FIELDS: [admin.ImportField, string, string, number, number][] = [
+  ['maxItems', 'Items per import', 'items', 200, 2000],
+  ['maxArchiveMb', 'Archive size (GitHub download, zip upload)', 'MB compressed', 35, 256],
+  ['maxPackMb', 'Pack size, unpacked', 'MB', 64, 256],
+];
+/** github.ts ZIPBALL_SLOTS: repository downloads in flight at once, each holding up to the archive cap. */
+const DOWNLOAD_SLOTS = 3;
+
+function ImportsCard({ settings, onSaved }: { settings: admin.AdminSettings; onSaved: (s: admin.AdminSettings) => void }) {
+  const toast = useToast();
+  const im = settings.imports;
+  const envOf = (f: admin.ImportField) => im.envFields.includes(f);
+  const [values, setValues] = useState<Record<admin.ImportField, string>>({ maxItems: String(im.maxItems), maxArchiveMb: String(im.maxArchiveMb), maxPackMb: String(im.maxPackMb) });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      // Only the fields the environment leaves alone; a blank field goes back to the default.
+      const patch: NonNullable<admin.SettingsPatch['imports']> = {};
+      for (const [f] of IMPORT_FIELDS) if (!envOf(f)) patch[f] = values[f].trim() === '' ? '' : Number(values[f]);
+      const s = await admin.putSettings({ imports: patch });
+      onSaved(s);
+      setValues({ maxItems: String(s.imports.maxItems), maxArchiveMb: String(s.imports.maxArchiveMb), maxPackMb: String(s.imports.maxPackMb) });
+      toast('Import limits saved.', 'ok');
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="card stack">
+      <header className="card-head">
+        <h2>Imports</h2>
+      </header>
+      <p className="muted">
+        Limits for pack and GitHub imports. Up to {DOWNLOAD_SLOTS} repository downloads run at once, each holding up to the archive size in memory
+        (now {DOWNLOAD_SLOTS * im.maxArchiveMb} MB at most), and every import holds its unpacked files. A GitHub folder whose repository archive is
+        over the cap is fetched file by file instead, one API request per file.
+        {im.envFields.length > 0 && ` Set by the environment (SCP_IMPORT_*), read-only here: ${im.envFields.join(', ')}.`}
+      </p>
+      <form className="stack" onSubmit={(e) => void submit(e)}>
+        {IMPORT_FIELDS.map(([f, label, unit, def, max]) => (
+          <label className="field" key={f}>
+            <span>{label}</span>
+            <input
+              type="number"
+              min={1}
+              max={max}
+              step={1}
+              value={values[f]}
+              onChange={(e) => setValues((v) => ({ ...v, [f]: e.target.value }))}
+              disabled={envOf(f)}
+              placeholder={String(def)}
+            />
+            <small className="muted">
+              {unit}, 1 to {max} (default {def}){envOf(f) ? '. Set by the environment.' : '. Leave blank for the default.'}
+            </small>
+          </label>
+        ))}
+        <ErrorBox error={error} />
+        {im.envFields.length < IMPORT_FIELDS.length && (
+          <div className="row end">
+            <button type="submit" className="btn btn-primary" disabled={busy}>
+              {busy ? 'Saving…' : 'Save import limits'}
+            </button>
+          </div>
+        )}
+      </form>
     </section>
   );
 }

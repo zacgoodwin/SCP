@@ -117,7 +117,16 @@ CREATE INDEX oauth_tokens_client ON oauth_tokens(client_id);  -- the client swee
 ### Settings keys (table `settings`, D4 writes, D1/D3 read)
 
 `oidc.issuer`, `oidc.client_id`, `oidc.client_secret`, `oidc.auto_register` (`true|false`),
-`oidc.label`, `github.token`. Read through one helper per consumer: effective value =
+`oidc.label`, `github.token`, and (v3 dhje, 00tr) `import.max_items` (default 200, 1..2000),
+`import.max_archive_mb` (35, 1..256: the GitHub zipball and the pack upload body, compressed; the
+single-file `POST /items/import` body too, never above 35) and
+`import.max_pack_mb` (64, 1..256: `PACK_LIMITS` per file and total, unpacked), env
+`SCP_IMPORT_MAX_ITEMS` / `SCP_IMPORT_MAX_ARCHIVE_MB` / `SCP_IMPORT_MAX_PACK_MB` (out of range stops the
+boot), ranges in `config.ts` `IMPORT_LIMITS`, read per request through `admin/settings.ts importLimit`;
+`GET /admin/settings` reports them as `imports` with `envFields`; `GET /imports/limits` reports the
+effective values (plus `maxFileMb`) to any signed-in user, so the Import dialog refuses an oversize
+file before uploading it (a browser cut off mid-upload by the 413 sees a connection reset). The per-version caps stay fixed (the
+item storage contract). Read through one helper per consumer: effective value =
 env (config) when set, else the settings row, else default. Secrets are never returned by the
 API: `GET /admin/settings` reports `clientSecretSet: true`, `tokenSet: true`.
 
@@ -141,10 +150,11 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   `^[A-Za-z0-9_./-]{1,200}$` without `..`. Anything else is 400 `bad_source`.
 - GitHub fetch via the API only, no clone, no code execution: `GET {githubApiUrl}/repos/{o}/{r}/commits/{ref}`
   (-> full sha; 404 -> 400 `bad_source`), then `GET {githubApiUrl}/repos/{o}/{r}/zipball/{sha}`
-  (follow redirects, 60 s timeout, body capped at 35 MB -> 413: the whole repository, compressed)
+  (follow redirects, 60 s timeout, body capped at `import.max_archive_mb`, default 35 MB -> 413 naming
+  the cap: the whole repository, compressed)
   into `safeUnzip` with a `keep` predicate (`underPath`) that skips every entry outside
   `<top>/<path>/` before it is counted, sized or inflated. The archive is held to pack caps
-  (`PACK_LIMITS`: 20,000 files, 64 MB inflated, the process's memory bound), not a version's: each
+  (`PACK_LIMITS`: 20,000 files, `import.max_pack_mb` inflated, default 64 MB, the process's memory bound), not a version's: each
   unit meets the per-version caps (1000 files, 30 MB) in `createItemTx` as it becomes an item, so a
   150-skill repository imports and an oversize unit alone lands in `skipped`, one over the 10 MB
   per-file cap included (`PACK_LIMITS.fileBytes` is the 64 MB total, never a version's cap). Then
@@ -159,6 +169,20 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   non-admin principal (400 `bad_source`): the instance token must not make every account a reader
   of every private repository it reaches. Only `githubApiUrl` is ever contacted (no user-supplied
   hosts).
+- Over the archive cap with a `path` (v3 a4q8; `import/github` and `source/update` alike, `routes.ts`
+  `download` -> `github.ts fetchFolder`): the folder comes through the Git Data API instead. One
+  `GET /repos/{o}/{r}/git/trees/{sha}` per path segment walks the tree shas down (a recursive
+  listing of the whole repository truncates on exactly the repositories that land here; chosen over
+  recursive-then-walk for one code path), then `git/trees/{folder}?recursive=1` (`truncated` -> 413).
+  Junk paths drop out; the blobs are held to the per-version limits (`LIMITS`: 1000 files, 10 MB
+  each, 30 MB) from the listing's sizes, and to the listing's `x-ratelimit-remaining` (more blobs
+  than left -> 400 naming `github.token`, or the token's reset), before any blob is fetched. Each
+  listing is charged to the per-user bucket as it is made, a refused folder's included, then the
+  blobs at once (`ratelimit.ts spend`: the import was admitted by its one `take`, so this never
+  refuses and may go into debt, which the user's next GitHub call waits out), and `git/blobs/{sha}`
+  (raw, 8 at a time, each checked against its git object id) builds the same repository-relative
+  `TreeFile[]` the zipball gives. Mode 120000 is a link (`symlink to ...` in `skipped`, as a51r), 160000 a submodule
+  (`submodule at <7sha>, not imported`; a zipball leaves it out). No `path`: still 413.
 - Pack layout detection (zip and GitHub alike), in order, each hit becomes one item:
   `.claude-plugin/plugin.json` (plugin: `skills/*/SKILL.md`, `agents/*.md`, `commands/*.md`),
   `.claude/skills/*/SKILL.md`, `.claude/agents/*.md`, `.claude/commands/*.md`, `skills/*/SKILL.md`,
@@ -179,7 +203,7 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   optional dotted suffix (`README.de.md`), never a stem that merely starts so (`security-review.md`).
   Nothing recognised at all is 400 `nothing_to_import`, with the skip reasons as `details` when
   there are any. Each returned item carries `op` (`create` | `version` | `unchanged`). At most 200
-  items per import (400 `too_many_items`).
+  items per import by default (`import.max_items`; 400 `too_many_items` naming the cap).
 - Reuse `items/import.ts importUpload` / `items/service.ts createItemTx` for each unit; pass
   `source` on every item. `name` collisions with the user's existing items of that kind: 409
   `name_taken` per unit goes to `skipped`, except when the existing item has the same
@@ -223,7 +247,7 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   renamed upstream while an unrelated item holds the new name is skipped. At the same commit the
   row's `source_ref` still follows the ref named (a tag, then the branch at that commit).
   A private repository is refused to non-admins with the very text a missing repository gets.
-- Body caps: pack 35 MB (added to `UPLOAD_ROUTES` by D0), github JSON 1 MB.
+- Body caps: pack `import.max_archive_mb` (default 35 MB, read per request; added to `UPLOAD_ROUTES` by D0), single-file import the same at most 35 MB, github JSON 1 MB.
 - GitHub quota: one shared identity (the token, or the egress address), so `import/github`,
   `source/check` and `source/update` take from a per-user token bucket (`lib/ratelimit.ts`
   `AUTH_LIMITS.github`: burst 10, 0.2/s; 429 `rate_limited`) before anything leaves; a sha-pinned
