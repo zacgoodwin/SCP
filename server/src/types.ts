@@ -86,6 +86,8 @@ export interface ItemRow {
   source_tree_sha256: string | null;
   /** How the import carved a skill (imports/pack.ts updateTree): the whole folder, or a root SKILL.md with sibling units carved out. */
   source_scope: 'tree' | 'root' | null;
+  /** JSON list of the paths (relative to source_path) other units of the import took out of this skill folder; updateTree leaves them out. */
+  source_carve: string | null;
   forked_from: string | null;
   created_at: string;
   updated_at: string;

@@ -6,6 +6,8 @@ import { HttpError, parseJson, parseQuery } from '../lib/http.ts';
 import { INSTALL_SCOPES, TARGETS, buildBundle, buildManifest, catalogMarkdown } from './bundle.ts';
 import { pluginZip, pluginZipHeaders } from './marketplace.ts';
 import {
+  MAX_GROUP_DESCRIPTION,
+  MAX_GROUP_NAME,
   addInclude,
   addMemberTx,
   createGroup,
@@ -24,8 +26,8 @@ import {
 import type { AppEnv, GroupRow } from '../types.ts';
 
 const fields = {
-  name: z.string().trim().min(1).max(100),
-  description: z.string().max(2000).optional(),
+  name: z.string().trim().min(1).max(MAX_GROUP_NAME),
+  description: z.string().max(MAX_GROUP_DESCRIPTION).optional(),
   instructions: z.string().max(20000).optional(),
   tags: z.array(z.string()).optional(),
   visibility: z.enum(['private', 'shared', 'public']).optional(),

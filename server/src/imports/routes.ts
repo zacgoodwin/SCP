@@ -18,9 +18,10 @@ const groupFields = {
   group: z.string().max(100).optional(),
   groupName: z.string().trim().min(1).max(100).optional(),
 };
-const packFields = z.object(groupFields);
+const packFields = z.object({ ...groupFields, includeRepoTooling: z.enum(['true', 'false']).optional() });
 const githubBody = z.object({
   ...groupFields,
+  includeRepoTooling: z.boolean().optional(),
   url: z.string().max(2000).optional(),
   repo: z.string().max(201).optional(),
   ref: z.string().max(200).optional(),
@@ -118,15 +119,16 @@ importRoutes.post('/items/import/pack', archiveBody, async (c) => {
   const file = form.file;
   if (!(file instanceof File)) throw badRequest("multipart field 'file' is required");
   const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
-  const fields = packFields.safeParse({ visibility: str(form.visibility), group: str(form.group), groupName: str(form.groupName) });
+  const fields = packFields.safeParse({ visibility: str(form.visibility), group: str(form.group), groupName: str(form.groupName), includeRepoTooling: str(form.includeRepoTooling) });
   if (!fields.success) throw badRequest('invalid fields', fields.error.issues);
+  const { includeRepoTooling, ...groupOpts } = fields.data;
   const bytes = new Uint8Array(await file.arrayBuffer());
   const name = baseOf(file.name) || 'pack.zip';
   const { files, top, links } = unpack(bytes, undefined, packLimits(c.var.ctx));
   const rootName = top ?? name.replace(/\.(zip|skill)$/i, '');
   const source: ItemSource = { kind: 'zip', repo: name, ref: null, path: null, commit: sha256Hex(bytes) };
   // A stripped wrapper folder (`zip -r my-skill.zip my-skill/`) is one folder, so its SKILL.md is the whole folder's.
-  const out = importTree(c.var.ctx, p, files, { ...fields.data, source, rootName, folderRoot: top !== null, skipped: linkSkips(links), groupName: fields.data.groupName ?? rootName, note: `import zip ${name}` });
+  const out = importTree(c.var.ctx, p, files, { ...groupOpts, includeRepoTooling: includeRepoTooling === 'true', source, rootName, folderRoot: top !== null, skipped: linkSkips(links), note: `import zip ${name}` });
   return respond(c, p, out, source);
 });
 
@@ -161,7 +163,9 @@ importRoutes.post('/items/import/github', async (c) => {
       kind: body.kind,
       name: body.name,
       group: body.group,
-      groupName: body.groupName ?? repo,
+      groupName: body.groupName,
+      defaultGroupName: repo,
+      includeRepoTooling: body.includeRepoTooling,
       note: `import github ${repo}@${short(sha)} ${src.path ?? ''}`.trimEnd(),
     });
     return respond(c, p, out, source);

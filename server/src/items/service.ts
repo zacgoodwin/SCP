@@ -46,6 +46,8 @@ export interface CreateItemInput {
   source?: ItemSource;
   /** With source: whether the unit was the whole tree or a root SKILL.md carved from its siblings (ItemRow.source_scope). */
   sourceScope?: 'tree' | 'root';
+  /** With source: the paths other units took out of this one (ItemRow.source_carve). */
+  sourceCarve?: string[];
 }
 
 export interface VersionInput {
@@ -447,7 +449,7 @@ function checkVisibility(v: unknown): void {
 // steered by whatever keys a row happens to carry.
 const INSERT_COLUMNS = {
   items: ['id', 'owner_id', 'kind', 'name', 'title', 'description', 'category', 'tags', 'visibility', 'format',
-    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'forked_from', 'created_at', 'updated_at'],
+    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'forked_from', 'created_at', 'updated_at'],
   item_versions: ['id', 'item_id', 'seq', 'entry_path', 'tree_sha256', 'frontmatter', 'lint', 'total_bytes', 'note',
     'created_by_user', 'created_by_key', 'created_by_client', 'created_at'],
 } as const;
@@ -558,6 +560,7 @@ export function createItemTx(
     source_commit: input.source?.commit ?? null,
     source_tree_sha256: null,
     source_scope: input.source ? (input.sourceScope ?? null) : null,
+    source_carve: input.source && input.sourceCarve?.length ? JSON.stringify(input.sourceCarve) : null,
     forked_from: input.forkedFrom ?? null,
     created_at: ts,
     updated_at: ts,

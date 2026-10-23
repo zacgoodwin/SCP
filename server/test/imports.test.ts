@@ -2,7 +2,7 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
-import { strToU8, zipSync } from 'fflate';
+import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
 import { listenLocal, makeTestCtx, type TestCtx } from './helpers.ts';
 import { buildZip } from '../src/lib/zip.ts';
 import { sha256Hex } from '../src/lib/crypto.ts';
@@ -289,7 +289,7 @@ test('pack import: items, group, provenance, skipped lint failures, one audit ro
   assert.deepEqual(names(r.json.items), ['agent:reviewer', 'command:ship', 'skill:pdf']);
   assert.deepEqual(r.json.skipped, [{ path: 'skills/broken', reason: 'frontmatter description is required' }]);
   assert.equal(r.json.group.slug, 'kit');
-  assert.equal(r.json.group.name, 'My Kit');
+  assert.equal(r.json.group.name, 'kit', "the plugin manifest's name, over the zip name");
   assert.equal(r.json.group.owner.username, u.username);
   assert.deepEqual(r.json.group.members.map((m: { item: { name: string } }) => m.item.name).sort(), ['pdf', 'reviewer', 'ship']);
   assert.equal(r.json.source.kind, 'zip');
@@ -378,14 +378,14 @@ test('pack import: group slug taken rolls the whole import back; too many items;
   assert.equal((await pack(t, { Origin: t.config.publicUrl }, 'kit.zip', PLUGIN)).status, 401);
 });
 
-test('github import: url -> pinned commit, provenance, note, group named after the repo, path subtree', async () => {
+test('github import: url -> pinned commit, provenance, note, group named after the plugin, path subtree', async () => {
   gh.repos['acme/kit'] = { default_branch: 'main', refs: { main: SHA_A, 'v1.0': SHA_A }, trees: { [SHA_A]: PLUGIN } };
   const { t, h } = setup();
   const r = await github(t, h, { url: 'https://github.com/acme/kit', group: 'acme-kit' });
   assert.equal(r.status, 201, r.text);
   assert.deepEqual(names(r.json.items), ['agent:reviewer', 'command:ship', 'skill:pdf']);
   assert.deepEqual(r.json.source, { kind: 'github', repo: 'acme/kit', ref: 'main', path: null, commit: SHA_A });
-  assert.equal(r.json.group.name, 'acme/kit');
+  assert.equal(r.json.group.name, 'kit', "the plugin manifest's name, over the repo");
   assert.equal(r.json.group.members.length, 3);
   const pdf = r.json.items.find((i: { name: string }) => i.name === 'pdf');
   assert.deepEqual(pdf.source, { kind: 'github', repo: 'acme/kit', ref: 'main', path: 'skills/pdf', commit: SHA_A });
@@ -1485,4 +1485,716 @@ test('a4q8: a folder refused from its listing still pays for the listings it mad
   // Each refusal spends 1 token to start and 2 for its listings: the burst of 10 admits four.
   for (let i = 0; i < 4; i++) assert.equal((await github(t, h, { repo: 'acme/huge-refused', path: 'docs' })).status, 413);
   assert.equal((await github(t, h, { repo: 'acme/huge-refused', path: 'docs' })).status, 429);
+});
+
+const TASTE_DESC = 'Design taste for agents: rules that keep UI work from looking generated.';
+/** The shape of Leonxlnx/taste-skill (probe 2026-10-22): a plugin manifest with more than SCP reads. */
+const TASTE: Files = {
+  '.claude-plugin/plugin.json': JSON.stringify({ name: 'taste-skill', version: '2.1.4', description: TASTE_DESC, author: { name: 'Leon' }, license: 'MIT', homepage: 'https://example.com/taste' }),
+  'skills/taste/SKILL.md': skill('taste'),
+  'README.md': '# taste-skill\n',
+};
+const withManifest = (files: Files, manifest: unknown, path = '.claude-plugin/plugin.json'): Files => ({ ...files, [path]: typeof manifest === 'string' ? manifest : JSON.stringify(manifest) });
+const marketplace = (plugins: unknown[]) => JSON.stringify({ name: 'market', owner: { name: 'o' }, plugins });
+async function servedPluginJson(t: TestCtx, h: H, slug: string) {
+  const r = await t.req('GET', `${API}/groups/${slug}/plugin.zip`, { headers: h });
+  assert.equal(r.status, 200, r.text);
+  const files = unzipSync(r.bytes);
+  return { files: Object.keys(files).sort(), plugin: JSON.parse(strFromU8(files['.claude-plugin/plugin.json'])), mcp: JSON.parse(strFromU8(files['.mcp.json'])) };
+}
+
+test('5w3w: a plugin import with a group takes the description from the manifest, and plugin.zip serves it (pack and GitHub)', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'taste-skill-main.zip', TASTE, { group: 'taste' });
+  assert.equal(r.status, 201, r.text);
+  assert.equal(r.json.group.description, TASTE_DESC);
+  assert.equal(r.json.group.name, 'taste-skill', "the manifest's name when it has no displayName, not the zip name");
+  assert.deepEqual(r.json.skipped, []);
+  const served = await servedPluginJson(t, h, 'taste');
+  assert.equal(served.plugin.name, 'taste');
+  assert.equal(served.plugin.description, TASTE_DESC);
+
+  gh.repos['leon/taste-skill'] = { default_branch: 'main', refs: { main: sha2('3a') }, trees: { [sha2('3a')]: withManifest(TASTE, { name: 'taste-skill', displayName: '  Taste Skill  ', description: TASTE_DESC }) } };
+  const t2 = setup();
+  const g = await github(t2.t, t2.h, { repo: 'leon/taste-skill', group: 'taste' });
+  assert.equal(g.status, 201, g.text);
+  assert.deepEqual([g.json.group.name, g.json.group.description], ['Taste Skill', TASTE_DESC], 'displayName, trimmed, names the group');
+  assert.equal((await servedPluginJson(t2.t, t2.h, 'taste')).plugin.description, TASTE_DESC);
+});
+
+test('5w3w: a request groupName overrides the manifest displayName; the description still comes from the manifest', async () => {
+  const named = withManifest(TASTE, { name: 'taste-skill', displayName: 'Taste Skill', description: TASTE_DESC });
+  const { t, h } = setup();
+  const r = await pack(t, h, 'taste.zip', named, { group: 'taste', groupName: 'My Taste' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual([r.json.group.name, r.json.group.description], ['My Taste', TASTE_DESC]);
+  gh.repos['leon/taste-named'] = { default_branch: 'main', refs: { main: sha2('3b') }, trees: { [sha2('3b')]: named } };
+  const t2 = setup();
+  const g = await github(t2.t, t2.h, { repo: 'leon/taste-named', group: 'taste', groupName: 'Ours' });
+  assert.equal(g.status, 201, g.text);
+  assert.deepEqual([g.json.group.name, g.json.group.description], ['Ours', TASTE_DESC]);
+});
+
+test('5w3w: a single-plugin marketplace.json with no plugin.json names the group; a multi-plugin one does not; Codex plugin.json is read too', async () => {
+  const base: Files = { 'skills/s/SKILL.md': skill('s') };
+  const { t, h } = setup();
+  const single = await pack(t, h, 'one.zip', withManifest(base, marketplace([{ name: 'solo', displayName: 'Solo', source: './', description: 'From the marketplace.' }]), '.claude-plugin/marketplace.json'), { group: 'one' });
+  assert.equal(single.status, 201, single.text);
+  assert.deepEqual([single.json.group.name, single.json.group.description], ['Solo', 'From the marketplace.']);
+  const t2 = setup();
+  const multi = await pack(t2.t, t2.h, 'two.zip', withManifest(base, marketplace([{ name: 'a', source: './', description: 'A' }, { name: 'b', source: './', description: 'B' }]), '.claude-plugin/marketplace.json'), { group: 'two' });
+  assert.equal(multi.status, 201, multi.text);
+  assert.deepEqual([multi.json.group.name, multi.json.group.description], ['two', '']);
+  const t3 = setup();
+  const codex = await pack(t3.t, t3.h, 'cx.zip', withManifest(base, { name: 'cx', description: 'Codex plugin.' }, '.codex-plugin/plugin.json'), { group: 'cx' });
+  assert.equal(codex.json.group.description, 'Codex plugin.');
+  // plugin.json comes first.
+  const t4 = setup();
+  const both = await pack(t4.t, t4.h, 'both.zip', withManifest(withManifest(base, { description: 'Plugin.' }), marketplace([{ name: 'm', source: './', description: 'Market.' }]), '.claude-plugin/marketplace.json'), { group: 'both' });
+  assert.equal(both.json.group.description, 'Plugin.');
+});
+
+test('5w3w: a malformed, non-object, oversize or wrongly typed manifest falls back to today, with a skipped entry, never a 4xx/5xx', async () => {
+  const P = '.claude-plugin/plugin.json';
+  const cases: [unknown, string[]][] = [
+    ['{"name": "taste", ', ['plugin manifest ignored: not valid JSON']],
+    ['["taste"]', ['plugin manifest ignored: not a JSON object']],
+    ['"taste"', ['plugin manifest ignored: not a JSON object']],
+    ['null', ['plugin manifest ignored: not a JSON object']],
+    [`{"description":"${noise(1.01)}"}`, ['plugin manifest ignored: larger than 1024 KB']],
+    [{ description: 'x'.repeat(2001) }, ["plugin manifest field ignored: 'description' is longer than 2000 characters"]],
+    [{ displayName: 'x'.repeat(101), description: 'Fine.' }, ["plugin manifest field ignored: 'displayName' is longer than 100 characters"]],
+    [{ displayName: ['Taste'], description: 42 }, ["plugin manifest field ignored: 'displayName' is not a string", "plugin manifest field ignored: 'description' is not a string"]],
+  ];
+  for (const [manifest, reasons] of cases) {
+    const { t, h } = setup();
+    const r = await pack(t, h, 'taste.zip', withManifest(TASTE, manifest), { group: 'taste' });
+    const label = String(typeof manifest === 'string' ? manifest : JSON.stringify(manifest)).slice(0, 60);
+    assert.equal(r.status, 201, `${label}: ${r.text.slice(0, 300)}`);
+    assert.deepEqual(r.json.skipped, reasons.map((reason) => ({ path: P, reason })), label);
+    assert.equal(r.json.group.name, 'taste', label);
+    assert.equal(r.json.group.description, (manifest as { description?: unknown }).description === 'Fine.' ? 'Fine.' : '', label);
+    assert.deepEqual(names(r.json.items), ['skill:taste'], label);
+  }
+  // A broken marketplace.json is reported by detection, once, group or not.
+  const { t, h } = setup();
+  const m = await pack(t, h, 'm.zip', withManifest({ 'skills/s/SKILL.md': skill('s') }, '{oops', '.claude-plugin/marketplace.json'), { group: 'mk' });
+  assert.equal(m.status, 201, m.text);
+  assert.deepEqual(m.json.skipped, [{ path: '.claude-plugin/marketplace.json', reason: 'marketplace manifest ignored: not valid JSON' }]);
+  assert.equal(m.json.group.description, '');
+});
+
+test('5w3w: imports without a group are unchanged: no manifest is read and none is reported', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'taste.zip', TASTE);
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual([r.json.group, r.json.skipped], [null, []]);
+  const bad = await pack(t, h, 'bad.zip', withManifest({ 'skills/b/SKILL.md': skill('b') }, '{nope'));
+  assert.equal(bad.status, 201, bad.text);
+  assert.deepEqual([bad.json.group, bad.json.skipped], [null, []]);
+  assert.equal((t.db.prepare('SELECT COUNT(*) AS n FROM scp_groups').get() as { n: number }).n, 0);
+});
+
+const agentMd = (name: string) => `---\nname: ${name}\ndescription: The ${name} agent.\n---\nYou are ${name}.\n`;
+/** A marketplace repository: plugin a has its own plugin.json, plugin b is only a marketplace source. */
+const MARKET: Files = {
+  '.claude-plugin/marketplace.json': marketplace([
+    { name: 'b', source: './plugins/b' },
+    { name: 'ext', source: { source: 'github', repo: 'other/repo' } },
+    { name: 'url', source: 'https://example.com/p.git' },
+    { name: 'bare', source: 'plugins/b' },
+    { name: 'up', source: './../outside' },
+    { name: 'deep', source: './plugins/../../x' },
+  ]),
+  'plugins/a/.claude-plugin/plugin.json': '{"name":"a"}',
+  'plugins/a/agents/x.md': agentMd('x-agent'),
+  'plugins/a/agents/sub/deep.md': agentMd('deep'),
+  'plugins/a/commands/y.md': 'Do y.\n',
+  'plugins/a/skills/z/SKILL.md': skill('z'),
+  'plugins/a/README.md': '# a\n',
+  'plugins/b/agents/w.md': agentMd('w-agent'),
+  'plugins/b/commands/v.md': 'Do v.\n',
+  'tools/agents/stray.md': agentMd('stray'),
+  'tools/commands/loose.md': 'Loose.\n',
+  'README.md': '# Market\n',
+};
+const MARKET_SKIPPED = [
+  { path: '.claude-plugin/marketplace.json', reason: "plugin 'ext': source github other/repo is not a path in this repository; not followed" },
+  { path: '.claude-plugin/marketplace.json', reason: "plugin 'url': source 'https://example.com/p.git' is not a path in this repository; not followed" },
+  { path: '.claude-plugin/marketplace.json', reason: "plugin 'bare': source 'plugins/b' is not a path in this repository; not followed" },
+  { path: '.claude-plugin/marketplace.json', reason: "plugin 'up': source './../outside' escapes the repository; not followed" },
+  { path: '.claude-plugin/marketplace.json', reason: "plugin 'deep': source './plugins/../../x' escapes the repository; not followed" },
+  { path: 'plugins/a/agents/sub/deep.md', reason: 'nested under plugins/a/agents/: only plugins/a/agents/*.md is imported' },
+  { path: 'tools/agents/stray.md', reason: 'agents/ below the repository root is imported only inside a plugin (.claude-plugin/plugin.json)' },
+  { path: 'tools/commands/loose.md', reason: 'commands/ below the repository root is imported only inside a plugin (.claude-plugin/plugin.json)' },
+];
+const MARKET_ITEMS = ['agent:w-agent', 'agent:x-agent', 'command:v', 'command:y', 'skill:z'];
+
+test('bppq: nested plugins (their own plugin.json, or a marketplace source) import their agents, commands and skills; foreign and escaping sources are skipped', () => {
+  const d = detectUnits(tree(MARKET), 'market');
+  assert.deepEqual(d.units.map((u) => [u.kind, u.path]), [
+    ['skill', 'plugins/a/skills/z'],
+    ['agent', 'plugins/a/agents/x.md'],
+    ['command', 'plugins/a/commands/y.md'],
+    ['agent', 'plugins/b/agents/w.md'],
+    ['command', 'plugins/b/commands/v.md'],
+  ]);
+  assert.equal(d.units[2].name, 'y', 'a command is named by its file, as at the root');
+  assert.deepEqual(d.skipped, MARKET_SKIPPED);
+  // A nested plugin claims its own files before the plugin around it.
+  const nested = detectUnits(tree({ '.claude-plugin/plugin.json': '{}', 'agents/top.md': agentMd('top'), 'agents/inner/.claude-plugin/plugin.json': '{}', 'agents/inner/agents/i.md': agentMd('i') }), 'x');
+  assert.deepEqual(nested.units.map((u) => [u.kind, u.path]), [['agent', 'agents/inner/agents/i.md'], ['agent', 'agents/top.md']]);
+  // A marketplace source at the root ('./') is the root: nothing changes.
+  assert.deepEqual(detectUnits(tree({ '.claude-plugin/marketplace.json': marketplace([{ name: 'r', source: './' }]), 'agents/r.md': agentMd('r') }), 'x').units.map((u) => u.path), ['agents/r.md']);
+  // Linear in plugin roots too: each root's layout folders come from the folder index, not a scan of the tree.
+  const many: Files = {};
+  for (let i = 0; i < 5000; i++) Object.assign(many, { [`p/${i}/.claude-plugin/plugin.json`]: '{}', [`p/${i}/agents/a${i}.md`]: agentMd(`a${i}`), [`p/${i}/docs/n.md`]: 'n' });
+  const start = performance.now();
+  const big = detectUnits(tree(many), 'many');
+  assert.equal(big.units.length, 5000);
+  assert.equal(big.skipped.length, 5000);
+  assert.ok(performance.now() - start < 1000, `took ${Math.round(performance.now() - start)} ms`);
+});
+
+test('bppq: a marketplace repository imports every nested plugin through the pack and GitHub routes; a name clash between plugins is reported as such', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'market.zip', MARKET);
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), MARKET_ITEMS);
+  assert.deepEqual(r.json.skipped, MARKET_SKIPPED);
+  assert.equal(r.json.items.find((i: { name: string }) => i.name === 'x-agent').source.path, 'plugins/a/agents/x.md');
+
+  gh.repos['acme/market'] = { default_branch: 'main', refs: { main: sha2('3c') }, trees: { [sha2('3c')]: MARKET } };
+  const t2 = setup();
+  const g = await github(t2.t, t2.h, { repo: 'acme/market' });
+  assert.equal(g.status, 201, g.text);
+  assert.deepEqual(names(g.json.items), MARKET_ITEMS);
+  assert.deepEqual(g.json.skipped, MARKET_SKIPPED);
+
+  // claude-plugins-official ships the same agent name in two plugins: the second is a clash, not a silent drop.
+  const t3 = setup();
+  const clash = await pack(t3.t, t3.h, 'clash.zip', {
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    'plugins/a/agents/reviewer.md': AGENT,
+    'plugins/b/.claude-plugin/plugin.json': '{}',
+    'plugins/b/agents/reviewer.md': AGENT,
+    'plugins/b/commands/go.md': 'Go.\n',
+    'README.md': '# Clash\n',
+  });
+  assert.equal(clash.status, 201, clash.text);
+  assert.deepEqual(names(clash.json.items), ['agent:reviewer', 'command:go']);
+  assert.equal(clash.json.items[0].source.path, 'plugins/a/agents/reviewer.md');
+  assert.deepEqual(clash.json.skipped, [{ path: 'plugins/b/agents/reviewer.md', reason: "you already have an agent named 'reviewer', imported from plugins/a/agents/reviewer.md of clash.zip" }]);
+  // GitHub alike. A clash with another source keeps its own reason (the tools.zip case above).
+  gh.repos['acme/clash'] = { default_branch: 'main', refs: { main: sha2('3f') }, trees: { [sha2('3f')]: { 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/agents/rev.md': agentMd('rev'), 'plugins/b/.claude-plugin/plugin.json': '{}', 'plugins/b/agents/rev.md': agentMd('rev'), 'README.md': '#\n' } } };
+  const gc = await github(t3.t, t3.h, { repo: 'acme/clash' });
+  assert.equal(gc.status, 201, gc.text);
+  assert.deepEqual(gc.json.skipped, [{ path: 'plugins/b/agents/rev.md', reason: "you already have an agent named 'rev', imported from plugins/a/agents/rev.md of acme/clash" }]);
+});
+
+test('bppq: source/update of a nested-plugin agent and command re-carves them the same way', async () => {
+  const next = { ...MARKET, 'plugins/a/agents/x.md': agentMd('x-agent') + 'Now better.\n', 'plugins/b/commands/v.md': 'Do v twice.\n' };
+  gh.repos['acme/market-live'] = { default_branch: 'main', refs: { main: sha2('3d') }, trees: { [sha2('3d')]: MARKET, [sha2('3e')]: next } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo: 'acme/market-live' });
+  assert.equal(imp.status, 201, imp.text);
+  gh.repos['acme/market-live'].refs.main = sha2('3e');
+  for (const [name, text] of [['x-agent', next['plugins/a/agents/x.md']], ['v', next['plugins/b/commands/v.md']]]) {
+    const item = imp.json.items.find((i: { name: string }) => i.name === name);
+    const up = await t.req('POST', `${API}/items/${item.id}/source/update`, { headers: h });
+    assert.equal(up.status, 200, up.text);
+    assert.equal(up.json.item.version.seq, 2, name);
+    const files = up.json.item.version.files as { path: string }[];
+    assert.equal(files.length, 1, name);
+    const body = await t.req('GET', `${API}/items/${item.id}/files/${files[0].path}`, { headers: h });
+    assert.equal(body.text, text, name);
+  }
+});
+
+test('bppq: source/update of a skill at a plugin root keeps out the agents the import carved; a folder import of it keeps them', async () => {
+  const P: Files = { 'plugins/a/.claude-plugin/plugin.json': '{"name":"a"}', 'plugins/a/SKILL.md': skill('a'), 'plugins/a/agents/x.md': agentMd('x'), 'plugins/a/scripts/run.sh': 'echo' };
+  gh.repos['acme/plugin-skill'] = { default_branch: 'main', refs: { main: sha2('b5') }, trees: { [sha2('b5')]: P, [sha2('b6')]: { ...P, 'plugins/a/SKILL.md': skill('a', 'Better.') } } };
+  const files = (it: { version: { files: { path: string }[] } }) => it.version.files.map((f) => f.path);
+  const update = async (path?: string) => {
+    gh.repos['acme/plugin-skill'].refs.main = sha2('b5');
+    const { t, h } = setup();
+    const imp = await github(t, h, { repo: 'acme/plugin-skill', path });
+    assert.equal(imp.status, 201, imp.text);
+    const sk = imp.json.items.find((i: { kind: string }) => i.kind === 'skill');
+    gh.repos['acme/plugin-skill'].refs.main = sha2('b6');
+    const up = await t.req('POST', `${API}/items/${sk.id}/source/update`, { headers: h });
+    assert.equal(up.status, 200, up.text);
+    return [names(imp.json.items), files(sk), files(up.json.item)];
+  };
+  const carved = ['.claude-plugin/plugin.json', 'SKILL.md', 'scripts/run.sh'];
+  assert.deepEqual(await update(), [['agent:x', 'skill:a'], carved, carved]);
+  const whole = ['.claude-plugin/plugin.json', 'SKILL.md', 'agents/x.md', 'scripts/run.sh'];
+  assert.deepEqual(await update('plugins/a'), [['skill:a'], whole, whole]);
+});
+
+test('5w3w: a bad marketplace.json is reported once when no detection pass reads it (a folder zip, a kind override)', async () => {
+  const bad: Files = { 'SKILL.md': skill('mine'), '.claude-plugin/marketplace.json': '{oops' };
+  const expected = [{ path: '.claude-plugin/marketplace.json', reason: 'marketplace manifest ignored: not valid JSON' }];
+  const { t, h } = setup();
+  const z = await pack(t, h, 'my-plugin.zip', Object.fromEntries(Object.entries(bad).map(([k, v]) => [`my-plugin/${k}`, v])), { group: 'mp' });
+  assert.equal(z.status, 201, z.text);
+  assert.deepEqual(z.json.skipped, expected);
+  gh.repos['acme/bad-market'] = { default_branch: 'main', refs: { main: sha2('b7') }, trees: { [sha2('b7')]: bad } };
+  const t2 = setup();
+  const g = await github(t2.t, t2.h, { repo: 'acme/bad-market', kind: 'skill', group: 'kk' });
+  assert.equal(g.status, 201, g.text);
+  assert.deepEqual(g.json.skipped, expected);
+  // Without a group the manifest is not read for metadata, so these imports stay as they were.
+  const t3 = setup();
+  assert.deepEqual((await github(t3.t, t3.h, { repo: 'acme/bad-market', kind: 'skill' })).json.skipped, []);
+});
+
+test('dnxq: a plugin\'s hooks, MCP servers, output styles, settings, LSP and monitors are reported in skipped, once each; nothing else changes', async () => {
+  const HOOKED: Files = {
+    '.claude-plugin/plugin.json': '{"name":"hooked"}',
+    'skills/h/SKILL.md': skill('h'),
+    'hooks/hooks.json': '{"hooks":{}}',
+    'hooks/run.sh': '#!/bin/sh\necho pwned\n',
+    '.mcp.json': '{"mcpServers":{"evil":{"command":"sh"}}}',
+    'output-styles/terse.md': '# Terse\n',
+    'output-styles/loud.md': '# Loud\n',
+    'plugins/n/.claude-plugin/plugin.json': '{"name":"n"}',
+    'plugins/n/commands/go.md': 'Go.\n',
+    'plugins/n/settings.json': '{}',
+    'plugins/n/.lsp.json': '{}',
+    'plugins/n/monitors/m.json': '{}',
+  };
+  const reason = (c: string) => `plugin ${c} is not supported by SCP; it was not imported`;
+  const expected = [
+    { path: '.mcp.json', reason: reason('.mcp.json') },
+    { path: 'hooks', reason: reason('hooks/') },
+    { path: 'output-styles', reason: reason('output-styles/') },
+    { path: 'plugins/n/.lsp.json', reason: reason('.lsp.json') },
+    { path: 'plugins/n/monitors', reason: reason('monitors/') },
+    { path: 'plugins/n/settings.json', reason: reason('settings.json') },
+  ];
+  const byPath = (a: { path: string }, b: { path: string }) => a.path.localeCompare(b.path);
+  assert.deepEqual(detectUnits(tree(HOOKED), 'hooked').skipped.sort(byPath), expected);
+  const { t, h } = setup();
+  const r = await pack(t, h, 'hooked.zip', HOOKED, { group: 'hooked' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['command:go', 'skill:h']);
+  assert.deepEqual(r.json.items.find((i: { name: string }) => i.name === 'h').version.files.map((f: { path: string }) => f.path), ['SKILL.md']);
+  assert.deepEqual([...r.json.skipped].sort(byPath), expected);
+  // Served: SCP's own .mcp.json only, no hooks or output styles.
+  const served = await servedPluginJson(t, h, 'hooked');
+  assert.deepEqual(served.files, ['.claude-plugin/plugin.json', '.mcp.json', 'commands/go.md', 'skills/h/SKILL.md']);
+  assert.deepEqual(Object.keys(served.mcp.mcpServers), ['scp-hooked']);
+  // Outside a plugin these are ordinary files: an .mcp.json or settings.json is not reported, an .md is told as before.
+  const plain = detectUnits(tree({ 'skills/p/SKILL.md': skill('p'), '.mcp.json': '{}', 'settings.json': '{}', 'output-styles/x.md': '# x' }), 'plain');
+  assert.deepEqual(plain.skipped, [{ path: 'output-styles/x.md', reason: 'not inside a recognised layout folder' }]);
+});
+
+const unitsOf = (d: { units: { kind: string; path: string }[] }) => d.units.map((u) => [u.kind, u.path]);
+/** A plugin whose manifest names its components outside SCP's folder conventions. */
+const ODD: Files = {
+  '.claude-plugin/plugin.json': JSON.stringify({ name: 'odd', skills: ['./src/my-skill', './plugin-skills/', './skills/c'], commands: './cmds', agents: ['./bots/helper.md'] }),
+  'src/my-skill/SKILL.md': skill('my-skill'),
+  'src/my-skill/lib/run.py': 'print(1)\n',
+  'plugin-skills/a/SKILL.md': skill('a'),
+  'plugin-skills/b/SKILL.md': skill('b'),
+  'cmds/deploy.md': 'Deploy it.\n',
+  'cmds/README.md': '# Commands\n',
+  'bots/helper.md': agentMd('helper'),
+  'bots/other.md': agentMd('other'),
+  'skills/c/SKILL.md': skill('c'),
+  'agents/x.md': agentMd('x-agent'),
+  'README.md': '# Odd\n',
+};
+
+test('4ky8: skills, commands and agents at non-standard manifest paths import as their kinds; conventions pick up the rest once', async () => {
+  const d = detectUnits(tree(ODD), 'odd');
+  assert.deepEqual(unitsOf(d), [
+    ['skill', 'src/my-skill'],
+    ['skill', 'plugin-skills/a'],
+    ['skill', 'plugin-skills/b'],
+    ['skill', 'skills/c'],
+    ['agent', 'bots/helper.md'],
+    ['command', 'cmds/deploy.md'],
+    ['agent', 'agents/x.md'],
+  ]);
+  assert.deepEqual(d.units[0].tree.map((f) => f.path).sort(), ['SKILL.md', 'lib/run.py']);
+  assert.equal(d.units[5].name, 'deploy', 'a declared command is named by its file');
+  // An undeclared file in a declared agent's folder is not an item; a README in a declared command folder is docs.
+  assert.deepEqual(d.skipped, [
+    { path: 'cmds/README.md', reason: 'repository documentation, not an item' },
+    { path: 'bots/other.md', reason: 'not inside a recognised layout folder' },
+  ]);
+  const { t, h } = setup();
+  const r = await pack(t, h, 'odd.zip', ODD);
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['agent:helper', 'agent:x-agent', 'command:deploy', 'skill:a', 'skill:b', 'skill:c', 'skill:my-skill']);
+  // A marketplace entry's own paths are relative to its source.
+  const market = detectUnits(tree({ '.claude-plugin/marketplace.json': marketplace([{ name: 'm', source: './p/m', commands: ['./ops/go.md'] }]), 'p/m/ops/go.md': 'Go.\n' }), 'x');
+  assert.deepEqual(unitsOf(market), [['command', 'p/m/ops/go.md']]);
+});
+
+test('4ky8: escaping, absolute and missing manifest paths are skipped with a reason; the rest imports', async () => {
+  const P = '.claude-plugin/plugin.json';
+  const files = withManifest({ 'skills/ok/SKILL.md': skill('ok'), 'cmds/go.md': 'Go.\n', 'escape/SKILL.md': skill('escape') }, {
+    skills: ['../escape', '/etc', 'C:/x', 'a\\b', './nowhere', 7],
+    commands: ['./cmds', './cmds/../../up'],
+    agents: { path: './bots' },
+  });
+  const d = detectUnits(tree(files), 'p');
+  // escape/ is still a skill: the generic SKILL.md pass finds it, as without a manifest.
+  assert.deepEqual(unitsOf(d), [['command', 'cmds/go.md'], ['skill', 'skills/ok'], ['skill', 'escape']]);
+  const expected = [
+    { path: P, reason: "skills path '../escape' escapes the plugin; not followed" },
+    { path: P, reason: "skills path '/etc' is not relative to the plugin; not followed" },
+    { path: P, reason: "skills path 'C:/x' is not relative to the plugin; not followed" },
+    { path: P, reason: "skills path 'a\\b' is not relative to the plugin; not followed" },
+    { path: P, reason: "skills path './nowhere' holds no SKILL.md; not imported" },
+    { path: P, reason: "skills path '7' is not a path" },
+    { path: P, reason: "'agents' is not a path or a list of paths" },
+    { path: P, reason: "commands path './cmds/../../up' escapes the plugin; not followed" },
+  ];
+  assert.deepEqual(d.skipped, expected);
+  // A nested plugin cannot reach its parent's files either.
+  const nested = detectUnits(tree({ 'plugins/n/.claude-plugin/plugin.json': JSON.stringify({ agents: '../../agents/top.md' }), 'agents/top.md': agentMd('top') }), 'x');
+  assert.deepEqual(nested.skipped, [{ path: 'plugins/n/.claude-plugin/plugin.json', reason: "agents path '../../agents/top.md' escapes the plugin; not followed" }]);
+  const { t, h } = setup();
+  const r = await pack(t, h, 'bad-paths.zip', files);
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['command:go', 'skill:escape', 'skill:ok']);
+  assert.deepEqual(r.json.skipped, expected);
+});
+
+test('4ky8: a remote marketplace source is skipped with a reason and never fetched', async () => {
+  const files: Files = {
+    '.claude-plugin/marketplace.json': marketplace([
+      { name: 'local', source: './plugins/local' },
+      { name: 'gh', source: { source: 'github', repo: 'far/away' }, skills: ['./skills/x'] },
+      { name: 'sub', source: { source: 'git-subdir', url: 'https://example.com/far.git', path: 'p' } },
+    ]),
+    'plugins/local/commands/go.md': 'Go.\n',
+  };
+  gh.repos['acme/remote-src'] = { default_branch: 'main', refs: { main: sha2('8a') }, trees: { [sha2('8a')]: files } };
+  const { t, h } = setup();
+  const from = gh.requests.length;
+  const r = await github(t, h, { repo: 'acme/remote-src' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['command:go']);
+  assert.deepEqual(r.json.skipped.map((s: { reason: string }) => s.reason), [
+    "plugin 'gh': source github far/away is not a path in this repository; not followed",
+    "plugin 'sub': source git-subdir https://example.com/far.git is not a path in this repository; not followed",
+  ]);
+  const urls = gh.requests.slice(from).map((q) => q.url);
+  assert.ok(urls.every((u) => u.startsWith('/repos/acme/remote-src') || u.startsWith('/zip/')), urls.join(' '));
+  assert.equal(urls.length, 4, 'metadata, commit, zipball redirect, zip: nothing for the remote sources');
+});
+
+test("4ky8: taste-skill's real manifest (a skills path naming its conventional folder) imports exactly as without it", async () => {
+  const real: Files = { ...TASTE, 'skills/taste-skill/SKILL.md': skill('taste') };
+  delete real['skills/taste/SKILL.md'];
+  const withPaths = withManifest(real, { name: 'taste-skill', description: TASTE_DESC, skills: ['./skills/taste-skill'] });
+  assert.deepEqual(detectUnits(tree(withPaths), 'taste'), detectUnits(tree(real), 'taste'));
+  const { t, h } = setup();
+  const r = await pack(t, h, 'taste.zip', withPaths, { group: 'taste' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual([names(r.json.items), r.json.skipped, r.json.group.description], [['skill:taste'], [], TASTE_DESC]);
+});
+
+test('4ky8: source/update of a manifest-path skill, command and agent re-carves them the way the import did', async () => {
+  const next: Files = { ...ODD, 'src/my-skill/SKILL.md': skill('my-skill', 'Better.'), 'src/my-skill/lib/new.py': 'print(2)\n', 'cmds/deploy.md': 'Deploy twice.\n', 'bots/helper.md': agentMd('helper') + 'More.\n' };
+  gh.repos['acme/odd'] = { default_branch: 'main', refs: { main: sha2('8b') }, trees: { [sha2('8b')]: ODD, [sha2('8c')]: next } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo: 'acme/odd' });
+  assert.equal(imp.status, 201, imp.text);
+  gh.repos['acme/odd'].refs.main = sha2('8c');
+  const byName = (n: string) => imp.json.items.find((i: { name: string }) => i.name === n);
+  const up = async (n: string) => {
+    const r = await t.req('POST', `${API}/items/${byName(n).id}/source/update`, { headers: h });
+    assert.equal(r.status, 200, r.text);
+    return r.json.item;
+  };
+  const sk = await up('my-skill');
+  assert.deepEqual([sk.description, filePaths(sk).sort()], ['Better.', ['SKILL.md', 'lib/new.py', 'lib/run.py']]);
+  for (const n of ['deploy', 'helper']) {
+    const it = await up(n);
+    assert.equal(filePaths(it).length, 1, n);
+    const body = await t.req('GET', `${API}/items/${it.id}/files/${filePaths(it)[0]}`, { headers: h });
+    assert.equal(body.text, next[n === 'deploy' ? 'cmds/deploy.md' : 'bots/helper.md'], n);
+  }
+});
+
+/** The shape of rtk-ai/rtk (survey 2026-10-22): the product, plus the maintainers' own agent tooling. */
+const RTK: Files = {
+  'skills/rtk/SKILL.md': skill('rtk'),
+  '.claude/skills/ship/SKILL.md': skill('ship'),
+  '.claude/skills/tdd-rust/SKILL.md': skill('tdd-rust'),
+  '.claude/agents/code-simplifier.md': agentMd('code-simplifier'),
+  '.claude/commands/release.md': 'Release.\n',
+  '.agents/skills/rust-rtk/SKILL.md': skill('rust-rtk'),
+  '.gemini/skills/gem/SKILL.md': skill('gem'),
+  '.opencode/skills/oc/SKILL.md': skill('oc'),
+  'CLAUDE.md': '# Working on rtk\n',
+  'AGENTS.md': '# Contributing agents\n',
+  'GEMINI.md': '# Gemini rules\n',
+  'README.md': '# rtk\n',
+};
+const RTK_ALL = [
+  ['skill', '.claude/skills/ship'],
+  ['skill', '.claude/skills/tdd-rust'],
+  ['skill', 'skills/rtk'],
+  ['agent', '.claude/agents/code-simplifier.md'],
+  ['command', '.claude/commands/release.md'],
+  ['skill', '.agents/skills/rust-rtk'],
+  ['skill', '.gemini/skills/gem'],
+  ['skill', '.opencode/skills/oc'],
+  ['instructions', 'AGENTS.md'],
+  ['instructions', 'CLAUDE.md'],
+];
+
+test('4ky8 part 2: a repository that ships a plugin or a skills/ folder skips its maintainer tooling, listed in skipped; includeRepoTooling imports it all', async () => {
+  const plugin = withManifest(RTK, { name: 'rtk' });
+  const why = (signal: string) => `maintainer tooling (repo ships ${signal})`;
+  const dirs = ['.claude/skills', '.claude/agents', '.claude/commands', '.agents/skills', '.gemini/skills', '.opencode/skills'];
+  const p = detectUnits(tree(plugin), 'rtk');
+  assert.deepEqual(unitsOf(p), [['skill', 'skills/rtk']]);
+  const pluginSkips = [...dirs, 'AGENTS.md', 'CLAUDE.md', 'GEMINI.md'].map((path) => ({ path, reason: why('a plugin') }));
+  assert.deepEqual(p.skipped, pluginSkips);
+  // A skills/ folder alone: the tool folders go, the root instructions stay (they may be the product).
+  const s = detectUnits(tree(RTK), 'rtk');
+  assert.deepEqual(unitsOf(s), [['skill', 'skills/rtk'], ['instructions', 'AGENTS.md'], ['instructions', 'CLAUDE.md']]);
+  assert.deepEqual(s.skipped.slice(0, dirs.length), dirs.map((path) => ({ path, reason: why('a skills/ folder') })));
+  assert.deepEqual(s.skipped.slice(dirs.length), [{ path: 'GEMINI.md', reason: 'not inside a recognised layout folder' }], 'GEMINI.md is reported as before');
+  // includeRepoTooling: today's units.
+  assert.deepEqual(unitsOf(detectUnits(tree(plugin), 'rtk', { includeRepoTooling: true })), RTK_ALL);
+  assert.deepEqual(unitsOf(detectUnits(tree(RTK), 'rtk', { includeRepoTooling: true })), RTK_ALL);
+
+  const { t, h } = setup();
+  const r = await pack(t, h, 'rtk.zip', plugin);
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual([names(r.json.items), r.json.skipped], [['skill:rtk'], pluginSkips]);
+  const t2 = setup();
+  const every = await pack(t2.t, t2.h, 'rtk.zip', plugin, { includeRepoTooling: 'true' });
+  assert.equal(every.status, 201, every.text);
+  assert.equal(every.json.items.length, RTK_ALL.length);
+  assert.deepEqual(every.json.skipped, [{ path: 'GEMINI.md', reason: 'not inside a recognised layout folder' }], 'as today');
+  assert.equal((await pack(t2.t, t2.h, 'x.zip', plugin, { includeRepoTooling: 'yes' })).status, 400);
+
+  gh.repos['rtk-ai/rtk'] = { default_branch: 'main', refs: { main: sha2('8d') }, trees: { [sha2('8d')]: plugin } };
+  const t3 = setup();
+  const g = await github(t3.t, t3.h, { repo: 'rtk-ai/rtk' });
+  assert.equal(g.status, 201, g.text);
+  assert.deepEqual([names(g.json.items), g.json.skipped], [['skill:rtk'], pluginSkips]);
+  const t4 = setup();
+  const ga = await github(t4.t, t4.h, { repo: 'rtk-ai/rtk', includeRepoTooling: true });
+  assert.equal(ga.status, 201, ga.text);
+  assert.equal(ga.json.items.length, RTK_ALL.length);
+});
+
+test('4ky8 part 2: a repository with no product signal imports its .claude/ folder and CLAUDE.md exactly as before', () => {
+  for (const files of [
+    { '.claude/skills/a/SKILL.md': skill('a'), '.claude/agents/x.md': AGENT, '.claude/commands/go.md': 'go', 'CLAUDE.md': '# Rules\n' },
+    { 'CLAUDE.md': '# Rules\n', 'src/main.rs': '' },
+    { '.agents/skills/b/SKILL.md': skill('b'), 'AGENTS.md': '# Rules\n' },
+  ] as Files[]) {
+    assert.deepEqual(detectUnits(tree(files), 'r'), detectUnits(tree(files), 'r', { includeRepoTooling: true }), Object.keys(files).join(' '));
+    assert.ok(detectUnits(tree(files), 'r').units.length >= 1);
+  }
+});
+
+test('4ky8 part 2: source/update of a root skill in a plugin repository does not take in the tooling the import skipped', async () => {
+  const v1: Files = { '.claude-plugin/plugin.json': '{"name":"solo"}', 'SKILL.md': skill('solo'), 'scripts/a.sh': 'a', 'CLAUDE.md': '# dev\n', '.claude/agents/dev.md': agentMd('dev') };
+  const v2: Files = { ...v1, 'SKILL.md': skill('solo', 'v2'), '.claude/skills/new/SKILL.md': skill('new') };
+  gh.repos['acme/solo-plugin'] = { default_branch: 'main', refs: { main: sha2('8e') }, trees: { [sha2('8e')]: v1, [sha2('8f')]: v2 } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo: 'acme/solo-plugin' });
+  assert.equal(imp.status, 201, imp.text);
+  assert.deepEqual(names(imp.json.items), ['skill:solo']);
+  const before = filePaths(imp.json.items[0]).sort();
+  assert.deepEqual(before, ['.claude-plugin/plugin.json', 'SKILL.md', 'scripts/a.sh']);
+  gh.repos['acme/solo-plugin'].refs.main = sha2('8f');
+  const up = await t.req('POST', `${API}/items/${imp.json.items[0].id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.deepEqual([up.json.item.description, filePaths(up.json.item).sort()], ['v2', before]);
+});
+
+const portSkill = (name: string, claude: boolean) =>
+  `---\nname: ${name}\ndescription: Does ${name} things.\n${claude ? 'allowed-tools: Read, Grep\nargument-hint: <spec>\n' : ''}---\n# ${name}\n${claude ? '!`cat spec.md`\n' : ''}Body.\n`;
+/** The shape of Code-My-Spec/plugins (import test 2026-10-22): one skill set, ported to three tools. */
+const CMS = (extra = ''): Files => ({
+  '.claude-plugin/marketplace.json': marketplace([{ name: 'codemyspec', source: './plugins/codemyspec' }]),
+  'antigravity/codemyspec/skills/spec/SKILL.md': portSkill('spec', false),
+  'antigravity/codemyspec/skills/plan/SKILL.md': portSkill('plan', false),
+  'codex/codemyspec/skills/spec/SKILL.md': portSkill('spec', false),
+  'plugins/codemyspec/.claude-plugin/plugin.json': '{"name":"codemyspec"}',
+  'plugins/codemyspec/skills/spec/SKILL.md': portSkill('spec', true) + extra,
+  'plugins/codemyspec/skills/plan/SKILL.md': portSkill('plan', true),
+});
+const portReason = (path: string, tool: string) => `another copy of this skill (${path}) was imported; this one is the ${tool} port`;
+const CMS_SKIPPED = [
+  { path: 'antigravity/codemyspec/skills/plan', reason: portReason('plugins/codemyspec/skills/plan', 'antigravity') },
+  { path: 'antigravity/codemyspec/skills/spec', reason: portReason('plugins/codemyspec/skills/spec', 'antigravity') },
+  { path: 'codex/codemyspec/skills/spec', reason: portReason('plugins/codemyspec/skills/spec', 'codex') },
+];
+
+test('ypmn: a multi-tool repository keeps the Claude Code copy of each skill and skips the ports, saying so', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'cms.zip', CMS());
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:plan', 'skill:spec']);
+  assert.deepEqual(r.json.items.map((i: { source: { path: string } }) => i.source.path).sort(), ['plugins/codemyspec/skills/plan', 'plugins/codemyspec/skills/spec']);
+  assert.deepEqual(r.json.skipped, CMS_SKIPPED);
+  // Without a plugin root the ranking alone decides: skills/ folder, then neutral, then ports.
+  const loose = detectUnits(tree({ 'antigravity/x/a/SKILL.md': skill('a'), '.openclaw/skills/b/SKILL.md': skill('b'), 'cursor/a/SKILL.md': skill('a'), 'tools/a/SKILL.md': skill('a'), 'pkg/skills/a/SKILL.md': skill('a'), 'sub/.claude/x/b/SKILL.md': skill('b') }), 'x');
+  assert.deepEqual(unitsOf(loose).map((u) => u[1]), ['sub/.claude/x/b', 'pkg/skills/a', 'tools/a', 'cursor/a', '.openclaw/skills/b', 'antigravity/x/a']);
+  // A skill named for a tool is not a port, and a skill still keeps a better-ranked nested skill as its own files.
+  const own = detectUnits(tree({ 'tools/gemini/SKILL.md': skill('gemini'), 'tools/a/SKILL.md': skill('a'), 'tools/a/skills/b/SKILL.md': skill('b') }), 'x');
+  assert.deepEqual(unitsOf(own).map((u) => u[1]), ['tools/a', 'tools/gemini']);
+  assert.deepEqual(own.units[0].tree.map((f) => f.path).sort(), ['SKILL.md', 'skills/b/SKILL.md']);
+  // One copy of each skill: every one imports, ports included.
+  const t2 = setup();
+  const one = await pack(t2.t, t2.h, 'one.zip', { 'skills/a/SKILL.md': skill('a'), '.openclaw/skills/b/SKILL.md': skill('b'), 'antigravity/c/SKILL.md': skill('c') });
+  assert.equal(one.status, 201, one.text);
+  assert.deepEqual([names(one.json.items), one.json.skipped], [['skill:a', 'skill:b', 'skill:c'], []]);
+});
+
+test('ypmn: re-importing a multi-tool repository updates the same Claude Code copies; their allowed-tools survive', async () => {
+  gh.repos['Code-My-Spec/plugins'] = { default_branch: 'main', refs: { main: sha2('9a') }, trees: { [sha2('9a')]: CMS(), [sha2('9b')]: CMS('More.\n') } };
+  const { t, h } = setup();
+  const first = await github(t, h, { repo: 'Code-My-Spec/plugins' });
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(first.json.skipped, CMS_SKIPPED);
+  gh.repos['Code-My-Spec/plugins'].refs.main = sha2('9b');
+  const again = await github(t, h, { repo: 'Code-My-Spec/plugins' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: { name: string; op: string; source: { path: string } }) => [i.name, i.op, i.source.path]).sort(), [
+    ['plan', 'unchanged', 'plugins/codemyspec/skills/plan'],
+    ['spec', 'version', 'plugins/codemyspec/skills/spec'],
+  ]);
+  assert.deepEqual(again.json.skipped, CMS_SKIPPED);
+  const spec = again.json.items.find((i: { name: string }) => i.name === 'spec');
+  const body = await t.req('GET', `${API}/items/${spec.id}/files/SKILL.md`, { headers: h });
+  assert.equal(body.text, portSkill('spec', true) + 'More.\n');
+  assert.match(body.text, /allowed-tools: Read, Grep/);
+});
+
+test('bppq, 4ky8: a hostile manifest (deeply nested values, half a million bad paths) is reported, never a 500 or an unbounded skipped list', async () => {
+  const nest = '['.repeat(5000) + ']'.repeat(5000);
+  const base: Files = { 'skills/s/SKILL.md': skill('s') };
+  const { t, h } = setup();
+  const deep = await pack(t, h, 'deep.zip', withManifest(base, `{"skills":[${nest}],"agents":${nest}}`));
+  assert.equal(deep.status, 201, deep.text.slice(0, 300));
+  assert.deepEqual(deep.json.skipped.map((s: { reason: string }) => s.reason), ["skills path '[...]' is not a path", "agents path '[...]' is not a path"]);
+  const t2 = setup();
+  const market = await pack(t2.t, t2.h, 'deep-market.zip', withManifest(base, `{"plugins":[{"name":"n","source":{"source":${nest},"repo":${nest}}}]}`, '.claude-plugin/marketplace.json'));
+  assert.equal(market.status, 201, market.text.slice(0, 300));
+  assert.deepEqual(market.json.skipped.map((s: { reason: string }) => s.reason), ["plugin 'n': source [...] [...] is not a path in this repository; not followed"]);
+  // Nearly 1 MB of bad paths: the first 500 are listed, the rest counted.
+  const t3 = setup();
+  const many = await pack(t3.t, t3.h, 'many.zip', withManifest(base, { skills: Array(300_000).fill(0), commands: Array(50_000).fill('/abs') }));
+  assert.equal(many.status, 201);
+  assert.equal(many.json.skipped.length, 501);
+  assert.deepEqual(many.json.skipped.at(-1), { path: '.claude-plugin', reason: '349500 more plugin manifest problems, not listed' });
+});
+
+test('bppq: an agents/ or commands/ folder nested inside a plugin is told only the plugin root one is read', () => {
+  const d = detectUnits(tree({ 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/agents/ok.md': agentMd('ok'), 'plugins/a/extra/agents/x.md': agentMd('x'), 'tools/commands/y.md': 'Y.\n' }), 'r');
+  assert.deepEqual(unitsOf(d), [['agent', 'plugins/a/agents/ok.md']]);
+  assert.deepEqual(d.skipped, [
+    { path: 'plugins/a/extra/agents/x.md', reason: 'agents/ is imported only at the plugin root: plugins/a/agents/*.md' },
+    { path: 'tools/commands/y.md', reason: 'commands/ below the repository root is imported only inside a plugin (.claude-plugin/plugin.json)' },
+  ]);
+  const rootPlugin = detectUnits(tree({ '.claude-plugin/plugin.json': '{}', 'skills/s/SKILL.md': skill('s'), 'tools/agents/z.md': agentMd('z') }), 'r');
+  assert.deepEqual(rootPlugin.skipped, [{ path: 'tools/agents/z.md', reason: 'agents/ is imported only at the plugin root: agents/*.md' }]);
+  // Any depth below an agents/ or commands/ folder (Code-My-Spec's antigravity/codemyspec/agents/<x>/agent.md).
+  const deep = detectUnits(tree({ 'skills/s/SKILL.md': skill('s'), 'antigravity/codemyspec/agents/bdd-spec-writer/agent.md': agentMd('bdd'), 'tools/commands/a/b/c.md': 'C.\n', 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/x/agents/y/z.md': agentMd('z') }), 'r');
+  assert.deepEqual(deep.skipped, [
+    { path: 'antigravity/codemyspec/agents/bdd-spec-writer/agent.md', reason: 'agents/ below the repository root is imported only inside a plugin (.claude-plugin/plugin.json)' },
+    { path: 'tools/commands/a/b/c.md', reason: 'commands/ below the repository root is imported only inside a plugin (.claude-plugin/plugin.json)' },
+    { path: 'plugins/a/x/agents/y/z.md', reason: 'agents/ is imported only at the plugin root: plugins/a/agents/*.md' },
+  ]);
+});
+
+/** Import `v1` from GitHub, move main to `v2`, source/update the skill `name`: its files at import and after the update. */
+async function updatedSkill(repo: string, shas: [string, string], v1: Files, v2: Files, name: string) {
+  gh.repos[repo] = { default_branch: 'main', refs: { main: shas[0] }, trees: { [shas[0]]: v1, [shas[1]]: v2 } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo });
+  assert.equal(imp.status, 201, imp.text);
+  const sk = imp.json.items.find((i: { kind: string; name: string }) => i.kind === 'skill' && i.name === name);
+  gh.repos[repo].refs.main = shas[1];
+  const up = await t.req('POST', `${API}/items/${sk.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  return { items: names(imp.json.items), imported: filePaths(sk).sort(), updated: filePaths(up.json.item).sort() };
+}
+
+test('4ky8: source/update of a declared skill another declared path carved keeps that path out; new files elsewhere in it arrive', async () => {
+  const v1 = withManifest({ 'tools/review/SKILL.md': skill('review'), 'tools/review/notes.md': 'n', 'tools/review/deep/SKILL.md': skill('deep'), 'tools/review/deep/x.py': 'x' }, { name: 'rv', skills: ['./tools/review/deep', './tools/review'] });
+  const v2 = { ...v1, 'tools/review/SKILL.md': skill('review', 'v2'), 'tools/review/more.md': 'm', 'tools/review/deep/x.py': 'x2', 'tools/review/deep/new.py': 'y' };
+  assert.deepEqual(await updatedSkill('acme/declared-nest', [sha2('c2'), sha2('c3')], v1, v2, 'review'), {
+    items: ['skill:deep', 'skill:review'],
+    imported: ['SKILL.md', 'notes.md'],
+    updated: ['SKILL.md', 'more.md', 'notes.md'],
+  });
+  // The same for a plain folder skill holding a nested plugin, whose agents that plugin's pass took first.
+  const n1: Files = { 'tools/x/SKILL.md': skill('x'), 'tools/x/sub/.claude-plugin/plugin.json': '{}', 'tools/x/sub/agents/a.md': agentMd('a') };
+  const n2 = { ...n1, 'tools/x/SKILL.md': skill('x', 'v2'), 'tools/x/sub/agents/a.md': agentMd('a') + 'More.\n', 'tools/x/run.sh': 'r' };
+  assert.deepEqual(await updatedSkill('acme/nested-plugin-skill', [sha2('e5'), sha2('e6')], n1, n2, 'x'), {
+    items: ['agent:a', 'skill:x'],
+    imported: ['SKILL.md', 'sub/.claude-plugin/plugin.json'],
+    updated: ['SKILL.md', 'run.sh', 'sub/.claude-plugin/plugin.json'],
+  });
+});
+
+test('bppq: source/update of a plugin skill keeps out the paths its marketplace entry declared', async () => {
+  const v1: Files = { '.claude-plugin/marketplace.json': marketplace([{ name: 'a', source: './plugins/a', agents: ['./x/helper.md'], commands: ['./c/go.md'] }]), 'plugins/a/SKILL.md': skill('a'), 'plugins/a/x/helper.md': agentMd('helper'), 'plugins/a/c/go.md': 'Go.\n', 'plugins/a/lib/run.py': 'r' };
+  const v2 = { ...v1, 'plugins/a/SKILL.md': skill('a', 'v2'), 'plugins/a/x/helper.md': agentMd('helper') + 'More.\n', 'plugins/a/lib/new.py': 'n' };
+  assert.deepEqual(await updatedSkill('acme/market-declared', [sha2('c4'), sha2('d6')], v1, v2, 'a'), {
+    items: ['agent:helper', 'command:go', 'skill:a'],
+    imported: ['SKILL.md', 'lib/run.py'],
+    updated: ['SKILL.md', 'lib/new.py', 'lib/run.py'],
+  });
+});
+
+test('4ky8: a folder skill no manifest carved keeps its nested example skill and new files on source/update, as before', async () => {
+  const v1: Files = { 'tools/plain/SKILL.md': skill('plain'), 'tools/plain/notes.md': 'n', 'tools/plain/ex/SKILL.md': skill('ex') };
+  const v2 = { ...v1, 'tools/plain/SKILL.md': skill('plain', 'v2'), 'tools/plain/ex/more.md': 'm', 'tools/plain/new.md': 'w' };
+  assert.deepEqual(await updatedSkill('acme/plain-folder', [sha2('d7'), sha2('e4')], v1, v2, 'plain'), {
+    items: ['skill:plain'],
+    imported: ['SKILL.md', 'ex/SKILL.md', 'notes.md'],
+    updated: ['SKILL.md', 'ex/SKILL.md', 'ex/more.md', 'new.md', 'notes.md'],
+  });
+});
+
+test('4ky8: a re-import records the carve the new manifest makes, so the next source/update keeps it', async () => {
+  const files: Files = { 'tools/review/SKILL.md': skill('review'), 'tools/review/notes.md': 'n', 'tools/review/deep/SKILL.md': skill('deep') };
+  const v1 = withManifest(files, { name: 'rv', skills: ['./tools/review'] });
+  const v2 = withManifest(files, { name: 'rv', skills: ['./tools/review/deep', './tools/review'] });
+  const v3 = { ...v2, 'tools/review/SKILL.md': skill('review', 'v3') };
+  gh.repos['acme/recarve'] = { default_branch: 'main', refs: { main: sha2('d3') }, trees: { [sha2('d3')]: v1, [sha2('d4')]: v2, [sha2('d5')]: v3 } };
+  const { t, h } = setup();
+  const first = await github(t, h, { repo: 'acme/recarve' });
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(filePaths(first.json.items[0]).sort(), ['SKILL.md', 'deep/SKILL.md', 'notes.md']);
+  gh.repos['acme/recarve'].refs.main = sha2('d4');
+  const again = await github(t, h, { repo: 'acme/recarve' });
+  assert.equal(again.status, 201, again.text);
+  const review = again.json.items.find((i: { name: string }) => i.name === 'review');
+  assert.deepEqual([review.op, filePaths(review).sort()], ['version', ['SKILL.md', 'notes.md']]);
+  gh.repos['acme/recarve'].refs.main = sha2('d5');
+  const up = await t.req('POST', `${API}/items/${review.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.deepEqual([up.json.item.description, filePaths(up.json.item).sort()], ['v3', ['SKILL.md', 'notes.md']]);
+});
+
+test('5w3w: a manifest that is not valid UTF-8 is malformed: the group falls back to its default name, with a skipped entry', async () => {
+  const bad = new Uint8Array([0x7b, 0x22, 0x6e, 0x61, 0x6d, 0x65, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d]);
+  const zip = (path: string) => zipSync({ [path]: bad, 'skills/s/SKILL.md': strToU8(skill('s')) });
+  const { t, h } = setup();
+  const r = await pack(t, h, 'kit.zip', zip('.claude-plugin/plugin.json'), { group: 'kit' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual([r.json.group.name, r.json.skipped], ['kit', [{ path: '.claude-plugin/plugin.json', reason: 'plugin manifest ignored: not valid UTF-8' }]]);
+  const t2 = setup();
+  const m = await pack(t2.t, t2.h, 'mk.zip', zip('.claude-plugin/marketplace.json'), { group: 'mk' });
+  assert.equal(m.status, 201, m.text);
+  assert.deepEqual([m.json.group.name, m.json.skipped], ['mk', [{ path: '.claude-plugin/marketplace.json', reason: 'marketplace manifest ignored: not valid UTF-8' }]]);
 });
