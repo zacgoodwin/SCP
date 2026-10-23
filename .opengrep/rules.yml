@@ -1,0 +1,170 @@
+# SCP's OpenGrep ruleset, run by the `sast` job in .github/workflows/ci.yml. Hand-picked for this
+# stack (Node 24 TypeScript, Hono, node:sqlite, React) instead of a registry pack, so every finding is
+# one we act on. rules.ts / rules.tsx next to this file are the rule tests (`opengrep test .opengrep`):
+# `ruleid:` lines must match, `ok:` lines must not. A new rule ships with both.
+rules:
+  # SQL is built from code-owned fragments all over the services (`${f.sql}`, `${w}`), so "template
+  # literal in prepare()" alone would flag safe code. What must never happen is request input in the
+  # SQL text: values go in as `?` parameters (later arguments are not a sink).
+  - id: scp.sql-injection.request-input-in-sql
+    mode: taint
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Request input reaches the SQL text of prepare()/exec(). Bind it as a `?` parameter instead.
+    pattern-sources:
+      - pattern-either:
+          - pattern: $C.req.param(...)
+          - pattern: $C.req.query(...)
+          - pattern: $C.req.queries(...)
+          - pattern: $C.req.header(...)
+          - pattern: $C.req.json()
+          - pattern: $C.req.text()
+          - pattern: $C.req.parseBody(...)
+          - pattern: $C.req.formData()
+          - pattern: $C.req.valid(...)
+          - pattern: $C.req.url
+          - pattern: $C.req.path
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: Number(...)
+          - pattern: parseInt(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $DB.prepare($SQL, ...)
+              - pattern: $DB.exec($SQL, ...)
+          # `db`, `ctx.db`, `c.var.ctx.db`: keeps RegExp#exec out of the sink. (metavariable-regex is
+          # anchored at the start.)
+          - metavariable-regex:
+              metavariable: $DB
+              regex: (.*\.)?db$
+          - focus-metavariable: $SQL
+
+  - id: scp.open-redirect.request-input-in-redirect
+    mode: taint
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Request input chooses the redirect target. Redirect to a fixed or allow-listed URL.
+    pattern-sources:
+      - pattern-either:
+          - pattern: $C.req.param(...)
+          - pattern: $C.req.query(...)
+          - pattern: $C.req.queries(...)
+          - pattern: $C.req.header(...)
+          - pattern: $C.req.json()
+          - pattern: $C.req.parseBody(...)
+          - pattern: $C.req.formData()
+    pattern-sinks:
+      - patterns:
+          - pattern: $C.redirect($URL, ...)
+          - focus-metavariable: $URL
+
+  - id: scp.command-injection.shell
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: This runs a shell. Use execFile/spawn with an argument array and no `shell` option.
+    pattern-either:
+      - pattern: |
+          $F(..., {..., shell: true, ...})
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-inside: |
+                      import { ..., $F, ... } from '$MOD';
+                      ...
+                  - pattern: $F(...)
+              - patterns:
+                  - pattern-either:
+                      - pattern-inside: |
+                          import * as $CP from '$MOD';
+                          ...
+                      - pattern-inside: |
+                          import $CP from '$MOD';
+                          ...
+                  - pattern: $CP.$F(...)
+              - pattern: require('$MOD').$F(...)
+          - metavariable-regex:
+              metavariable: $MOD
+              regex: ^(node:)?child_process$
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^exec(Sync)?$
+
+  - id: scp.code-injection.eval
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Evaluates a string as code. SCP never runs stored content on the server.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: Function(...)
+      # node:vm, however it is imported.
+      - patterns:
+          - pattern-either:
+              - pattern: $VM.$F(...)
+              - pattern: $F(...)
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^(runInNewContext|runInThisContext|runInContext|compileFunction)$
+      - pattern: new $VM.Script(...)
+
+  - id: scp.frontmatter.gray-matter
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: gray-matter evals `---js` frontmatter. Parse frontmatter with lib/frontmatter.ts (yaml).
+    pattern-regex: (from\s+|require\(\s*|import\(\s*)['"]gray-matter['"]
+
+  - id: scp.llm.hosted-api
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: SCP makes no hosted LLM API calls (CLAUDE.md). Route model work through local Claude Code.
+    pattern-regex: (api\.anthropic\.com|api\.openai\.com|generativelanguage\.googleapis\.com|(from\s+|require\(\s*|import\(\s*)['"](@anthropic-ai/sdk|openai|@google/genai|@google/generative-ai)['"])
+
+  - id: scp.tls.verification-disabled
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Disables TLS certificate verification.
+    pattern-either:
+      - pattern: |
+          {..., rejectUnauthorized: false, ...}
+      - pattern-regex: NODE_TLS_REJECT_UNAUTHORIZED
+
+  - id: scp.crypto.weak-hash
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: MD5/SHA-1 are broken for security use. Use sha256 (lib/crypto.ts sha256Hex).
+    patterns:
+      - pattern-either:
+          - pattern: createHash($ALG)
+          - pattern: $CRYPTO.createHash($ALG)
+      - metavariable-regex:
+          metavariable: $ALG
+          regex: (?i)['"](md5|sha1|sha-1)['"]
+
+  - id: scp.crypto.insecure-random
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Math.random() is predictable. Use crypto (randomBytes, randomUUID, getRandomValues).
+    pattern: Math.random()
+
+  - id: scp.cookie.missing-httponly
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: "Cookie set without `httpOnly: true`, so page script (and any XSS) can read it."
+    patterns:
+      - pattern-either:
+          - pattern: setCookie($C, $N, $V)
+          - pattern: setCookie($C, $N, $V, $OPTS)
+      - pattern-not: |
+          setCookie($C, $N, $V, {..., httpOnly: true, ...})
+
+  - id: scp.xss.raw-html-sink
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Writes raw HTML into the app origin's DOM. Render text through React; artifact HTML only ever runs on the artifact origin.
+    pattern-either:
+      - pattern: <$EL dangerouslySetInnerHTML={...} />
+      - pattern: $E.innerHTML = $X
+      - pattern: $E.outerHTML = $X
+      - pattern: $E.insertAdjacentHTML(...)
+      - pattern: document.write(...)

@@ -1,5 +1,6 @@
-# The gate on every PR and every push to main. The main ruleset requires the `gate` check, so a red
-# gate cannot merge. Actions are pinned to commit SHAs (the repo enforces it); Dependabot bumps them.
+# The gate and the OpenGrep scan on every PR and every push to main. The main ruleset requires the
+# `gate` and `sast` checks, so neither can merge red. Actions are pinned to commit SHAs (the repo
+# enforces it); Dependabot bumps them.
 name: ci
 
 on:
@@ -23,3 +24,30 @@ jobs:
           node-version: 24.22.1
       - run: npm run install:all
       - run: npm run gate
+
+  # OpenGrep with the repo's own rules (.opengrep/rules.yml). The repo allows only GitHub-owned and
+  # docker/* actions, so the binary comes from the release page, pinned and sha256-checked. To bump:
+  # take the new opengrep_manylinux_x86 digest from `gh release view <tag> -R opengrep/opengrep --json assets`.
+  sast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      OPENGREP_VERSION: v1.30.2
+      OPENGREP_SHA256: a66aa3278457f02b287b985a45b6762aebcaba5000f2689245fd1ed86d1456c7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install OpenGrep
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/opengrep" \
+            "https://github.com/opengrep/opengrep/releases/download/$OPENGREP_VERSION/opengrep_manylinux_x86"
+          echo "$OPENGREP_SHA256  $RUNNER_TEMP/opengrep" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/opengrep"
+      - name: Rule tests
+        run: $RUNNER_TEMP/opengrep test .opengrep
+      # Scans git-tracked files; the default ignore skips test/ dirs, and .opengrep holds the rule
+      # tests, which are violations on purpose.
+      - name: Scan
+        run: $RUNNER_TEMP/opengrep scan --config .opengrep/rules.yml --exclude .opengrep --error .
