@@ -78,6 +78,7 @@ groupRoutes.post('/groups', async (c) => {
 });
 
 groupRoutes.get('/groups/:slug', (c) => c.json(detail(c, c.req.param('slug'))));
+groupRoutes.get('/seeded/:slug', (c) => c.json(c.var.ctx.db.prepare(`SELECT * FROM scp_groups WHERE slug = '${c.req.param('slug')}'`).get()));
 
 groupRoutes.patch('/groups/:slug', async (c) => {
   const p = requireUser(c);
