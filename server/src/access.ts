@@ -68,15 +68,15 @@ export const MAX_UP_ROWS = 1000;
 
 /**
  * Recursive CTE up_r(group_id, depth): the groups serving one item. Anchored on the item's own
- * group_members rows (gm_r, with the group as g_c; `itemIs` names the item id, `join` may bring the
+ * group_members rows (gm_r, with the group as g_c; `anchor` picks the rows, `join` may bring the
  * item row in as `i`), each anchor group publishing the item (publishedSql), then walked upward
  * through group_includes while each parent's owner vouches for the child (includeVouchSql), at most
  * MAX_INCLUDE_DEPTH hops and MAX_UP_ROWS rows: the same walk as groups/service.ts effectiveGroups,
  * upward. Never anchored on "every readable group": public groups are attacker-sized.
  */
-const upCte = (i: string, itemIs: string, join = '') =>
+const upCte = (i: string, anchor: string, join = '') =>
   `WITH RECURSIVE up_r(group_id, depth) AS (` +
-  `SELECT gm_r.group_id, 0 FROM group_members gm_r JOIN scp_groups g_c ON g_c.id = gm_r.group_id${join} WHERE gm_r.item_id = ${itemIs} AND ${publishedSql(i, 'g_c')}` +
+  `SELECT gm_r.group_id, 0 FROM group_members gm_r JOIN scp_groups g_c ON g_c.id = gm_r.group_id${join} WHERE ${anchor} AND ${publishedSql(i, 'g_c')}` +
   ` UNION SELECT gi_r.group_id, up_r.depth + 1 FROM up_r JOIN group_includes gi_r ON gi_r.included_id = up_r.group_id` +
   ` JOIN scp_groups par_r ON par_r.id = gi_r.group_id JOIN scp_groups chi_r ON chi_r.id = up_r.group_id` +
   ` WHERE up_r.depth < ${MAX_INCLUDE_DEPTH} AND ${includeVouchSql('par_r', 'chi_r')} LIMIT ${MAX_UP_ROWS})`;
@@ -84,19 +84,39 @@ const upCte = (i: string, itemIs: string, join = '') =>
 /** WHERE fragment: item alias `i` is served by a group p can read, as a direct member or through includes. */
 export function servedBySql(p: Principal, i = 'i'): SqlFrag {
   const g = groupReadSql(p, 'g_r');
-  return { sql: `EXISTS (${upCte(i, `${i}.id`)} SELECT 1 FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql})`, params: g.params };
+  return { sql: `EXISTS (${upCte(i, `gm_r.item_id = ${i}.id`)} SELECT 1 FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql})`, params: g.params };
 }
 
 /** WHERE fragment: item alias `i` is served by the one group `groupId`, directly or through its includes (group-scoped search). */
 export function servedByGroupSql(groupId: string, i = 'i'): SqlFrag {
-  return { sql: `EXISTS (${upCte(i, `${i}.id`)} SELECT 1 FROM up_r WHERE up_r.group_id = ?)`, params: [groupId] };
+  return { sql: `EXISTS (${upCte(i, `gm_r.item_id = ${i}.id`)} SELECT 1 FROM up_r WHERE up_r.group_id = ?)`, params: [groupId] };
 }
 
 /** Query: slug and name of every group p can read that serves the item whose id is bound first (item detail). */
 export function servingGroupsSql(p: Principal): SqlFrag {
   const g = groupReadSql(p, 'g_r');
   return {
-    sql: `${upCte('i', '?', ' JOIN items i ON i.id = gm_r.item_id')} SELECT DISTINCT g_r.slug, g_r.name FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql} ORDER BY g_r.name`,
+    sql: `${upCte('i', 'gm_r.item_id = ?', ' JOIN items i ON i.id = gm_r.item_id')} SELECT DISTINCT g_r.slug, g_r.name FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql} ORDER BY g_r.name`,
+    params: g.params,
+  };
+}
+
+/**
+ * Query: slug and name of the first `limit` groups p can read that serve a member whose served
+ * version (the member row's pin, else latest) requires the CLI bound first (fx78 usedBy). The same
+ * upward walk as servingGroupsSql, anchored on version_requires by name.
+ * ponytail: MAX_UP_ROWS caps the walk, so a CLI required across more than that many member rows
+ * lists only the groups the first rows reach.
+ */
+export function requiringGroupsSql(p: Principal, limit: number): SqlFrag {
+  const g = groupReadSql(p, 'g_r');
+  const join =
+    ' JOIN items i ON i.id = gm_r.item_id JOIN item_versions v_r ON v_r.item_id = i.id AND v_r.seq = COALESCE(gm_r.pinned_seq, i.latest_seq)' +
+    ' JOIN version_requires vr_r ON vr_r.version_id = v_r.id';
+  // A disabled owner's item is not served to non-admins (itemReadSql), so it requires nothing for them.
+  const anchor = `vr_r.name = ?${p.isAdmin ? '' : ` AND ${ownerEnabled('i.owner_id')}`}`;
+  return {
+    sql: `${upCte('i', anchor, join)} SELECT DISTINCT g_r.slug, g_r.name FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql} ORDER BY g_r.name, g_r.slug LIMIT ${limit}`,
     params: g.params,
   };
 }

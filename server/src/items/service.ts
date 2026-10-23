@@ -9,7 +9,7 @@ import { HttpError, badRequest, forbidden, notFound } from '../lib/http.ts';
 import { assertNoCollisions, isJunkPath, isTextPath, mediaTypeFor, normalizePath, segmentProblem } from '../lib/paths.ts';
 import { LIMITS, checkLimits, stripTopFolder, tooLarge, treeSha256, type TreeFile } from '../lib/tree.ts';
 import { sweepBlobs } from './gc.ts';
-import { FRONTMATTER_ERRORS, lintVersion, type Lint } from './lint.ts';
+import { FRONTMATTER_ERRORS, lintVersion, parseRequires, type Lint } from './lint.ts';
 import { touchGroupsOfItem } from '../groups/touch.ts';
 import { FORMATS, KINDS, aKind, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type SuppliedFrontmatter, type VersionRow } from '../types.ts';
 
@@ -515,6 +515,8 @@ function insertVersion(db: Db, p: Principal, itemId: string, seq: number, s: Sha
     created_at: now(),
   };
   insertRow(db, 'item_versions', v);
+  const req = db.prepare('INSERT INTO version_requires (version_id, name) VALUES (?, ?)');
+  for (const name of s.fm && !s.fm.error ? parseRequires(s.fm.data).names : []) req.run(v.id, name);
   const blob = db.prepare('INSERT OR IGNORE INTO blobs (sha256, size, data) VALUES (?, ?, ?)');
   const file = db.prepare('INSERT INTO version_files (version_id, path, mode, sha256, size) VALUES (?, ?, ?, ?, ?)');
   for (const e of entries) {

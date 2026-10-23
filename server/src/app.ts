@@ -16,6 +16,7 @@ import { importRoutes } from './imports/routes.ts';
 import { oauthApiRoutes, oauthRoutes } from './oauth/routes.ts';
 import { oidcRoutes } from './auth/oidc.ts';
 import { adminRoutes } from './admin/routes.ts';
+import { toolRoutes } from './tools/routes.ts';
 import type { AppEnv, Ctx } from './types.ts';
 
 export function buildApp(ctx: Ctx) {
@@ -45,6 +46,7 @@ export function buildApp(ctx: Ctx) {
   api.route('/', auditRoutes);
   api.route('/', oauthApiRoutes);
   api.route('/', adminRoutes);
+  api.route('/', toolRoutes);
   api.all('*', () => {
     throw notFound('route');
   });

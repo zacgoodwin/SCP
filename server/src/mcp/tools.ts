@@ -22,6 +22,7 @@ import { addMemberTx, listReadableGroups } from '../groups/service.ts';
 import { INSTALL_SCOPES, TARGETS, buildManifest } from '../groups/bundle.ts';
 import { asText, catalogEntry, catalogText, clip, entryText, memberEntry, memberInstallPath, resolveTarget, type McpScope } from './scope.ts';
 import { VIEWER_URI } from './viewer.ts';
+import { PLATFORMS, requiresOf, type RequiredCli } from '../tools/service.ts';
 import { FORMATS, KINDS, MD_KINDS, aKind, type GroupRow, type ItemRow, type Kind } from '../types.ts';
 
 /**
@@ -80,6 +81,21 @@ const errorText = (e: HttpError) => {
   const lines = lints.filter((l) => l && l.message).map((l) => `- ${l.level ?? 'error'} ${l.code ?? ''}: ${l.message}`);
   return lines.length ? `${e.message}\n${lines.join('\n')}` : e.message;
 };
+
+/**
+ * The group's required CLIs as text (f9j0). Commands come from the admin registry only; the agent
+ * shows them to the user and runs nothing on its own.
+ */
+function requiresText(reqs: RequiredCli[]): string {
+  if (!reqs.length) return '';
+  const lines = reqs.map((r) => {
+    const by = `needed by ${r.items.map((i) => i.name).join(', ')}`;
+    if (!r.tool) return `- ${r.name} (${by}): no install command recorded on this SCP instance.${r.sources ? ` Source: ${r.sources.join(', ')}` : ''}`;
+    const cmds = PLATFORMS.filter((k) => r.tool!.install[k]).map((k) => `${k}: \`${r.tool!.install[k]}\``);
+    return `- ${r.name} (${by}): ${cmds.length ? cmds.join('; ') : 'no install command recorded'}.${r.tool.homepage ? ` Homepage: ${r.tool.homepage}.` : ''} Check: \`command -v ${r.tool.check}\``;
+  });
+  return `## Required CLIs (${reqs.length})\n\nThese skills need command-line tools on the user's machine. Show the user these commands to run themselves; do not run them on your own.\n\n${lines.join('\n')}`;
+}
 
 const fmtBytes = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
 
@@ -187,12 +203,14 @@ export function registerTools(server: McpServer, s: McpScope): void {
       const pg = listPage(s.membersOf(g), from, 'entries');
       const entries = pg.rows.map(memberEntry);
       const how = 'Load a skill with get_skill, an MD with get_md, an artifact with get_artifact or render_artifact. Install everything with get_bundle.';
-      // Description and instructions on the first page only; later pages are catalog.
+      // Description, instructions and required CLIs on the first page only; later pages are catalog.
       const first = from === 0;
+      const requires = first ? requiresOf(db, s.membersOf(g)) : [];
       const text = [
         `# ${g.name} (group '${g.slug}')`,
         first ? g.description.trim() : '',
         first && g.instructions.trim() ? `## Instructions\n\n${g.instructions.trim()}` : '',
+        requiresText(requires),
         `## Catalog (${pg.total})\n\n${catalogText(entries)}${pg.note}`,
         how,
       ]
@@ -202,13 +220,13 @@ export function registerTools(server: McpServer, s: McpScope): void {
         group: {
           slug: g.slug,
           name: g.name,
-          ...(first ? { description: g.description, instructions: g.instructions } : {}),
+          ...(first ? { description: g.description, instructions: g.instructions, requires } : {}),
           mcp: `${config.publicUrl}/mcp/${g.slug}`,
         },
         items: entries,
         total: pg.total,
         next: pg.next,
-        message: `Group '${g.slug}': ${pg.total} catalog entries, ${entries.length} in \`items\`${first ? '; description and instructions in `group`' : ''}.${pg.note} ${how}`,
+        message: `Group '${g.slug}': ${pg.total} catalog entries, ${entries.length} in \`items\`${first ? '; description, instructions and required CLIs in `group`' : ''}.${pg.note} ${how}${requires.length ? ` These skills need ${requires.length} CLI(s) installed (\`group.requires\`): show the user the install commands to run themselves; do not run them on your own.` : ''}`,
       });
     },
   );
@@ -569,8 +587,10 @@ export function registerTools(server: McpServer, s: McpScope): void {
             `This connection is an OAuth token, which that URL does not accept: fetch it ${withKey}, then unzip the file in ${where}; or install the group as a Claude Code plugin from its Plugin tab.`,
           ]
         : [`${summary} Run from ${where}, with SCP_KEY set to your SCP API key:`, '', 'bash:', bash, '', 'PowerShell:', powershell];
+      const requires = requiresOf(db, s.membersOf(g));
       const text = [
         ...commands,
+        ...(requires.length ? ['', requiresText(requires)] : []),
         '',
         'Installs:',
         ...m.items.slice(0, LIST_PAGE).map((i) => `- ${i.installPath} (${i.kind} ${i.name} v${i.version})`),
@@ -580,7 +600,7 @@ export function registerTools(server: McpServer, s: McpScope): void {
           ? ['', `Warning: install path conflicts (the download will fail until fixed): ${conflicts.map((x) => `${x.path} <- ${x.items.join(', ')}`).join('; ')}${m.conflicts.length > conflicts.length ? `; and ${m.conflicts.length - conflicts.length} more` : ''}`]
           : []),
       ].join('\n');
-      return ok(text, { group: g.slug, url, target, scope, items: m.items.length, ...(viaOauth ? {} : { bash, powershell }), conflicts, conflictCount: m.conflicts.length });
+      return ok(text, { group: g.slug, url, target, scope, items: m.items.length, ...(viaOauth ? {} : { bash, powershell }), conflicts, conflictCount: m.conflicts.length, requires });
     },
   );
 

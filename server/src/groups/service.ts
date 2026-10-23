@@ -7,6 +7,7 @@ import { normalizePath, segmentProblem } from '../lib/paths.ts';
 import { ftsQuery, getItemRow, itemSummary, listFiles, resolveVersion, type ItemSummary } from '../items/service.ts';
 import { INSTALL_AS_KINDS, INSTALL_SCOPES, TARGETS, fileCount, findConflicts, footprint, installPath, pathConflict, type PluginMember } from './bundle.ts';
 import { touchGroup, touchIncluders } from './touch.ts';
+import { requiresOf, type RequiredCli } from '../tools/service.ts';
 import { MD_KINDS, planeOf, type Ctx, type GroupRow, type ItemRow, type Kind, type Principal, type VersionRow } from '../types.ts';
 
 export { buildBundle, buildManifest, catalogMarkdown, installPath } from './bundle.ts';
@@ -59,6 +60,8 @@ export interface GroupDetail extends GroupSummary {
   includedBy: { slug: string; name: string }[];
   endpoints: { mcp: string; manifest: string; bundle: string };
   canEdit: boolean;
+  /** CLIs the effective members require, with install commands from the registry only (tools/service.ts). */
+  requires: RequiredCli[];
 }
 
 export interface GroupInput {
@@ -387,11 +390,12 @@ export function groupDetail(db: Db, p: Principal, row: GroupRow, publicUrl: stri
     )
     .all(row.id, ...readable.params) as { slug: string; name: string }[];
   const api = `${publicUrl}/api/v1/groups/${row.slug}`;
+  const members = resolvedMembers(db, p, row);
   return {
     ...groupSummary(db, row),
     instructions: row.instructions,
     sharedWith: shared.map((s) => s.username),
-    members: resolvedMembers(db, p, row).map((m) => ({
+    members: members.map((m) => ({
       item: itemSummary(db, m.item),
       pinnedSeq: m.pinnedSeq,
       installAs: m.installAs,
@@ -403,6 +407,7 @@ export function groupDetail(db: Db, p: Principal, row: GroupRow, publicUrl: stri
     includedBy: includedBy.map((g) => ({ slug: g.slug, name: g.name })),
     endpoints: { mcp: `${publicUrl}/mcp/${row.slug}`, manifest: `${api}/manifest`, bundle: `${api}/bundle.zip` },
     canEdit,
+    requires: requiresOf(db, members),
   };
 }
 

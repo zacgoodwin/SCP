@@ -38,6 +38,29 @@ const DESIGN_SECTIONS = [
 const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
 const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
 
+/** A CLI name in `requires` (f9j0): the item-name rule, so it is also a safe shell word. */
+export const CLI_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+/** CLIs stored per version; more is a lint warning and the rest are dropped. */
+export const MAX_REQUIRES = 50;
+
+/**
+ * The CLIs a version needs, from frontmatter `metadata.requires` (portable) and top-level `requires`
+ * (context-builder's spelling): a list of names or one name. Sorted, deduplicated, capped at
+ * MAX_REQUIRES. db.ts migration 16 backfills older versions with the same rule in SQL.
+ */
+export function parseRequires(d: Record<string, unknown>): { names: string[]; invalid: string[]; topLevel: boolean; dropped: number } {
+  const meta = d.metadata && typeof d.metadata === 'object' && !Array.isArray(d.metadata) ? (d.metadata as Record<string, unknown>).requires : undefined;
+  const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : typeof v === 'string' ? [v] : []);
+  const raw = [...list(meta), ...list(d.requires)];
+  const valid = [...new Set(raw.filter((n): n is string => typeof n === 'string' && CLI_NAME.test(n)))].sort();
+  return {
+    names: valid.slice(0, MAX_REQUIRES),
+    invalid: raw.filter((n) => !(typeof n === 'string' && CLI_NAME.test(n))).map((n) => String(n).slice(0, 80)),
+    topLevel: d.requires !== undefined,
+    dropped: Math.max(0, valid.length - MAX_REQUIRES),
+  };
+}
+
 /**
  * Lint one version (docs/research/formats.md 7.5, claude-code profile). Errors are the cases where
  * the client would silently ignore the file; writes with any error are rejected.
@@ -103,6 +126,14 @@ export function lintVersion(
     if (d.color !== undefined && !COLORS.has(String(d.color))) add('warn', 'agent.color.invalid', `color must be one of ${[...COLORS].join(', ')}`);
     const skills = Array.isArray(d.skills) ? d.skills : typeof d.skills === 'string' ? d.skills.split(/[,\s]+/).filter(Boolean) : [];
     if (skills.length > 32) add('error', 'agent.skills.max32', 'an agent can preload at most 32 skills');
+  }
+
+  if (fm && !fm.error) {
+    const r = parseRequires(d);
+    if (r.names.length) add('info', 'requires.found', `requires CLIs: ${r.names.join(', ')}`);
+    if (r.invalid.length) add('warn', 'requires.invalid', `requires names must match ^[a-z0-9][a-z0-9._-]{0,63}$; ignored: ${r.invalid.slice(0, 10).join(', ')}`);
+    if (r.dropped) add('warn', 'requires.max', `at most ${MAX_REQUIRES} required CLIs are kept; ${r.dropped} dropped`);
+    if (r.topLevel) add('info', 'requires.toplevel', 'top-level requires is outside the portable key set; prefer metadata.requires');
   }
 
   if (kind === 'instructions' && fm?.hasFrontmatter) {

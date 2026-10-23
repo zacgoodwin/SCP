@@ -20,6 +20,7 @@ import { LoginPage } from './pages/Login.tsx';
 import { NewItemPage } from './pages/NewItem.tsx';
 import { NotFoundPage, RouteErrorPage } from './pages/NotFound.tsx';
 import { RegisterPage } from './pages/Register.tsx';
+import { ToolsPage } from './pages/Tools.tsx';
 import './styles.css';
 
 const router = createBrowserRouter([
@@ -52,6 +53,7 @@ const router = createBrowserRouter([
       { path: '/items/:id', element: <ItemDetailPage /> },
       { path: '/groups', element: <GroupsPage /> },
       { path: '/groups/:slug', element: <GroupDetailPage /> },
+      { path: '/tools', element: <ToolsPage /> },
       { path: '/keys', element: <KeysPage /> },
       { path: '/activity', element: <ActivityPage /> },
       { path: '/admin/users', element: <AdminUsersPage /> },

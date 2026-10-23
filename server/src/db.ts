@@ -290,6 +290,31 @@ const MIGRATIONS: string[] = [
     expires_at TEXT NOT NULL
   );
    CREATE INDEX oidc_pending_links_expires ON oidc_pending_links(expires_at);`,
+  // v3 f9j0/fx78 (docs/PLAN-v3.md "CLI tools"): the CLIs each version's frontmatter requires (items/lint.ts
+  // parseRequires, written by items/service.ts insertVersion; backfilled here with the same rule, the
+  // MAX_REQUIRES = 50 cap by name included),
+  // and the admin-curated registry that alone supplies install commands.
+  `CREATE TABLE version_requires (
+    version_id TEXT NOT NULL REFERENCES item_versions(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    PRIMARY KEY (version_id, name)
+  );
+  CREATE INDEX version_requires_name ON version_requires(name);
+  INSERT INTO version_requires (version_id, name)
+    SELECT version_id, name FROM (
+      SELECT version_id, name, ROW_NUMBER() OVER (PARTITION BY version_id ORDER BY name) AS n FROM (
+        SELECT DISTINCT v.id AS version_id, j.value AS name FROM item_versions v, json_each(v.frontmatter, p.path) j, (SELECT '$.metadata.requires' AS path UNION ALL SELECT '$.requires') p
+        WHERE json_type(v.frontmatter, p.path) IN ('array', 'text') AND j.type = 'text' AND length(j.value) <= 64
+          AND j.value GLOB '[a-z0-9]*' AND j.value NOT GLOB '*[^a-z0-9._-]*'))
+    WHERE n <= 50;
+  CREATE TABLE cli_tools (
+    name TEXT PRIMARY KEY,
+    homepage TEXT NOT NULL DEFAULT '',
+    check_bin TEXT NOT NULL,
+    install TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );`,
 ];
 
 export function openDb(path: string): Db {

@@ -355,7 +355,7 @@ input:user-invalid { border-color: var(--danger); }
   .builder-grid { grid-template-columns: minmax(0, 1fr); }
   .builder-grid #add-items { position: static; max-height: none; }
 }
-.pick-list, .share-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.pick-list, .share-list, .requires-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
 .pick-row {
   display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: var(--space-3);
   padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg);

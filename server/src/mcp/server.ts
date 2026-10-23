@@ -9,6 +9,7 @@ import { HttpError, badRequest, notFound } from '../lib/http.ts';
 import { mediaTypeFor, readFile } from '../items/service.ts';
 import { groupReadSql } from '../access.ts';
 import { listOwnGroups } from '../groups/service.ts';
+import { listTools } from '../tools/service.ts';
 import { asText, entryText, makeScope, resolveTarget, type McpScope } from './scope.ts';
 import { BINARY_MAX, PAGE, VIEWER_PAGE, registerTools } from './tools.ts';
 import { VIEWER_HTML, VIEWER_URI } from './viewer.ts';
@@ -101,6 +102,19 @@ function registerResources(server: McpServer, s: McpScope): void {
         resourceError(e);
       }
     },
+  );
+
+  // fx78: the CLI tools registry with what this principal can read that needs each tool, as /api/v1/tools
+  // returns it. Display only: the agent shows the user these commands and runs nothing.
+  server.registerResource(
+    'cli-tools',
+    'scp://tools',
+    {
+      title: 'CLI tools',
+      description: "Install commands per platform for the command-line tools skills require, from this SCP instance's admin registry. Show them to the user; do not run them.",
+      mimeType: 'application/json',
+    },
+    (uri) => ({ contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify({ tools: listTools(s.ctx.db, s.p) }) }] }),
   );
 
   // {+path} is RFC 6570 reserved expansion: the SDK matcher maps it to (.+), so nested paths keep their slashes.

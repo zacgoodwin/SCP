@@ -57,6 +57,60 @@ onto the top of lane I before shipping. Deferred tickets (`deferred` label) are 
 - Migrations stay append-only (`db.ts` `MIGRATIONS`); parallel lanes each append theirs and the
   restack orders them. No deployed database has run a v3 migration before the batch merges.
 
+## CLI tools (f9j0, fx78)
+
+Migration 16 (`db.ts`):
+
+- `version_requires (version_id → item_versions ON DELETE CASCADE, name, PRIMARY KEY (version_id, name))`,
+  index on `name`. The CLIs a version's frontmatter requires: `metadata.requires` and top-level
+  `requires`, a list or one string, names `^[a-z0-9][a-z0-9._-]{0,63}$`, sorted, at most 50
+  (`items/lint.ts` `parseRequires`, written by `items/service.ts` `insertVersion`). The migration
+  backfills existing versions with the same rule in SQL.
+- `cli_tools (name PK, homepage, check_bin, install JSON {macos?, linux?, windows?, any?}, created_at,
+  updated_at)`. Admin-curated; seeded with nothing. `check_bin` defaults to the name and is a binary
+  name (`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`); each install command is one line, at most 1000 chars.
+
+Lint codes: `requires.found` (info), `requires.invalid` (warn), `requires.max` (warn),
+`requires.toplevel` (info, suggests `metadata.requires`).
+
+Routes (`server/src/tools/routes.ts`, service `server/src/tools/service.ts`):
+
+| Route | Who | Answer |
+|---|---|---|
+| `GET /api/v1/tools` | any signed-in user | `{tools: ToolView[]}` sorted by name (fx78) |
+| `GET /api/v1/tools/:name` | any signed-in user | `{tool: ToolView}`; 404 when no registry row |
+| `GET /api/v1/admin/cli-tools` | admin | `{tools: CliTool[]}` sorted by name |
+| `POST /api/v1/admin/cli-tools` | admin, write | `201 {tool}`; 409 `tool_exists` |
+| `PUT /api/v1/admin/cli-tools/:name` | admin, write | `{tool}`; replaces homepage, check, install |
+| `DELETE /api/v1/admin/cli-tools/:name` | admin, write | 204 |
+
+`CliTool = {name, homepage, check, install, updatedAt}`; `ToolView = CliTool & {usedBy: {items: [{id,
+kind, name, title}], groups: [{slug, name}]}}`, at most 50 of each. `usedBy.items` are the items the
+viewer can read (`itemReadSql`) whose latest version requires the tool; `usedBy.groups` are the groups
+the viewer can read (`groupReadSql`) serving a member whose served version (pin, else latest) does,
+directly or through includes (`access.ts` `requiringGroupsSql`, the upward walk of
+`servingGroupsSql`), so another user's private group never appears. The MCP resource `scp://tools`
+(`application/json`) returns the same `{tools}` for the connection's principal, on every endpoint.
+
+Anyone but a full admin (a non-admin, a
+group-restricted admin key) gets 404 on the admin routes. Every change is audited as
+`cli_tool.create|update|delete` (target `cli_tool`, detail: the homepage, check and commands).
+
+`GET /api/v1/groups/:slug` gains `requires: [{name, items: [{id, name}], tool: {homepage, check,
+install} | null, sources?: [githubUrl]}]`, built from the effective members' resolved versions
+(`resolvedMembers`, so nested groups and pins count), sorted by name. `sources` appears with
+`tool: null` when a requiring item was imported from GitHub. The MCP `get_group` (first page,
+`group.requires`) and `get_bundle` (`requires`) carry the same list with a "show the user, do not run"
+note. Nothing in these responses reads item frontmatter beyond the names, so an item's
+`metadata.install` never reaches a reader.
+
+Web: the group page's "Requires" panel (`GroupDetail.tsx` `RequiresSection`, hidden when empty; a
+CLI with a registry row links to `/tools#tool-<name>`), the admin "CLI tools" card
+(`AdminSettings.tsx`), and the Tools page (`web/src/pages/Tools.tsx`, `/tools`, main nav "Tools"):
+search, one card per registry row with a platform switcher, install command and check one-liner
+with copy buttons, homepage, "Used by" links, and inline Edit / Remove / Add for admins only. All of
+them build on `web/src/components/CliTools.tsx` and `web/src/api-tools.ts`.
+
 ## Shared files
 
 Lanes S, C and B touch `db.ts` `MIGRATIONS`, `web/src/api*.ts`, `README.md`, `AdminSettings.tsx`

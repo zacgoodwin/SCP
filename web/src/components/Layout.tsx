@@ -11,6 +11,7 @@ const NAV: { to: string; label: string }[] = [
   { to: '/mds', label: 'Prompts & MDs' },
   { to: '/artifacts', label: 'Artifacts' },
   { to: '/groups', label: 'Groups' },
+  { to: '/tools', label: 'Tools' },
   { to: '/keys', label: 'API Keys' },
   { to: '/activity', label: 'Activity' },
 ];
