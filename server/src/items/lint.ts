@@ -8,7 +8,16 @@ export interface Lint {
   code: string;
   message: string;
   path?: string;
+  /** A frontmatter error an import accepted (0rdh): kept as a warning, shown as the item's "frontmatter errors" badge. */
+  waived?: true;
 }
+
+/**
+ * The errors an import may accept (0rdh): bad or missing frontmatter that Claude Code works around
+ * (the folder name for a missing name, the first paragraph for a missing description). Any other
+ * error still rejects the unit.
+ */
+export const FRONTMATTER_ERRORS = new Set(['frontmatter.invalid', 'skill.description.missing', 'skill.description.len', 'agent.name.missing', 'agent.description.missing']);
 
 const SKILL_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const PORTABLE_KEYS = new Set(['name', 'description', 'license', 'allowed-tools', 'metadata', 'compatibility']);

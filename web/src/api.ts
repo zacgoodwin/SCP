@@ -56,6 +56,8 @@ export interface Lint {
   code: string;
   message: string;
   path?: string;
+  /** A frontmatter error the import accepted (0rdh): shown as the item's "frontmatter errors" badge. */
+  waived?: true;
 }
 export interface FileIn {
   path: string;

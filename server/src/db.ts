@@ -263,6 +263,11 @@ const MIGRATIONS: string[] = [
   UNDOUBLE_SOURCE_PATHS,
   // v3 4ky8/bppq: what another unit of the import carved out of a skill folder (imports/pack.ts updateTree).
   `ALTER TABLE items ADD COLUMN source_carve TEXT;`,
+  // v3 0rdh: an item imported with its frontmatter errors accepted; its source updates accept them too
+  // without asking again (imports/pack.ts versionFromSource).
+  `ALTER TABLE items ADD COLUMN lint_waived INTEGER NOT NULL DEFAULT 0;`,
+  // v3 5ef6: the prefix an import put in front of the unit's bare name (imports/pack.ts keepPrefix, importUnit).
+  `ALTER TABLE items ADD COLUMN source_prefix TEXT;`,
 ];
 
 export function openDb(path: string): Db {

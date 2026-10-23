@@ -88,6 +88,10 @@ export interface ItemRow {
   source_scope: 'tree' | 'root' | null;
   /** JSON list of the paths (relative to source_path) other units of the import took out of this skill folder; updateTree leaves them out. */
   source_carve: string | null;
+  /** 1 when an import accepted the item's frontmatter errors (0rdh): its source updates accept them too. */
+  lint_waived: number;
+  /** 5ef6: what an import put in front of the unit's bare name (in-import, cross-source or both: 'fork-discord'); null when unprefixed or imported before it was recorded. */
+  source_prefix: string | null;
   forked_from: string | null;
   created_at: string;
   updated_at: string;

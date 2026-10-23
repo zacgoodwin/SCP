@@ -32,7 +32,7 @@ const PLUGIN: Files = {
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
 const SHA_HUGE = 'f'.repeat(40);
-/** The fake serves a zipball by sha across every repo, so a repo with its own tree needs its own shas. */
+/** A commit sha; the fake resolves it within the repo asked for, as GitHub does, so two repos may reuse one. */
 const sha = (ch: string) => ch.repeat(40);
 /** More unique shas: a two-hex-digit pattern, so 'a0' never collides with SHA_A. */
 const sha2 = (pair: string) => pair.repeat(20);
@@ -74,7 +74,12 @@ async function fakeGithub() {
     blobs.set(id, bytes);
     return { path: rel, mode: text.startsWith(LINK) ? '120000' : rel.endsWith('.sh') ? '100755' : '100644', type: 'blob', sha: id, size: bytes.length };
   };
-  const listing = (files: Files, commit: string, dir: string, recursive: boolean) => {
+  // Repo names resolve case-insensitively, like GitHub's.
+  const repoOf = (name: string) => {
+    const key = Object.keys(repos).find((k) => k.toLowerCase() === name.toLowerCase());
+    return key ? { key, repo: repos[key] } : undefined;
+  };
+  const listing = (repo: string, files: Files, commit: string, dir: string, recursive: boolean) => {
     const prefix = dir ? dir + '/' : '';
     const out = new Map<string, object>();
     for (const [p, text] of Object.entries(files)) {
@@ -84,7 +89,7 @@ async function fakeGithub() {
         const rel = segs.slice(0, i).join('/');
         if (i === segs.length) out.set(rel, entry(rel, text));
         else if (!out.has(rel)) {
-          const id = sha1(`${commit}:${prefix}${rel}`);
+          const id = sha1(`${repo}:${commit}:${prefix}${rel}`);
           treeIds.set(id, { files, dir: prefix + rel });
           out.set(rel, { path: rel, mode: '040000', type: 'tree', sha: id });
         }
@@ -95,24 +100,27 @@ async function fakeGithub() {
   const server = createServer((req, res) => {
     requests.push({ url: req.url!, headers: req.headers });
     const json = (status: number, body: unknown) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
-    const git = /^\/repos\/[^/]+\/[^/]+\/git\/(trees|blobs)\/([0-9a-f]{40})(\?recursive=1)?$/.exec(req.url!);
+    const git = /^\/repos\/([^/]+\/[^/]+)\/git\/(trees|blobs)\/([0-9a-f]{40})(\?recursive=1)?$/.exec(req.url!);
     if (git) {
-      if (git[1] === 'blobs') {
-        const bytes = blobs.get(git[2]);
+      if (git[2] === 'blobs') {
+        const bytes = blobs.get(git[3]);
         return bytes ? res.writeHead(200, { 'content-type': 'application/vnd.github.raw' }).end(bytes) : json(404, { message: 'Not Found' });
       }
+      const owner = repoOf(git[1]);
+      if (!owner) return json(404, { message: 'Not Found' });
       // A commit sha lists its root tree, as on GitHub.
-      const owner = Object.values(repos).find((r) => r.trees[git[2]]);
-      const at = owner ? { files: owner.trees[git[2]], dir: '' } : treeIds.get(git[2]);
+      const root = owner.repo.trees[git[3]];
+      const at = root ? { files: root, dir: '' } : treeIds.get(git[3]);
       if (!at) return json(404, { message: 'Not Found' });
       const headers: Record<string, string> = { 'content-type': 'application/json' };
       if (quota.remaining !== null) headers['x-ratelimit-remaining'] = String(quota.remaining);
-      return res.writeHead(200, headers).end(JSON.stringify({ sha: git[2], tree: listing(at.files, git[2], at.dir, !!git[3]), truncated: false }));
+      return res.writeHead(200, headers).end(JSON.stringify({ sha: git[3], tree: listing(owner.key, at.files, git[3], at.dir, !!git[4]), truncated: false }));
     }
     const m = /^\/repos\/([^/]+\/[^/]+)(?:\/(commits|zipball)\/(.+))?$/.exec(req.url!);
-    const zip = /^\/zip\/([0-9a-f]{40})$/.exec(req.url!);
+    // The zipball redirect names the repo, as GitHub's codeload URL does.
+    const zip = /^\/zip\/([^/]+\/[^/]+)\/([0-9a-f]{40})$/.exec(req.url!);
     if (zip) {
-      if (zip[1] === SHA_HUGE) {
+      if (zip[2] === SHA_HUGE) {
         res.writeHead(200, { 'content-type': 'application/zip' });
         res.on('error', () => {});
         const chunk = new Uint8Array(1024 * 1024);
@@ -128,13 +136,12 @@ async function fakeGithub() {
         pump();
         return;
       }
-      const owner = Object.values(repos).find((r) => r.trees[zip[1]]);
-      if (!owner) return json(404, { message: 'Not Found' });
-      const files = owner.trees[zip[1]];
+      const files = repoOf(zip[1])?.repo.trees[zip[2]];
+      if (!files) return json(404, { message: 'Not Found' });
       // Like `git archive`: a symlink is a mode 120000 entry holding its target; a submodule is left out.
       const bytes = buildZip(
         Object.entries(files).filter(([, text]) => text !== SUBMODULE).map(([path, text]) => ({
-          path: `owner-repo-${zip[1].slice(0, 7)}/${path}`,
+          path: `owner-repo-${zip[2].slice(0, 7)}/${path}`,
           bytes: strToU8(text.startsWith(LINK) ? text.slice(LINK.length) : text),
           mode: text.startsWith(LINK) ? 0o120777 : path.endsWith('.sh') ? 493 : 420,
         })),
@@ -147,15 +154,15 @@ async function fakeGithub() {
       return res.end(JSON.stringify({ message: 'API rate limit exceeded' }));
     }
     // Like GitHub: names resolve case-insensitively and the metadata carries the canonical spelling.
-    const key = m && Object.keys(repos).find((k) => k.toLowerCase() === m[1].toLowerCase());
-    const repo = key ? repos[key] : undefined;
-    if (!m || !repo) return json(404, { message: 'Not Found' });
+    const found = m ? repoOf(m[1]) : undefined;
+    if (!m || !found) return json(404, { message: 'Not Found' });
+    const { key, repo } = found;
     if (!m[2]) return json(200, { full_name: key, default_branch: repo.default_branch, private: !!repo.private });
     if (m[2] === 'commits') {
       const sha = repo.refs[m[3]] ?? Object.keys(repo.trees).find((s) => s.startsWith(m[3]));
       return sha ? json(200, { sha }) : json(422, { message: 'No commit found' });
     }
-    return res.writeHead(302, { location: `/zip/${m[3]}` }).end();
+    return res.writeHead(302, { location: `/zip/${key}/${m[3]}` }).end();
   });
   const base = `http://127.0.0.1:${await listenLocal(server)}`;
   return { base, repos, requests, server, quota };
@@ -286,7 +293,7 @@ test('detectUnits: plugin, .claude, nested SKILL.md, root skill, root docs, md-o
 
 test('pack import: items, group, provenance, skipped lint failures, one audit row per unit', async () => {
   const { t, u, h } = setup();
-  const r = await pack(t, h, 'My Kit.zip', PLUGIN, { group: 'kit', visibility: 'public' });
+  const r = await pack(t, h, 'My Kit.zip', PLUGIN, { group: 'kit', visibility: 'public', frontmatterErrors: 'skip' });
   assert.equal(r.status, 201, r.text);
   assert.deepEqual(names(r.json.items), ['agent:reviewer', 'command:ship', 'skill:pdf']);
   assert.deepEqual(r.json.skipped, [{ path: 'skills/broken', reason: 'frontmatter description is required' }]);
@@ -362,7 +369,7 @@ test('pack import: a commands-only zip keeps its layout folder; a GitHub path at
 test('pack import: group slug taken rolls the whole import back; too many items; restricted and read-only keys', async () => {
   const { t, u, h } = setup();
   assert.equal((await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'kit', name: 'Kit' } })).status, 201);
-  const r = await pack(t, h, 'kit.zip', PLUGIN, { group: 'kit' });
+  const r = await pack(t, h, 'kit.zip', PLUGIN, { group: 'kit', frontmatterErrors: 'skip' });
   assert.equal(r.status, 409);
   assert.equal(r.json.error.code, 'slug_taken');
   assert.equal((t.db.prepare('SELECT COUNT(*) AS n FROM items').get() as { n: number }).n, 0);
@@ -383,7 +390,7 @@ test('pack import: group slug taken rolls the whole import back; too many items;
 test('github import: url -> pinned commit, provenance, note, group named after the plugin, path subtree', async () => {
   gh.repos['acme/kit'] = { default_branch: 'main', refs: { main: SHA_A, 'v1.0': SHA_A }, trees: { [SHA_A]: PLUGIN } };
   const { t, h } = setup();
-  const r = await github(t, h, { url: 'https://github.com/acme/kit', group: 'acme-kit' });
+  const r = await github(t, h, { url: 'https://github.com/acme/kit', group: 'acme-kit', frontmatterErrors: 'skip' });
   assert.equal(r.status, 201, r.text);
   assert.deepEqual(names(r.json.items), ['agent:reviewer', 'command:ship', 'skill:pdf']);
   assert.deepEqual(r.json.source, { kind: 'github', repo: 'acme/kit', ref: 'main', path: null, commit: SHA_A });
@@ -419,20 +426,20 @@ test('github import: re-import updates in place, unchanged content adds no versi
   const { t, h } = setup();
   // An unrelated local item already owns the agent's name.
   assert.equal((await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'agent', content: AGENT } })).status, 201);
-  const first = await github(t, h, { repo: 'acme/again' });
+  const first = await github(t, h, { repo: 'acme/again', frontmatterErrors: 'skip' });
   assert.equal(first.status, 201, first.text);
   assert.deepEqual(names(first.json.items), ['command:ship', 'skill:pdf']);
   assert.deepEqual(first.json.skipped.map((s: { path: string; reason: string }) => [s.path, /name_taken|already have/.test(s.reason)]), [['skills/broken', false], ['agents/reviewer.md', true]]);
   const pdfId = first.json.items.find((i: { name: string }) => i.name === 'pdf').id;
 
-  const same = await github(t, h, { repo: 'acme/again' });
+  const same = await github(t, h, { repo: 'acme/again', frontmatterErrors: 'skip' });
   assert.equal(same.status, 201, same.text);
   const samePdf = same.json.items.find((i: { name: string }) => i.name === 'pdf');
   assert.equal(samePdf.id, pdfId);
   assert.equal(samePdf.latestSeq, 1, 'identical content adds no version');
 
   gh.repos['acme/again'].refs.main = SHA_B;
-  const next = await github(t, h, { repo: 'acme/again' });
+  const next = await github(t, h, { repo: 'acme/again', frontmatterErrors: 'skip' });
   assert.equal(next.status, 201, next.text);
   const pdf2 = next.json.items.find((i: { name: string }) => i.name === 'pdf');
   assert.equal(pdf2.id, pdfId);
@@ -572,6 +579,59 @@ test('source/update carves a root skill the way the import did; a skills/ folder
   assert.deepEqual(rows.map((r) => ({ ...r })), [{ name: 'bar', latest_seq: 1 }, { name: 'foo', latest_seq: 1 }]);
 });
 
+test('re-import of a unit renamed upstream is a new unit: never versions the item that kept the old name, prefixed or not; source/update keeps an unprefixed name only when upstream does', async () => {
+  // A skill renamed upstream (old -> new, its name its install folder) is created beside the item that kept the old name.
+  gh.repos['acme/renamed'] = { default_branch: 'main', refs: { main: sha2('e1') }, trees: { [sha2('e1')]: { 'skills/s/SKILL.md': skill('old') }, [sha2('e2')]: { 'skills/s/SKILL.md': skill('new') } } };
+  const { t, h } = setup();
+  const r1 = await github(t, h, { repo: 'acme/renamed' });
+  assert.deepEqual(names(r1.json.items), ['skill:old']);
+  gh.repos['acme/renamed'].refs.main = sha2('e2');
+  const r2 = await github(t, h, { repo: 'acme/renamed' });
+  assert.equal(r2.status, 201, r2.text);
+  assert.deepEqual(r2.json.items.map((i: { name: string; op: string }) => [i.name, i.op]), [['new', 'create']]);
+  assert.deepEqual(r2.json.skipped, []);
+  const rows = t.db.prepare("SELECT name, latest_seq FROM items WHERE kind = 'skill' ORDER BY name").all() as { name: string; latest_seq: number }[];
+  assert.deepEqual(rows.map((r) => ({ ...r })), [{ name: 'new', latest_seq: 1 }, { name: 'old', latest_seq: 1 }]);
+
+  // An unprefixed name that merely ends in -<new name> is not a prefix: pdf-tools renamed to tools is not
+  // rewritten back to pdf-tools, on source/update (its skill.name.dir lint refuses it) or on re-import.
+  const tools = (name: string): Files => ({ 'skills/pdf-tools/SKILL.md': skill(name) });
+  gh.repos['acme/kit'] = { default_branch: 'main', refs: { main: sha2('e3') }, trees: { [sha2('e3')]: tools('pdf-tools'), [sha2('e4')]: tools('tools') } };
+  const t2 = setup();
+  const k1 = await github(t2.t, t2.h, { repo: 'acme/kit' });
+  assert.deepEqual(names(k1.json.items), ['skill:pdf-tools']);
+  gh.repos['acme/kit'].refs.main = sha2('e4');
+  const up = await t2.t.req('POST', `${API}/items/${k1.json.items[0].id}/source/update`, { headers: t2.h });
+  assert.equal(up.status, 422, up.text);
+  assert.match(up.text, /frontmatter name 'tools' must equal the item name 'pdf-tools'/);
+  const k2 = await github(t2.t, t2.h, { repo: 'acme/kit' });
+  assert.equal(k2.status, 201, k2.text);
+  assert.deepEqual(k2.json.items.map((i: { name: string; op: string }) => [i.name, i.op]), [['tools', 'create']]);
+  assert.equal(await fileText(t2.t, t2.h, k1.json.items[0].id, 'SKILL.md'), skill('pdf-tools'));
+
+  // A prefixed item renamed upstream is a new unit too: a-access is not versioned with 'entry'.
+  const t3 = setup();
+  const plug = (b: string, name: string): Files => ({ [`plugins/${b}/.claude-plugin/plugin.json`]: '{}', [`plugins/${b}/skills/access/SKILL.md`]: skill(name) });
+  const p1 = await pack(t3.t, t3.h, 'official.zip', { ...plug('a', 'access'), ...plug('b', 'access') });
+  assert.deepEqual(names(p1.json.items), ['skill:a-access', 'skill:b-access']);
+  const p2 = await pack(t3.t, t3.h, 'official.zip', { ...plug('a', 'entry'), ...plug('b', 'access') });
+  assert.equal(p2.status, 201, p2.text);
+  assert.deepEqual(p2.json.items.map((i: { name: string; op: string }) => [i.name, i.op]), [['entry', 'create'], ['b-access', 'unchanged']]);
+  assert.equal(count(t3.t, "SELECT COUNT(*) AS n FROM items WHERE name = 'a-access' AND latest_seq = 1"), 1);
+
+  // A plugin-folder prefix (inside one import) is kept by source/update, as a repository-name one is.
+  const twin = (desc: string): Files => ({ ...plug('a', 'access'), 'plugins/a/skills/access/SKILL.md': skill('access', desc), ...plug('b', 'access') });
+  gh.repos['acme/twin'] = { default_branch: 'main', refs: { main: sha2('e5') }, trees: { [sha2('e5')]: twin('v1'), [sha2('e6')]: twin('v2') } };
+  const t4 = setup();
+  const g1 = await github(t4.t, t4.h, { repo: 'acme/twin' });
+  assert.deepEqual(names(g1.json.items), ['skill:a-access', 'skill:b-access']);
+  gh.repos['acme/twin'].refs.main = sha2('e6');
+  const a = byName(g1.json.items, 'a-access');
+  const up2 = await t4.t.req('POST', `${API}/items/${a.id}/source/update`, { headers: t4.h });
+  assert.equal(up2.status, 200, up2.text);
+  assert.equal(await fileText(t4.t, t4.h, a.id, 'SKILL.md'), skill('access', 'v2').replace('name: access', 'name: a-access'));
+});
+
 test('github import: a folder of a repository over the per-version caps imports and updates; so does the whole repository, its units each held to the caps', async () => {
   const big: Files = Object.fromEntries(Array.from({ length: 1001 }, (_, i) => [`src/f${i}.ts`, `export const f${i} = ${i};\n`]));
   const folder = (desc: string): Files => ({ ...big, 'skills/pdf/SKILL.md': skill('pdf', desc), 'skills/pdf/ref.md': 'ref\n' });
@@ -627,7 +687,7 @@ test('github import: an artifact never comes from a tree; every unit skipped is 
   const art = await github(t, h, { repo: 'acme/art', kind: 'artifact' });
   assert.equal(art.status, 400, art.text);
   assert.match(art.json.error.message, /single file/);
-  const r = await pack(t, h, 'broken.zip', { 'skills/broken/SKILL.md': PLUGIN['skills/broken/SKILL.md'] }, { group: 'empty-kit' });
+  const r = await pack(t, h, 'broken.zip', { 'skills/broken/SKILL.md': PLUGIN['skills/broken/SKILL.md'] }, { group: 'empty-kit', frontmatterErrors: 'skip' });
   assert.equal(r.status, 422, r.text);
   assert.equal(r.json.error.code, 'nothing_imported');
   assert.match(r.json.error.details[0].reason, /description is required/);
@@ -636,7 +696,7 @@ test('github import: an artifact never comes from a tree; every unit skipped is 
   assert.equal((t.db.prepare('SELECT COUNT(*) AS n FROM deleted_group_slugs').get() as { n: number }).n, 0, 'the slug is not burnt');
   assert.equal((await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'empty-kit', name: 'G' } })).status, 201);
   // Without a group too: a 201 with items: [] reads as success to any client branching on 2xx.
-  const loose = await pack(t, h, 'broken2.zip', { 'skills/broken/SKILL.md': PLUGIN['skills/broken/SKILL.md'] });
+  const loose = await pack(t, h, 'broken2.zip', { 'skills/broken/SKILL.md': PLUGIN['skills/broken/SKILL.md'] }, { frontmatterErrors: 'skip' });
   assert.equal(loose.status, 422, loose.text);
   assert.equal(loose.json.error.code, 'nothing_imported');
   assert.equal(loose.json.error.message, 'every unit was skipped');
@@ -673,7 +733,7 @@ test('source/update re-homes a loose design.md the way its import did; a lone sk
 });
 
 test('github token: env first, then the github.token setting, else no Authorization header', async () => {
-  gh.repos['acme/tok'] = { default_branch: 'main', refs: { main: SHA_A }, trees: { [SHA_A]: { 'SKILL.md': skill('tok') } } };
+  gh.repos['acme/tok'] = { default_branch: 'main', refs: { main: sha2('e7') }, trees: { [sha2('e7')]: { 'SKILL.md': skill('tok') } } };
   const auth = () => gh.requests.slice(-3).map((r) => r.headers.authorization ?? null);
   const plain = setup();
   assert.equal((await github(plain.t, plain.h, { repo: 'acme/tok' })).status, 201);
@@ -2211,7 +2271,7 @@ const newGroup = async (t: TestCtx, h: H, slug: string, visibility = 'private') 
 test('p2wf: intoGroup adds every imported item to an existing own group (pack and GitHub); the result is that group', async () => {
   const { t, h } = setup();
   await newGroup(t, h, 'mine');
-  const r = await pack(t, h, 'kit.zip', PLUGIN, { intoGroup: 'mine' });
+  const r = await pack(t, h, 'kit.zip', PLUGIN, { intoGroup: 'mine', frontmatterErrors: 'skip' });
   assert.equal(r.status, 201, r.text);
   assert.equal(r.json.group.slug, 'mine');
   assert.deepEqual(memberNames(r.json.group), ['agent:reviewer', 'command:ship', 'skill:pdf']);
@@ -2222,7 +2282,7 @@ test('p2wf: intoGroup adds every imported item to an existing own group (pack an
   gh.repos['acme/into'] = { default_branch: 'main', refs: { main: sha2('1a') }, trees: { [sha2('1a')]: PLUGIN } };
   const t2 = setup();
   await newGroup(t2.t, t2.h, 'team');
-  const g = await github(t2.t, t2.h, { repo: 'acme/into', intoGroup: 'team' });
+  const g = await github(t2.t, t2.h, { repo: 'acme/into', intoGroup: 'team', frontmatterErrors: 'skip' });
   assert.equal(g.status, 201, g.text);
   assert.equal(g.json.group.slug, 'team');
   assert.deepEqual(memberNames(g.json.group), ['agent:reviewer', 'command:ship', 'skill:pdf']);
@@ -2274,7 +2334,7 @@ test('p2wf: intoGroup of a group the user cannot edit is 404 and imports nothing
   assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
 
   // The pack form is different on purpose: a browser sends an empty input as '', which reads as absent.
-  const blank = await pack(t, h, 'kit.zip', PLUGIN, { group: 'new-one', intoGroup: '' });
+  const blank = await pack(t, h, 'kit.zip', PLUGIN, { group: 'new-one', intoGroup: '', frontmatterErrors: 'skip' });
   assert.equal(blank.status, 201, blank.text);
   assert.equal(blank.json.group.slug, 'new-one');
 });
@@ -2283,10 +2343,10 @@ test('p2wf: re-importing the same repository into the same group versions the it
   gh.repos['acme/regroup'] = { default_branch: 'main', refs: { main: sha2('1c') }, trees: { [sha2('1c')]: PLUGIN, [sha2('1d')]: { ...PLUGIN, 'skills/pdf/SKILL.md': skill('pdf', 'Better.') } } };
   const { t, h } = setup();
   await newGroup(t, h, 'mine');
-  const first = await github(t, h, { repo: 'acme/regroup', intoGroup: 'mine' });
+  const first = await github(t, h, { repo: 'acme/regroup', intoGroup: 'mine', frontmatterErrors: 'skip' });
   assert.equal(first.status, 201, first.text);
   gh.repos['acme/regroup'].refs.main = sha2('1d');
-  const again = await github(t, h, { repo: 'acme/regroup', intoGroup: 'mine' });
+  const again = await github(t, h, { repo: 'acme/regroup', intoGroup: 'mine', frontmatterErrors: 'skip' });
   assert.equal(again.status, 201, again.text);
   assert.equal(again.json.items.find((i: { name: string }) => i.name === 'pdf').op, 'version');
   assert.deepEqual(memberNames(again.json.group), ['agent:reviewer', 'command:ship', 'skill:pdf']);
@@ -2296,8 +2356,8 @@ test('p2wf: re-importing the same repository into the same group versions the it
   // A pack re-uploaded into the group it already fills: unchanged, members included.
   const t2 = setup();
   await newGroup(t2.t, t2.h, 'mine');
-  const p1 = await pack(t2.t, t2.h, 'kit.zip', PLUGIN, { intoGroup: 'mine' });
-  const p2 = await pack(t2.t, t2.h, 'kit.zip', PLUGIN, { intoGroup: 'mine' });
+  const p1 = await pack(t2.t, t2.h, 'kit.zip', PLUGIN, { intoGroup: 'mine', frontmatterErrors: 'skip' });
+  const p2 = await pack(t2.t, t2.h, 'kit.zip', PLUGIN, { intoGroup: 'mine', frontmatterErrors: 'skip' });
   assert.deepEqual([p1.status, p2.status], [201, 201], p2.text);
   assert.ok(p2.json.items.every((i: { op: string }) => i.op === 'unchanged'));
   assert.equal(count(t2.t, 'SELECT COUNT(*) AS n FROM group_members'), 3);
@@ -2310,7 +2370,7 @@ test('p2wf: a group deleted after the route resolved intoGroup (during a GitHub 
   assert.equal((await t.req('DELETE', `${API}/groups/gone`, { headers: h })).status, 204);
   const p: Principal = { userId: u.id, username: u.username, isAdmin: false, via: 'key', scopes: ['read', 'write'], groupIds: null };
   const source = { kind: 'zip' as const, repo: 'kit.zip', ref: null, path: null, commit: 'c' };
-  assert.throws(() => importTree(t.ctx, p, tree(PLUGIN), { source, rootName: 'kit', note: 'n', intoGroup: stale }), { status: 404, code: 'not_found' });
+  assert.throws(() => importTree(t.ctx, p, tree(PLUGIN), { source, rootName: 'kit', note: 'n', intoGroup: stale, frontmatterErrors: 'skip' }), { status: 404, code: 'not_found' });
   assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
 });
 
@@ -2478,4 +2538,513 @@ test('mvfp: folderKinds with ../, an absolute path, an unknown kind or bad JSON 
   }
   assert.equal((await pack(t, h, 'kit.zip', NOTES, { folderKinds: '{not json' })).status, 400);
   assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
+});
+
+// ---------- 5ef6 name clashes, 0rdh frontmatter errors ----------
+
+const fileText = async (t: TestCtx, h: H, id: string, path: string) => (await t.req('GET', `${API}/items/${id}/files/${path}`, { headers: h })).text;
+const bundleFiles = async (t: TestCtx, h: H, slug: string) => {
+  const r = await t.req('GET', `${API}/groups/${slug}/bundle.zip`, { headers: h });
+  assert.equal(r.status, 200, r.text);
+  return new Map(Object.entries(unzipSync(r.bytes)).map(([p, b]) => [p, strFromU8(b)]));
+};
+type Out = { id: string; kind: string; name: string; op: string; source: { path: string }; version: { lint: unknown[] } };
+const byName = (items: Out[], name: string) => items.find((i) => i.name === name)!;
+
+test('5ef6: skills sharing a name inside one import each take their plugin (or skills/ parent) folder as prefix, frontmatter name included; the group holds them; a re-import is unchanged', async () => {
+  const { t, h } = setup();
+  const files: Files = {
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    'plugins/a/skills/access/SKILL.md': skill('access', 'Discord access.'),
+    'plugins/b/.claude-plugin/plugin.json': '{}',
+    'plugins/b/skills/access/SKILL.md': skill('access', 'iMessage access.'),
+    'plugins/b/skills/solo/SKILL.md': skill('solo'),
+    'x/skills/dup/SKILL.md': skill('dup'),
+    'y/skills/dup/SKILL.md': skill('dup'),
+  };
+  const r = await pack(t, h, 'official.zip', files, { group: 'official' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:a-access', 'skill:b-access', 'skill:solo', 'skill:x-dup', 'skill:y-dup']);
+  assert.deepEqual(r.json.skipped, []);
+  assert.deepEqual(r.json.group.members.map((m: { item: { name: string } }) => m.item.name).sort(), ['a-access', 'b-access', 'solo', 'x-dup', 'y-dup']);
+  const a = byName(r.json.items, 'a-access');
+  assert.equal(a.source.path, 'plugins/a/skills/access');
+  assert.equal(await fileText(t, h, a.id, 'SKILL.md'), skill('access', 'Discord access.').replace('name: access', 'name: a-access'));
+  // Installed under the prefixed name, its frontmatter name matching the folder.
+  const bundle = await bundleFiles(t, h, 'official');
+  assert.match(bundle.get('.claude/skills/b-access/SKILL.md')!, /^---\nname: b-access\ndescription: iMessage access\.\n/);
+  assert.ok(!bundle.has('.claude/skills/access/SKILL.md'));
+  // The same pack again: every unit is the item it created, nothing new.
+  const again = await pack(t, h, 'official.zip', files, { intoGroup: 'official' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => i.op), ['unchanged', 'unchanged', 'unchanged', 'unchanged', 'unchanged']);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 5);
+
+  // A port of a name every other copy was prefixed away from is still skipped as a port (ypmn), not imported bare.
+  const t2 = setup();
+  const ports = await pack(t2.t, t2.h, 'ports.zip', { ...files, '.codex/skills/access/SKILL.md': skill('access') });
+  assert.equal(ports.status, 201, ports.text);
+  assert.ok(!ports.json.items.some((i: Out) => i.name === 'access'));
+  assert.deepEqual(ports.json.skipped, [{ path: '.codex/skills/access', reason: portReason('plugins/a/skills/access', '.codex') }]);
+  // One non-port copy keeps the bare name: the ports give way to it as before.
+  assert.deepEqual(detectUnits(tree(files), 'x').units.filter((u) => u.path.endsWith('/access')).map((u) => u.prefix), ['a', 'b']);
+
+  // A copy an earlier import of this source holds under the bare name keeps it (re-import = update), so a
+  // plugin added upstream with the same skill name neither duplicates nor strands the existing item.
+  const t3 = setup();
+  const solo = { 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/skills/access/SKILL.md': skill('access', 'Discord access.') };
+  const first = await pack(t3.t, t3.h, 'grow.zip', solo, { group: 'grow' });
+  assert.deepEqual(names(first.json.items), ['skill:access']);
+  const grown = await pack(t3.t, t3.h, 'grow.zip', { ...solo, 'plugins/b/.claude-plugin/plugin.json': '{}', 'plugins/b/skills/access/SKILL.md': skill('access', 'iMessage access.') }, { intoGroup: 'grow' });
+  assert.equal(grown.status, 201, grown.text);
+  assert.deepEqual(grown.json.items.map((i: Out) => [i.name, i.op]).sort(), [['access', 'unchanged'], ['b-access', 'create']]);
+  assert.deepEqual(grown.json.skipped, []);
+  assert.equal(count(t3.t, 'SELECT COUNT(*) AS n FROM items'), 2);
+});
+
+test("5ef6: a prefixed name another skill of the import already carries is never taken: that copy is skipped, the repository's own skill imports", async () => {
+  const { t, h } = setup();
+  const files: Files = {
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    'plugins/a/skills/access/SKILL.md': skill('access', 'Discord access.'),
+    'plugins/b/.claude-plugin/plugin.json': '{}',
+    'plugins/b/skills/access/SKILL.md': skill('access', 'iMessage access.'),
+    'skills/a-access/SKILL.md': skill('a-access', 'The repository\'s own.'),
+  };
+  const r = await pack(t, h, 'taken.zip', files);
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:a-access', 'skill:b-access']);
+  assert.equal(byName(r.json.items, 'a-access').source.path, 'skills/a-access');
+  assert.deepEqual(r.json.skipped, [{ path: 'plugins/a/skills/access', reason: "another skill of this import is named 'access', and 'a-access' is the name of another skill of this import" }]);
+});
+
+test('5ef6: a twin its lint refuses forces no prefix: the clean copy keeps its bare name; when both import, both take their prefix', async () => {
+  const clean = { 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/skills/access/SKILL.md': skill('access', 'Discord access.'), 'plugins/b/.claude-plugin/plugin.json': '{}' };
+  // A twin with a frontmatter error, skipped.
+  let s = setup();
+  let r = await pack(s.t, s.h, 'fm.zip', { ...clean, 'plugins/b/skills/access/SKILL.md': '---\nname: access\n---\nNo description.\n' }, { frontmatterErrors: 'skip' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:access']);
+  // The lone top folder (plugins/) is the zip's wrapper, stripped.
+  assert.deepEqual(r.json.skipped.map((k: { path: string }) => k.path), ['b/skills/access']);
+  // A twin with an error no mode waives (compatibility over 500 characters), in the default mode.
+  s = setup();
+  r = await pack(s.t, s.h, 'lint.zip', { ...clean, 'plugins/b/skills/access/SKILL.md': `---\nname: access\ndescription: iMessage access.\ncompatibility: ${'x'.repeat(501)}\n---\nBody.\n` });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:access']);
+  // Both import (the frontmatter error accepted): both prefixed, as before.
+  s = setup();
+  r = await pack(s.t, s.h, 'both.zip', { ...clean, 'plugins/b/skills/access/SKILL.md': '---\nname: access\n---\nNo description.\n' }, { frontmatterErrors: 'import' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:a-access', 'skill:b-access']);
+});
+
+test("5ef6: a second pack's clash with an existing name is skipped (offering the prefixed name) by default; onNameClash 'prefix' imports it as <repo>-<name>, also for an agent; re-imports find it; source update keeps the prefix", async () => {
+  const BRAIN = '---\nname: brainstorming\ndescription: MPM brainstorming.\n---\n# Brainstorming\nUpstream body.\n';
+  gh.repos['obra/superpowers'] = { default_branch: 'main', refs: { main: sha2('5d') }, trees: { [sha2('5d')]: { 'skills/brainstorming/SKILL.md': skill('brainstorming') } } };
+  const mpm = (body: string): Files => ({ 'skills/brainstorming/SKILL.md': BRAIN + body, 'skills/other/SKILL.md': skill('other'), 'agents/reviewer.md': AGENT });
+  gh.repos['bobmatnyc/claude-mpm-skills'] = { default_branch: 'main', refs: { main: sha2('c2') }, trees: { [sha2('c2')]: mpm(''), [sha2('c3')]: mpm('More.\n') } };
+  const { t, h } = setup();
+  assert.equal((await github(t, h, { repo: 'obra/superpowers' })).status, 201);
+  assert.equal((await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'agent', content: AGENT } })).status, 201);
+
+  const skip = await github(t, h, { repo: 'bobmatnyc/claude-mpm-skills' });
+  assert.equal(skip.status, 201, skip.text);
+  assert.deepEqual(names(skip.json.items), ['skill:other']);
+  assert.deepEqual(skip.json.skipped, [
+    { path: 'skills/brainstorming', reason: "you already have a skill named 'brainstorming'", prefixed: 'claude-mpm-skills-brainstorming' },
+    { path: 'agents/reviewer.md', reason: "you already have an agent named 'reviewer'", prefixed: 'claude-mpm-skills-reviewer' },
+  ]);
+
+  const pre = await github(t, h, { repo: 'bobmatnyc/claude-mpm-skills', onNameClash: 'prefix', group: 'mpm' });
+  assert.equal(pre.status, 201, pre.text);
+  assert.deepEqual(pre.json.items.map((i: Out) => [i.name, i.op]).sort(), [['claude-mpm-skills-brainstorming', 'create'], ['claude-mpm-skills-reviewer', 'create'], ['other', 'unchanged']]);
+  assert.deepEqual(pre.json.skipped, []);
+  assert.deepEqual(pre.json.group.members.map((m: { item: { name: string } }) => m.item.name).sort(), ['claude-mpm-skills-brainstorming', 'claude-mpm-skills-reviewer', 'other']);
+  const brain = byName(pre.json.items, 'claude-mpm-skills-brainstorming');
+  assert.equal(await fileText(t, h, brain.id, 'SKILL.md'), BRAIN.replace('name: brainstorming', 'name: claude-mpm-skills-brainstorming'));
+  const rev = byName(pre.json.items, 'claude-mpm-skills-reviewer');
+  assert.match(await fileText(t, h, rev.id, 'claude-mpm-skills-reviewer.md'), /^---\nname: claude-mpm-skills-reviewer\n/);
+  const bundle = await bundleFiles(t, h, 'mpm');
+  assert.match(bundle.get('.claude/skills/claude-mpm-skills-brainstorming/SKILL.md')!, /^---\nname: claude-mpm-skills-brainstorming\n/);
+  assert.ok(bundle.has('.claude/agents/claude-mpm-skills-reviewer.md'));
+
+  // A later re-import without the option still finds the prefixed items (no skip, no duplicate).
+  const again = await github(t, h, { repo: 'bobmatnyc/claude-mpm-skills' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['claude-mpm-skills-brainstorming', 'unchanged'], ['claude-mpm-skills-reviewer', 'unchanged'], ['other', 'unchanged']]);
+  assert.deepEqual(again.json.skipped, []);
+
+  // Source update at a new commit: upstream still says 'brainstorming', the item keeps its prefixed name.
+  gh.repos['bobmatnyc/claude-mpm-skills'].refs.main = sha2('c3');
+  const up = await t.req('POST', `${API}/items/${brain.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.name, 'claude-mpm-skills-brainstorming');
+  assert.equal(up.json.item.latestSeq, 2);
+  assert.equal(await fileText(t, h, brain.id, 'SKILL.md'), (BRAIN + 'More.\n').replace('name: brainstorming', 'name: claude-mpm-skills-brainstorming'));
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 5);
+
+  // A zip's prefix is its file name.
+  const z = await pack(t, h, 'mytools.zip', { 'skills/brainstorming/SKILL.md': skill('brainstorming') }, { onNameClash: 'prefix' });
+  assert.equal(z.status, 201, z.text);
+  assert.deepEqual(names(z.json.items), ['skill:mytools-brainstorming']);
+  assert.equal((await pack(t, h, 'mytools.zip', {}, { onNameClash: 'sometimes' })).status, 400);
+});
+
+test('5ef6: a prefixed item stays the item of its source path once the clash is gone: a re-import versions it under its name, never creates a bare twin or a second member', async () => {
+  // Plugin b leaves upstream, so a's copy is the only 'access' left.
+  const { t, h } = setup();
+  const access = (desc: string): Files => ({ 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/skills/access/SKILL.md': skill('access', desc) });
+  const both = { ...access('Discord access.'), 'plugins/b/.claude-plugin/plugin.json': '{}', 'plugins/b/skills/access/SKILL.md': skill('access', 'iMessage access.') };
+  const r1 = await pack(t, h, 'official.zip', both, { group: 'official' });
+  assert.deepEqual(names(r1.json.items), ['skill:a-access', 'skill:b-access']);
+  const a = byName(r1.json.items, 'a-access');
+  const r2 = await pack(t, h, 'official.zip', access('Discord access, v2.'), { intoGroup: 'official' });
+  assert.equal(r2.status, 201, r2.text);
+  assert.deepEqual(r2.json.items.map((i: Out) => [i.name, i.op]), [['a-access', 'version']]);
+  assert.equal(r2.json.items[0].id, a.id);
+  assert.equal(await fileText(t, h, a.id, 'SKILL.md'), skill('access', 'Discord access, v2.').replace('name: access', 'name: a-access'));
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 2);
+  assert.deepEqual(memberNames(r2.json.group), ['skill:a-access', 'skill:b-access']);
+  // A different source path is its own item, even under a name another path's item once had.
+  const r3 = await pack(t, h, 'official.zip', { ...access('Discord access, v2.'), 'plugins/c/.claude-plugin/plugin.json': '{}', 'plugins/c/skills/access/SKILL.md': skill('access', 'Telegram access.') }, { intoGroup: 'official' });
+  assert.equal(r3.status, 201, r3.text);
+  assert.deepEqual(r3.json.items.map((i: Out) => [i.name, i.op]).sort(), [['a-access', 'unchanged'], ['c-access', 'create']]);
+  assert.equal(byName(r3.json.items, 'c-access').source.path, 'c/skills/access');
+  assert.deepEqual(memberNames(r3.json.group), ['skill:a-access', 'skill:b-access', 'skill:c-access']);
+});
+
+test("5ef6: a cross-source prefixed item stays its source's item once the other source's is deleted", async () => {
+  gh.repos['o/one'] = { default_branch: 'main', refs: { main: sha2('b8') }, trees: { [sha2('b8')]: { 'skills/brain/SKILL.md': skill('brain') } } };
+  gh.repos['o/two'] = { default_branch: 'main', refs: { main: sha2('b9') }, trees: { [sha2('b9')]: { 'skills/brain/SKILL.md': skill('brain', 'Two.') }, [sha2('ba')]: { 'skills/brain/SKILL.md': skill('brain', 'Two, v2.') } } };
+  const t2 = setup();
+  const one = await github(t2.t, t2.h, { repo: 'o/one' });
+  const two = await github(t2.t, t2.h, { repo: 'o/two', onNameClash: 'prefix', group: 'two' });
+  assert.deepEqual(names(two.json.items), ['skill:two-brain']);
+  assert.equal((await t2.t.req('DELETE', `${API}/items/${one.json.items[0].id}`, { headers: t2.h })).status, 204);
+  gh.repos['o/two'].refs.main = sha2('ba');
+  const again = await github(t2.t, t2.h, { repo: 'o/two', intoGroup: 'two' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]), [['two-brain', 'version']]);
+  assert.equal(await fileText(t2.t, t2.h, two.json.items[0].id, 'SKILL.md'), skill('brain', 'Two, v2.').replace('name: brain', 'name: two-brain'));
+  assert.equal(count(t2.t, "SELECT COUNT(*) AS n FROM items WHERE source_repo = 'o/two'"), 1);
+  assert.deepEqual(memberNames(again.json.group), ['skill:two-brain']);
+});
+
+/** Valid fences, invalid YAML (a colon inside a plain value): the frontmatter cannot be parsed, so no name can be set in it. */
+const BAD_YAML = '---\nname: access\ndescription: Use when: x\n---\n';
+const badYamlReason = (name: string) => `its frontmatter is not valid YAML, so it cannot take the prefixed name '${name}'`;
+
+test('5ef6: in-import twins whose frontmatter is not valid YAML are skipped (frontmatterErrors import), never imported under the bare name', async () => {
+  const { t, h } = setup();
+  const files: Files = {
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    'plugins/a/skills/access/SKILL.md': BAD_YAML,
+    'plugins/b/.claude-plugin/plugin.json': '{}',
+    'plugins/b/skills/access/SKILL.md': BAD_YAML,
+    'plugins/b/skills/solo/SKILL.md': skill('solo'),
+  };
+  const r = await pack(t, h, 'official.zip', files, { frontmatterErrors: 'import' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:solo']);
+  // The zip's one top folder (plugins/) is stripped.
+  assert.deepEqual(r.json.skipped, [
+    { path: 'a/skills/access', reason: `another skill of this import is named 'access', and ${badYamlReason('a-access')}` },
+    { path: 'b/skills/access', reason: `another skill of this import is named 'access', and ${badYamlReason('b-access')}` },
+  ]);
+  assert.equal(count(t, "SELECT COUNT(*) AS n FROM items WHERE name LIKE '%access'"), 0);
+  // A twin whose frontmatter parses but names nothing takes the prefixed name, inserted into its block.
+  const t2 = setup();
+  const r2 = await pack(t2.t, t2.h, 'official.zip', { ...files, 'plugins/a/skills/access/SKILL.md': '---\ndescription: Discord access.\n---\nBody.\n', 'plugins/b/skills/access/SKILL.md': skill('access') });
+  assert.equal(r2.status, 201, r2.text);
+  assert.deepEqual(names(r2.json.items), ['skill:a-access', 'skill:b-access', 'skill:solo']);
+  assert.equal(await fileText(t2.t, t2.h, byName(r2.json.items, 'a-access').id, 'SKILL.md'), '---\nname: a-access\ndescription: Discord access.\n---\nBody.\n');
+});
+
+test('5ef6: source update of a prefixed item whose upstream drops name: inserts the prefixed name; invalid YAML is refused, item unchanged; valid frontmatter again updates', async () => {
+  const brain = (fm: string) => ({ 'skills/brain/SKILL.md': fm });
+  gh.repos['o/one-p'] = { default_branch: 'main', refs: { main: sha2('f1') }, trees: { [sha2('f1')]: brain(skill('brain')) } };
+  gh.repos['o/two-p'] = {
+    default_branch: 'main',
+    refs: { main: sha2('f2') },
+    trees: { [sha2('f2')]: brain(skill('brain', 'Two.')), [sha2('f3')]: brain('---\ndescription: Two v2.\n---\n'), [sha2('f4')]: brain(BAD_YAML.replace('access', 'brain')), [sha2('f5')]: brain(skill('brain', 'Two v4.')) },
+  };
+  const { t, h } = setup();
+  assert.equal((await github(t, h, { repo: 'o/one-p' })).status, 201);
+  const two = await github(t, h, { repo: 'o/two-p', onNameClash: 'prefix' });
+  assert.deepEqual(names(two.json.items), ['skill:two-p-brain']);
+  const id = two.json.items[0].id;
+  const update = () => t.req('POST', `${API}/items/${id}/source/update`, { headers: h });
+
+  gh.repos['o/two-p'].refs.main = sha2('f3');
+  const up = await update();
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.latestSeq, 2);
+  assert.equal(await fileText(t, h, id, 'SKILL.md'), '---\nname: two-p-brain\ndescription: Two v2.\n---\n');
+
+  // Invalid YAML: no name can be set, so neither source/update nor a re-import accepting frontmatter errors writes it.
+  gh.repos['o/two-p'].refs.main = sha2('f4');
+  const bad = await update();
+  assert.equal(bad.status, 422, bad.text);
+  assert.equal(bad.json.error.message, badYamlReason('two-p-brain'));
+  const re = await github(t, h, { repo: 'o/two-p', frontmatterErrors: 'import' });
+  assert.equal(re.status, 422, re.text);
+  assert.deepEqual(re.json.error.details, [{ path: 'skills/brain', reason: badYamlReason('two-p-brain') }]);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items WHERE id = ? AND latest_seq = 2', id), 1);
+  assert.equal(await fileText(t, h, id, 'SKILL.md'), '---\nname: two-p-brain\ndescription: Two v2.\n---\n');
+
+  gh.repos['o/two-p'].refs.main = sha2('f5');
+  const ok = await update();
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(ok.json.item.latestSeq, 3);
+  assert.equal(await fileText(t, h, id, 'SKILL.md'), skill('brain', 'Two v4.').replace('name: brain', 'name: two-p-brain'));
+});
+
+test("5ef6: onNameClash 'prefix' across sources: invalid YAML is skipped, never imported bare; a prefixed agent whose upstream drops name: takes the prefixed name on source update", async () => {
+  const rev = (fm: string) => `---\n${fm}---\nYou review code.\n`;
+  gh.repos['o/x'] = {
+    default_branch: 'main',
+    refs: { main: sha2('f7') },
+    trees: { [sha2('f7')]: { 'skills/access/SKILL.md': BAD_YAML, 'agents/reviewer.md': AGENT }, [sha2('f8')]: { 'skills/access/SKILL.md': BAD_YAML, 'agents/reviewer.md': rev('description: Reviews, v2.\n') } },
+  };
+  const { t, h } = setup();
+  assert.equal((await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'skill', content: skill('access') } })).status, 201);
+  assert.equal((await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'agent', content: AGENT } })).status, 201);
+  const r = await github(t, h, { repo: 'o/x', onNameClash: 'prefix', frontmatterErrors: 'import' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['agent:x-reviewer']);
+  assert.deepEqual(r.json.skipped, [{ path: 'skills/access', reason: badYamlReason('x-access') }]);
+  const id = r.json.items[0].id;
+  gh.repos['o/x'].refs.main = sha2('f8');
+  const up = await t.req('POST', `${API}/items/${id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(await fileText(t, h, id, 'x-reviewer.md'), rev('name: x-reviewer\ndescription: Reviews, v2.\n'));
+});
+
+test("5ef6: onNameClash 'prefix' whose <repo>-<name> another zip's item holds says the prefixed name is taken too", async () => {
+  const { t, h } = setup();
+  assert.equal((await pack(t, h, 'a.zip', { 'skills/tools/SKILL.md': skill('tools') })).status, 201);
+  assert.equal((await pack(t, h, 'b.zip', { 'skills/mytools-tools/SKILL.md': skill('mytools-tools') })).status, 201);
+  const r = await pack(t, h, 'mytools.zip', { 'skills/tools/SKILL.md': skill('tools') }, { onNameClash: 'prefix' });
+  assert.equal(r.status, 422, r.text);
+  assert.deepEqual(r.json.error.details, [{ path: 'skills/tools', reason: "you already have a skill named 'tools', and its prefixed name 'mytools-tools' is taken too (imported from b.zip)" }]);
+});
+
+test('5ef6: a supplied name is the skill or agent frontmatter name', async () => {
+  gh.repos['acme/named'] = { default_branch: 'main', refs: { main: sha2('f6') }, trees: { [sha2('f6')]: { 'skills/foo/SKILL.md': skill('foo'), 'skills/bare/SKILL.md': '---\ndescription: No name.\n---\n', 'agents/reviewer.md': AGENT, 'skills/bad/SKILL.md': BAD_YAML } } };
+  const { t, h } = setup();
+  const s = await github(t, h, { repo: 'acme/named', path: 'skills/foo', name: 'mine' });
+  assert.equal(s.status, 201, s.text);
+  assert.equal(await fileText(t, h, s.json.items[0].id, 'SKILL.md'), skill('foo').replace('name: foo', 'name: mine'));
+  // With a kind override as well.
+  const k = await github(t, h, { repo: 'acme/named', path: 'skills/foo', kind: 'skill', name: 'mine-kind' });
+  assert.equal(k.status, 201, k.text);
+  assert.equal(await fileText(t, h, k.json.items[0].id, 'SKILL.md'), skill('foo').replace('name: foo', 'name: mine-kind'));
+  const b = await github(t, h, { repo: 'acme/named', path: 'skills/bare', name: 'mine-too' });
+  assert.equal(b.status, 201, b.text);
+  assert.equal(await fileText(t, h, b.json.items[0].id, 'SKILL.md'), '---\nname: mine-too\ndescription: No name.\n---\n');
+  const a = await github(t, h, { repo: 'acme/named', path: 'agents/reviewer.md', name: 'rev' });
+  assert.equal(a.status, 201, a.text);
+  assert.equal(await fileText(t, h, a.json.items[0].id, 'rev.md'), AGENT.replace('name: reviewer', 'name: rev'));
+  const bad = await github(t, h, { repo: 'acme/named', path: 'skills/bad', name: 'mine-bad', frontmatterErrors: 'import' });
+  assert.equal(bad.status, 422, bad.text);
+  assert.equal(bad.json.error.message, "its frontmatter is not valid YAML, so it cannot take the name 'mine-bad'");
+});
+
+/**
+ * anthropics/mkt imports discord-access and imessage-access (in-import prefix); someone/fork, the same tree,
+ * then takes fork-discord-access with onNameClash 'prefix' (both prefixes). No single candidate prefix
+ * (the repository name or one folder) turns the bare 'access' into that name, so it is recorded.
+ */
+const doublePrefixed = async (t: TestCtx, h: H) => {
+  const mkt = (desc: string, both = true): Files => ({
+    'plugins/discord/.claude-plugin/plugin.json': '{}',
+    'plugins/discord/skills/access/SKILL.md': skill('access', desc),
+    ...(both && { 'plugins/imessage/.claude-plugin/plugin.json': '{}', 'plugins/imessage/skills/access/SKILL.md': skill('access', 'iMessage access.') }),
+  });
+  gh.repos['anthropics/mkt'] = { default_branch: 'main', refs: { main: sha2('e1') }, trees: { [sha2('e1')]: mkt('Discord access.') } };
+  gh.repos['someone/fork'] = {
+    default_branch: 'main',
+    refs: { main: sha2('e2') },
+    trees: { [sha2('e2')]: mkt('Discord access.'), [sha2('e3')]: mkt('Discord access, v2.'), [sha2('e4')]: mkt('Discord access, v3.', false) },
+  };
+  assert.deepEqual(names((await github(t, h, { repo: 'anthropics/mkt' })).json.items), ['skill:discord-access', 'skill:imessage-access']);
+  const fork = await github(t, h, { repo: 'someone/fork', onNameClash: 'prefix' });
+  assert.equal(fork.status, 201, fork.text);
+  assert.deepEqual(names(fork.json.items), ['skill:fork-discord-access', 'skill:fork-imessage-access']);
+  return byName(fork.json.items, 'fork-discord-access');
+};
+const forkAccess = (desc: string) => skill('access', desc).replace('name: access', 'name: fork-discord-access');
+
+test('5ef6: an item prefixed inside its import and across sources (fork-discord-access) keeps its name on source update', async () => {
+  const { t, h } = setup();
+  const item = await doublePrefixed(t, h);
+  gh.repos['someone/fork'].refs.main = sha2('e3');
+  const up = await t.req('POST', `${API}/items/${item.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.name, 'fork-discord-access');
+  assert.equal(up.json.item.latestSeq, 2);
+  assert.equal(await fileText(t, h, item.id, 'SKILL.md'), forkAccess('Discord access, v2.'));
+  assert.equal((t.db.prepare('SELECT source_prefix FROM items WHERE id = ?').get(item.id) as { source_prefix: string }).source_prefix, 'fork-discord');
+});
+
+test('5ef6: a re-import of a doubly prefixed item at a new commit versions the same item, also once the in-import clash is gone', async () => {
+  const { t, h } = setup();
+  const item = await doublePrefixed(t, h);
+  // A new commit, both plugins still there: the unit takes discord-access inside the import again.
+  gh.repos['someone/fork'].refs.main = sha2('e3');
+  const again = await github(t, h, { repo: 'someone/fork' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['fork-discord-access', 'version'], ['fork-imessage-access', 'unchanged']]);
+  assert.equal(byName(again.json.items, 'fork-discord-access').id, item.id);
+  assert.equal(await fileText(t, h, item.id, 'SKILL.md'), forkAccess('Discord access, v2.'));
+  // imessage leaves upstream: the unit now takes the bare 'access', and is still the same item.
+  gh.repos['someone/fork'].refs.main = sha2('e4');
+  const gone = await github(t, h, { repo: 'someone/fork' });
+  assert.equal(gone.status, 201, gone.text);
+  assert.deepEqual(gone.json.items.map((i: Out) => [i.name, i.op, i.id]), [['fork-discord-access', 'version', item.id]]);
+  assert.equal(await fileText(t, h, item.id, 'SKILL.md'), forkAccess('Discord access, v3.'));
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 4);
+});
+
+test('5ef6: a unit whose <prefix>-<name> would pass the 64-character name limit is skipped, never prefixed to a cut name', async () => {
+  // 'claude-mpm-skills-' + 50 characters is 68: cut to 64, the name no longer ends in -<name> (source update
+  // would 422 on skill.name.dir), and these two would cut to the same name.
+  const long = 'x'.repeat(46);
+  const [one, two] = [`${long}-one`, `${long}-two`];
+  const reason = (name: string) => `you already have a skill named '${name}'; 'claude-mpm-skills-${name}' would exceed the 64-character name limit, so it cannot take the prefix`;
+  const { t, h } = setup();
+  for (const n of [one, two]) assert.equal((await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'skill', content: skill(n) } })).status, 201);
+  const mpm: Files = { [`skills/${one}/SKILL.md`]: skill(one), [`skills/${two}/SKILL.md`]: skill(two), 'skills/other/SKILL.md': skill('other') };
+  for (const onNameClash of ['skip', 'prefix']) {
+    const r = await pack(t, h, 'claude-mpm-skills.zip', mpm, { onNameClash });
+    assert.equal(r.status, 201, r.text);
+    assert.deepEqual(names(r.json.items), ['skill:other']);
+    // No prefixed offer: the dialog must not propose a name the import cannot create.
+    assert.deepEqual(r.json.skipped, [{ path: `skills/${one}`, reason: reason(one) }, { path: `skills/${two}`, reason: reason(two) }]);
+  }
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 3);
+
+  // Inside one import: the copy whose plugin prefix would pass the limit is skipped, the other is prefixed.
+  const t2 = setup();
+  const plugin = 'p'.repeat(20);
+  const r = await pack(t2.t, t2.h, 'official.zip', {
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    [`plugins/a/skills/${one}/SKILL.md`]: skill(one),
+    [`plugins/${plugin}/.claude-plugin/plugin.json`]: '{}',
+    [`plugins/${plugin}/skills/${one}/SKILL.md`]: skill(one),
+  });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), [`skill:a-${one}`]);
+  // The zip's one top folder (plugins/) is stripped.
+  assert.deepEqual(r.json.skipped, [{ path: `${plugin}/skills/${one}`, reason: `another skill of this import is named '${one}', and '${plugin}-${one}' would exceed the 64-character name limit` }]);
+});
+
+test("5ef6: a one-file GitHub import's clash is reported at the file's path, not the root of its one-file tree", async () => {
+  gh.repos['acme/stax'] = { default_branch: 'main', refs: { main: sha2('d4') }, trees: { [sha2('d4')]: { 'skill.md': skill('stax'), 'docs/skill.md': skill('stax') } } };
+  const { t, h } = setup();
+  assert.equal((await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'skill', content: skill('stax') } })).status, 201);
+  for (const path of ['skill.md', 'docs/skill.md']) {
+    const r = await github(t, h, { repo: 'acme/stax', path });
+    assert.equal(r.status, 422, r.text);
+    assert.deepEqual(r.json.error.details, [{ path, reason: "you already have a skill named 'stax'", prefixed: 'stax-stax' }]);
+  }
+});
+
+/** One clean skill and one missing its description, the first paragraph of its body its description of last resort. */
+const NODESC = '---\nname: nodesc\n---\n# No description\n\nFirst paragraph\nof the body.\n\nSecond.\n';
+const MIXED: Files = { 'skills/good/SKILL.md': skill('good'), 'skills/nodesc/SKILL.md': NODESC };
+const NODESC_ERRORS = [{ path: 'skills/nodesc', kind: 'skill', errors: ['frontmatter description is required'] }];
+
+test("0rdh: frontmatter errors are asked about (409, nothing written, no group); 'skip' matches today; 'import' stores them with upstream bytes and waived warnings", async () => {
+  const ask = setup();
+  const r = await pack(ask.t, ask.h, 'mixed.zip', MIXED, { group: 'mixed' });
+  assert.equal(r.status, 409, r.text);
+  assert.equal(r.json.error.code, 'frontmatter_errors');
+  assert.deepEqual(r.json.error.details, NODESC_ERRORS);
+  assert.equal(count(ask.t, 'SELECT COUNT(*) AS n FROM items'), 0);
+  assert.equal(count(ask.t, 'SELECT COUNT(*) AS n FROM scp_groups'), 0);
+  assert.equal(count(ask.t, 'SELECT COUNT(*) AS n FROM deleted_group_slugs'), 0, 'the slug stays free');
+  assert.equal((await pack(ask.t, ask.h, 'mixed.zip', MIXED, { frontmatterErrors: 'maybe' })).status, 400);
+
+  const skip = await pack(ask.t, ask.h, 'mixed.zip', MIXED, { group: 'mixed', frontmatterErrors: 'skip' });
+  assert.equal(skip.status, 201, skip.text);
+  assert.deepEqual(names(skip.json.items), ['skill:good']);
+  assert.deepEqual(skip.json.skipped, [{ path: 'skills/nodesc', reason: 'frontmatter description is required' }]);
+
+  const imp = setup();
+  const r2 = await pack(imp.t, imp.h, 'mixed.zip', MIXED, { group: 'mixed', frontmatterErrors: 'import' });
+  assert.equal(r2.status, 201, r2.text);
+  assert.deepEqual(names(r2.json.items), ['skill:good', 'skill:nodesc']);
+  assert.deepEqual(r2.json.group.members.map((m: { item: { name: string } }) => m.item.name).sort(), ['good', 'nodesc']);
+  const nodesc = byName(r2.json.items, 'nodesc') as Out & { description: string; version: { lint: unknown[] } };
+  assert.equal(nodesc.description, 'First paragraph of the body.');
+  assert.deepEqual(nodesc.version.lint.filter((l) => (l as { waived?: boolean }).waived), [
+    { level: 'warn', code: 'skill.description.missing', message: 'frontmatter description is required', path: 'SKILL.md', waived: true },
+  ]);
+  assert.deepEqual(byName(r2.json.items, 'good').version.lint, [], 'a clean unit carries no waiver');
+  assert.equal(await fileText(imp.t, imp.h, nodesc.id, 'SKILL.md'), NODESC, 'the upstream bytes, untouched');
+  // A bundle serves the upstream file unchanged.
+  assert.equal((await bundleFiles(imp.t, imp.h, 'mixed')).get('.claude/skills/nodesc/SKILL.md'), NODESC);
+  // A re-upload does not ask again for the unit it took with its errors.
+  const again = await pack(imp.t, imp.h, 'mixed.zip', { ...MIXED, 'skills/nodesc/SKILL.md': NODESC + 'Third.\n' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['good', 'unchanged'], ['nodesc', 'version']]);
+  // A local edit is still held to lint: the waiver is the import's, not the editor's.
+  const edit = await imp.t.req('POST', `${API}/items/${nodesc.id}/versions`, { headers: imp.h, json: { content: NODESC } });
+  assert.equal(edit.status, 422, edit.text);
+});
+
+test('0rdh: a unit with any other lint error (bad skill name characters) is skipped in every mode, never asked about', async () => {
+  const BAD = '---\nname: Bad_Name\n---\nno description either\n';
+  for (const mode of [undefined, 'ask', 'import', 'skip']) {
+    const { t, h } = setup();
+    const r = await pack(t, h, 'bad.zip', { 'skills/good/SKILL.md': skill('good'), 'skills/bad/SKILL.md': BAD }, mode ? { frontmatterErrors: mode } : {});
+    assert.equal(r.status, 201, `${mode}: ${r.text}`);
+    assert.deepEqual(names(r.json.items), ['skill:good']);
+    assert.equal(r.json.skipped.length, 1);
+    assert.equal(r.json.skipped[0].path, 'skills/bad');
+    assert.match(r.json.skipped[0].reason, /must match/);
+  }
+});
+
+test("0rdh: GitHub, silent-failure-hunter's plugin folder (a YAML error) is asked about, then imported named by its file; source update and re-import accept it without asking", async () => {
+  const HUNTER = (body: string) => `---\nname: silent-failure-hunter\ndescription: Use this agent when: reviewing code\nmodel: inherit\n---\n# Hunter\n\n${body}`;
+  const official = (body: string): Files => ({
+    'plugins/pr-review-toolkit/.claude-plugin/plugin.json': '{"name":"pr-review-toolkit"}',
+    'plugins/pr-review-toolkit/agents/silent-failure-hunter.md': HUNTER(body),
+    'plugins/pr-review-toolkit/agents/clean.md': agentMd('clean'),
+  });
+  gh.repos['anthropics/claude-plugins-official'] = {
+    default_branch: 'main',
+    refs: { main: sha2('5e') },
+    trees: { [sha2('5e')]: official('You hunt silent failures.\n'), [sha2('5f')]: official('You hunt them all.\n'), [sha2('d3')]: official('Every one.\n') },
+  };
+  const url = 'https://github.com/anthropics/claude-plugins-official/tree/main/plugins/pr-review-toolkit';
+  const { t, h } = setup();
+  const ask = await github(t, h, { url });
+  assert.equal(ask.status, 409, ask.text);
+  assert.deepEqual(ask.json.error.details, [
+    { path: 'agents/silent-failure-hunter.md', kind: 'agent', errors: ['frontmatter: Nested mappings are not allowed in compact mappings at line 2, column 14:', 'frontmatter name is required', 'frontmatter description is required'] },
+  ]);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
+
+  const r = await github(t, h, { url, frontmatterErrors: 'import' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['agent:clean', 'agent:silent-failure-hunter']);
+  const hunter = byName(r.json.items, 'silent-failure-hunter') as Out & { description: string; version: { lint: { waived?: boolean }[] } };
+  assert.equal(hunter.description, 'You hunt silent failures.');
+  assert.equal(hunter.version.lint.filter((l) => (l as { waived?: boolean }).waived).length, 3);
+  assert.equal(await fileText(t, h, hunter.id, 'silent-failure-hunter.md'), HUNTER('You hunt silent failures.\n'));
+
+  gh.repos['anthropics/claude-plugins-official'].refs.main = sha2('5f');
+  const up = await t.req('POST', `${API}/items/${hunter.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.latestSeq, 2);
+  assert.ok(up.json.item.version.lint.some((l: { waived?: boolean }) => l.waived));
+
+  gh.repos['anthropics/claude-plugins-official'].refs.main = sha2('d3');
+  const again = await github(t, h, { url });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['clean', 'unchanged'], ['silent-failure-hunter', 'version']]);
 });

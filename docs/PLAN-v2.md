@@ -133,11 +133,11 @@ API: `GET /admin/settings` reports `clientSecretSet: true`, `tokenSet: true`.
 ## D1 imports (`server/src/imports/*`, tests `server/test/imports.test.ts`)
 
 ```
-POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [intoGroup=<slug>] [kind] [folderKinds=<JSON>] [includeRepoTooling=true]  -> 201 ImportResult
-POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, intoGroup?, folderKinds?, includeRepoTooling?  -> 201 ImportResult
+POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [intoGroup=<slug>] [kind] [folderKinds=<JSON>] [includeRepoTooling=true] [onNameClash] [frontmatterErrors]  -> 201 ImportResult | 409 frontmatter_errors
+POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, intoGroup?, folderKinds?, includeRepoTooling?, onNameClash?, frontmatterErrors?  -> 201 ImportResult | 409 frontmatter_errors
 POST /items/:id/source/check                                                                     -> {source, upToDate, latestCommit}
 POST /items/:id/source/update  {note?}                                                           -> {item, skipped}  (new version; 409 up_to_date when nothing changed; skipped: the path's symlinks)
-ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason}], skippedFolders:[{path, count}], source: ItemSource | null}
+ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason, prefixed?}], skippedFolders:[{path, count}], source: ItemSource | null}
 ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: string|null, commit: string|null}
 ```
 
@@ -250,11 +250,12 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   the same import is skipped as `another copy of this skill (<path>) was imported; this one is the
   <tool> port`. Re-import and `updateTree` detect the same way, so the kept copy stays the same.
 - Reuse `items/import.ts importUpload` / `items/service.ts createItemTx` for each unit; pass
-  `source` on every item. `name` collisions with the user's existing items of that kind: 409
-  `name_taken` per unit goes to `skipped`, except when the existing item has the same
-  `source_repo`+`source_path`: then add a new version to it instead (re-import = update), unless
-  its `source_commit` already equals the import's (same commit, or the same zip bytes): then
-  `op: 'unchanged'`, so a local edit made since stays the latest version. When the name holder
+  `source` on every item. An existing item of that kind with the unit's `source_repo`+`source_path`
+  is the unit's item whatever its name (`importUnit`, checked before creating): add a new version to
+  it (re-import = update), unless its `source_commit` already equals the import's (same commit, or
+  the same zip bytes): then `op: 'unchanged'`, so a local edit made since stays the latest version.
+  Otherwise a `name` collision with the user's existing items of that kind is a 409 `name_taken`
+  per unit, listed in `skipped`. When the name holder
   came from a zip under another file name, the reason names that file ("upload the file under
   that name to update it"): the zip's identity is its file name.
 - `group`: when given, create the group (`groups/service.ts createGroup`, 409 if taken) with all
@@ -295,11 +296,61 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   the same way), or `package` the whole folder's remaining files one item. A key that fails
   `normalizePath` (`../x`, `/abs`, `C:/x`) is 400 before anything is fetched; a folder with nothing
   left lands in `skipped` as `folderKinds: no unrecognised files in this folder; ignored`.
+- Name clashes (v3 5ef6). Inside one import, skills sharing a name (`previewItem` names every unit
+  before the transaction) are all imported: each non-port copy takes `Unit.prefix`, its plugin
+  root's folder name, else for `<x>/skills/<name>` the `<x>` (never a dot folder or a port), as
+  `<prefix>-<name>`; ports of a name every copy was prefixed away from are skipped as ports. Agents
+  and other kinds keep the bppq rule (the second is `name_taken`). Across sources: a name an item
+  from another source (or a local one) holds is skipped, the `skipped` entry carrying
+  `prefixed: '<repo>-<name>'`; `onNameClash: 'prefix'` (pack form field too) imports it under that
+  name, `<repo>` the repository name or the zip's file name less `.zip`. Same-repository clashes
+  keep their reasons. A renamed skill or agent has its entry's frontmatter `name:` rewritten
+  (`items/service.ts renameFrontmatter`, as a fork's): chosen over relaxing `lint.ts`
+  `skill.name.dir`, since Claude Code identifies a skill by that name and it must match the
+  `.claude/skills/<name>/` folder the bundle installs. The item records what was put in front of
+  the unit's bare name, `source_prefix` (migration 12): the in-import prefix, the cross-source one,
+  or both combined (`fork-discord` for `fork-discord-access`, a fork of a repository whose plugins
+  discord and imessage both ship `access`). `versionFromSource` re-applies the name (`keepPrefix`:
+  the item name is `<source_prefix>-<upstream name>`), and a re-import, with or without the option
+  and after the clash is gone, versions the prefixed item of that source path (found by source and
+  the name the unit takes, or `<source_prefix>-<bare name>`). Rows from before the column infer
+  the prefix (`wasPrefixed`: the repository or zip name, or one folder above the unit), which
+  misses an item that took both. A unit imported with `frontmatterErrors: 'import'` that is also
+  prefixed has its `SKILL.md` `name:` rewritten to the prefixed item name all the same (a skill's
+  name is its install folder, `skill.name.dir`), so its bytes differ from upstream's in that one
+  line; everything else stays upstream's. The rule (`pinName`): a skill, or a one-file agent, that
+  carries a name SCP chose (a prefix, or a `name` the import was given) always stores exactly that
+  `name:`. A block that parses but names nothing gets the line added first (`renameFrontmatter`,
+  the value emitted by the yaml library; a key a line edit cannot reach is re-emitted whole); text
+  with no frontmatter gets a block. A block that does not parse (invalid YAML or fence) cannot take
+  it: 422 `frontmatter_invalid`, so the import skips the unit ("its frontmatter is not valid YAML,
+  so it cannot take the prefixed name '<n>'") instead of importing it bare, and a source update or
+  re-import refuses and leaves the item unchanged. `keepPrefix` pins an upstream that dropped
+  `name:` when the item records a `source_prefix` it starts with (a row from before the column
+  keeps the nameless entry). A cross-source retry whose `<repo>-<name>` is itself held is skipped
+  saying the prefixed name is taken too, with no `prefixed` offer. A given `name` is not recorded,
+  so a later source update of such a skill whose upstream names it otherwise is refused by
+  `skill.name.dir` as before. A prefixed name
+  is never cut to the 64-character cap (a cut one breaks `keepPrefix`, and two long names can cut to
+  one): such a unit is skipped with the limit as its reason and no `prefixed` offer.
+- Frontmatter errors (v3 0rdh): `items/lint.ts FRONTMATTER_ERRORS` (`frontmatter.invalid`,
+  `skill.description.missing`/`.len`, `agent.name.missing`, `agent.description.missing`) are the
+  errors an import may accept. `frontmatterErrors: 'ask' | 'import' | 'skip'` (default `ask`): with
+  `ask`, units whose every lint error is one of those (and no earlier import of the same source
+  took them) make the import 409 `frontmatter_errors`, `details: [{path, kind, errors}]`, before
+  the transaction, so nothing exists, no group either. `skip` is the earlier behaviour. `import`
+  stores the upstream bytes untouched; the errors stay on the version as `level: 'warn'`,
+  `waived: true`; a skill or agent the frontmatter does not name takes its folder or file name
+  (never a heading), and a missing description the body's first non-heading paragraph. The item
+  gets `lint_waived = 1` (migration 11), and every later source write (`versionFromSource`:
+  source/update and re-imports) accepts the same errors without asking. A local edit is still
+  gated. Any other lint error skips the unit in every mode.
 - Provenance: `source_kind`, `source_repo` (`owner/repo` as GitHub's `full_name` spells it, zip: the
   file name), `source_ref`, `source_path`, `source_commit` (zip: sha256 of the zip bytes),
   `source_tree_sha256` (the tree the source last wrote), `source_scope` (`root` for a root
   `SKILL.md` detection unit, `tree` for a folder unit or a `kind` override), `source_carve` (v3: the
-  paths inside a folder unit that another unit or skip took first). Version note
+  paths inside a folder unit that another unit or skip took first), `source_prefix` (v3 5ef6: what
+  the import put in front of the unit's bare name). Version note
   `import github owner/repo@<7sha> <path>` / `import zip <name>`.
 - `source/check`: GitHub only (404 otherwise). Resolves `ref` again (a sha ref is always up to
   date), compares to `source_commit`. `source/update` re-imports that path at the latest commit as
@@ -324,9 +375,11 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   in `agents`/`commands`/`prompts` makes the loose `.md` files at its root that kind. The md-only
   fallback re-homes `design.md` to `DESIGN.md` like the single-file import (a root `skill.md` is
   the root skill before the fallback is reached).
-  Re-import updates an item only when the name holder has the same `source_repo` (compared
-  case-insensitively: GitHub names and zip file names are) + `source_path` AND that name; a unit
-  renamed upstream while an unrelated item holds the new name is skipped. At the same commit the
+  Re-import updates the item of that kind with the same `source_repo` (compared
+  case-insensitively: GitHub names and zip file names are) + `source_path` and the unit's name, or
+  that name under its 5ef6 prefix; two source paths never resolve to one item. A unit renamed
+  upstream is a new unit: created under the new name, or skipped when an unrelated item holds it,
+  never written into the item that kept the old name. At the same commit the
   row's `source_ref` still follows the ref named (a tag, then the branch at that commit).
   A private repository is refused to non-admins with the very text a missing repository gets.
 - Body caps: pack `import.max_archive_mb` (default 35 MB, read per request; added to `UPLOAD_ROUTES` by D0), single-file import the same at most 35 MB, github JSON 1 MB.

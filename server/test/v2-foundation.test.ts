@@ -27,14 +27,18 @@ test('migration 4 adds the v2 tables and columns, and upgrades a v3 database', (
   }
   // Migration 10: what another unit of an import carved out of a skill folder (imports/pack.ts updateTree).
   assert.ok(cols('items').includes('source_carve'));
-  assert.equal((t.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10);
+  // Migration 11 (v3 0rdh): items an import took with their frontmatter errors.
+  assert.ok(cols('items').includes('lint_waived'));
+  // Migration 12 (v3 5ef6): the prefix an import put in front of a unit's bare name.
+  assert.ok(cols('items').includes('source_prefix'));
+  assert.equal((t.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
 
   // migrate() is idempotent and a fresh database lands on the same version.
   const fresh = new DatabaseSync(':memory:');
   fresh.exec('PRAGMA foreign_keys = ON');
   migrate(fresh);
   migrate(fresh);
-  assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10);
+  assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
   assert.throws(() => t.db.prepare('INSERT INTO group_includes (group_id, included_id, added_at) VALUES (?, ?, ?)').run('a', 'a', 'now'), /CHECK/);
 });
 

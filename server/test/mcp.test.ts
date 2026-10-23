@@ -5,6 +5,7 @@ import vm from 'node:vm';
 import { createAdaptorServer } from '@hono/node-server';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { strToU8, zipSync } from 'fflate';
 import { listenLocal, makeTestCtx, type TestCtx } from './helpers.ts';
 import { renderVersionHtml } from '../src/artifacts/shares.ts';
 import { createItemTx, getItemRow, resolveVersion } from '../src/items/service.ts';
@@ -817,6 +818,25 @@ test('tool results stay under host output budgets for max-size items', async () 
     const xsd = await call(c, 'get_skill_file', { id: bin.id, path: 'schema.xsd' });
     assert.equal(xsd.structuredContent.encoding, 'utf8');
     assert.equal(xsd.structuredContent.text, '<?xml version="1.0"?>\n<xs:schema/>\n');
+  });
+});
+
+test('0rdh: get_skill and get_md of items imported with frontmatter errors serve the upstream files unchanged', async () => {
+  const skillMd = '---\nname: rough\n---\nNo description in the frontmatter.\n';
+  const agentMd = '---\nname: hunter\ndescription: Use this agent when: reviewing\n---\nYou hunt.\n';
+  const fd = new FormData();
+  fd.set('file', new File([zipSync({ 'skills/rough/SKILL.md': strToU8(skillMd), 'agents/hunter.md': strToU8(agentMd) }) as Uint8Array<ArrayBuffer>], 'rough.zip'));
+  fd.set('frontmatterErrors', 'import');
+  const r = await f.t.req('POST', `${API}/items/import/pack`, { headers: f.full.headers, body: fd });
+  assert.equal(r.status, 201, r.text);
+  const id = (name: string) => (r.json.items as { id: string; name: string }[]).find((i) => i.name === name)!.id;
+  await withClient('/mcp', f.full.headers, async (c) => {
+    const sk = await call(c, 'get_skill', { id: id('rough') });
+    assert.ok(!sk.isError, text(sk));
+    assert.ok(text(sk).includes(`--- SKILL.md ---\n${skillMd}`), text(sk));
+    const md = await call(c, 'get_md', { id: id('hunter') });
+    assert.ok(!md.isError, text(md));
+    assert.equal(md.structuredContent.text, agentMd);
   });
 });
 
