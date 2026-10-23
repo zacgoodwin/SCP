@@ -31,6 +31,14 @@ it); to keep it off the artifact origin entirely, serve that from a different ho
 Data lives in the `scp-data` named volume (`/data/scp.db`, SQLite in WAL mode), so it survives
 `docker compose down` and `up`. `docker compose down -v` deletes it.
 
+Prebuilt images are published to `ghcr.io/zacgoodwin/scp` (`:<version>`, plus `:latest` for
+non-prerelease versions). To use one
+instead of building, set `image: ghcr.io/zacgoodwin/scp:latest` and remove `build: .` in
+`docker-compose.yml`. To cut a release, bump `VERSION`, merge, then push the matching tag
+(`git tag v$(cat VERSION) && git push origin v$(cat VERSION)`); `.github/workflows/release.yml`
+refuses a tag that is not on `main`, does not match `VERSION`, or carries a `VERSION` that is not
+semver.
+
 ### Configuration
 
 Set these in your shell or in a `.env` file next to `docker-compose.yml`:
