@@ -268,6 +268,10 @@ const MIGRATIONS: string[] = [
   `ALTER TABLE items ADD COLUMN lint_waived INTEGER NOT NULL DEFAULT 0;`,
   // v3 5ef6: the prefix an import put in front of the unit's bare name (imports/pack.ts keepPrefix, importUnit).
   `ALTER TABLE items ADD COLUMN source_prefix TEXT;`,
+  // v3 jcfm: the frontmatter fields (JSON) an import supplied to an upstream file that had none, re-applied
+  // on every source write; upstream_frontmatter is 1 while upstream ships its own instead (imports/pack.ts versionFromSource).
+  `ALTER TABLE items ADD COLUMN supplied_frontmatter TEXT;
+   ALTER TABLE items ADD COLUMN upstream_frontmatter INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export function openDb(path: string): Db {

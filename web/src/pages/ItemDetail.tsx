@@ -235,6 +235,20 @@ function ItemView({ id }: { id: string }) {
           onRepinned={setItem}
         />
       )}
+      {item.suppliedFrontmatter && (
+        <SuppliedPanel
+          key={item.suppliedFrontmatter.description}
+          item={item}
+          supplied={item.suppliedFrontmatter}
+          onSaved={(next) => {
+            if (next.latestSeq !== item.latestSeq) onNewVersion(next);
+            else {
+              setItem(next);
+              toast('Description saved.', 'ok');
+            }
+          }}
+        />
+      )}
 
       <Tabs tabs={tabs} value={tab} onChange={setTab} label="Item sections" idPrefix="tab" panelId="tab-panel" />
       <section id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="tab-panel">
@@ -421,6 +435,86 @@ function SourcePanel({
             </span>
           )}
         </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * jcfm: the frontmatter SCP supplied on import because upstream had none, re-applied on every source update.
+ * Editing the description writes a new version while the block is in use; while upstream ships its own, it only changes the fallback.
+ */
+function SuppliedPanel({ item, supplied, onSaved }: { item: api.ItemDetail; supplied: { name?: string; description: string }; onSaved: (i: api.ItemDetail) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [description, setDescription] = useState(supplied.description);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      onSaved((await imp.editSuppliedFrontmatter(item.id, description)).item);
+    } catch (err) {
+      setError(err);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="card stack-tight" aria-label="Supplied frontmatter">
+      <div className="row wrap">
+        <strong>Frontmatter supplied by SCP</strong>
+        {item.upstreamFrontmatter && (
+          <span className="badge badge-shared" role="status">
+            upstream now provides its own frontmatter
+          </span>
+        )}
+      </div>
+      <p className="muted">
+        {item.upstreamFrontmatter
+          ? 'The source file has frontmatter of its own now, so the latest version uses it. These fields are added again if upstream drops it.'
+          : 'The source file has no frontmatter, so SCP adds these fields to it on import and on every update from the source.'}
+      </p>
+      {editing ? (
+        <form className="stack-tight" onSubmit={save}>
+          <label className="field">
+            <span>Description</span>
+            <textarea rows={3} maxLength={1024} required value={description} onChange={(e) => setDescription(e.target.value)} />
+          </label>
+          <ErrorBox error={error} />
+          <div className="row end">
+            <button type="button" className="btn" onClick={() => setEditing(false)}>
+              Cancel
+            </button>
+            <button type="submit" className="btn btn-primary" disabled={busy || !description.trim()}>
+              {busy ? 'Saving…' : item.upstreamFrontmatter ? 'Save' : 'Save as a new version'}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <>
+          <dl className="kv">
+            {supplied.name !== undefined && (
+              <>
+                <dt>name</dt>
+                <dd>
+                  <code>{supplied.name}</code>
+                </dd>
+              </>
+            )}
+            <dt>description</dt>
+            <dd className="pre-wrap">{supplied.description}</dd>
+          </dl>
+          {item.canEdit && (
+            <div className="row">
+              <button type="button" className="btn btn-small" onClick={() => setEditing(true)}>
+                Edit description
+              </button>
+            </div>
+          )}
+        </>
       )}
     </section>
   );

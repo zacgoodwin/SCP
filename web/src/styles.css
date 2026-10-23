@@ -258,6 +258,7 @@ input:user-invalid { border-color: var(--danger); }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-1) var(--space-4); margin: 0; }
 .kv dt { color: var(--text-muted); }
 .kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+.pre-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 .audit-detail summary { cursor: pointer; font-size: var(--text-sm); }
 .audit-detail .kv { margin-top: var(--space-1); font-size: var(--text-sm); }
 .audit-detail dd code { overflow-wrap: anywhere; }

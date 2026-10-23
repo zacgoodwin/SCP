@@ -133,10 +133,11 @@ API: `GET /admin/settings` reports `clientSecretSet: true`, `tokenSet: true`.
 ## D1 imports (`server/src/imports/*`, tests `server/test/imports.test.ts`)
 
 ```
-POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [intoGroup=<slug>] [kind] [folderKinds=<JSON>] [includeRepoTooling=true] [onNameClash] [frontmatterErrors]  -> 201 ImportResult | 409 frontmatter_errors
-POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, intoGroup?, folderKinds?, includeRepoTooling?, onNameClash?, frontmatterErrors?  -> 201 ImportResult | 409 frontmatter_errors
+POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [intoGroup=<slug>] [kind] [folderKinds=<JSON>] [includeRepoTooling=true] [onNameClash] [frontmatterErrors] [description]  -> 201 ImportResult | 409 frontmatter_errors
+POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, intoGroup?, folderKinds?, includeRepoTooling?, onNameClash?, frontmatterErrors?, description?  -> 201 ImportResult | 409 frontmatter_errors
 POST /items/:id/source/check                                                                     -> {source, upToDate, latestCommit}
 POST /items/:id/source/update  {note?}                                                           -> {item, skipped}  (new version; 409 up_to_date when nothing changed; skipped: the path's symlinks)
+PUT  /items/:id/source/frontmatter  {description}                                                -> {item}  (jcfm; 404 when SCP supplied nothing; 409 frontmatter_edited)
 ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason, prefixed?}], skippedFolders:[{path, count}], source: ItemSource | null}
 ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: string|null, commit: string|null}
 ```
@@ -253,7 +254,11 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   `source` on every item. An existing item of that kind with the unit's `source_repo`+`source_path`
   is the unit's item whatever its name (`importUnit`, checked before creating): add a new version to
   it (re-import = update), unless its `source_commit` already equals the import's (same commit, or
-  the same zip bytes): then `op: 'unchanged'`, so a local edit made since stays the latest version.
+  the same zip bytes) or the unit's tree with the stored block is `source_tree_sha256` (a commit that
+  left it alone): then `op: 'unchanged'` with the ref and commit recorded, so a local edit made since stays the latest version (jcfm: unless the unit
+  carries supplied frontmatter other than the item stores; that swaps only the block on the latest
+  version, as `PUT /items/:id/source/frontmatter` does, so a local edit keeps its body and a block
+  edited by hand skips the unit as `frontmatter_edited`).
   Otherwise a `name` collision with the user's existing items of that kind is a 409 `name_taken`
   per unit, listed in `skipped`. When the name holder
   came from a zip under another file name, the reason names that file ("upload the file under
@@ -321,8 +326,10 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   line; everything else stays upstream's. The rule (`pinName`): a skill, or a one-file agent, that
   carries a name SCP chose (a prefix, or a `name` the import was given) always stores exactly that
   `name:`. A block that parses but names nothing gets the line added first (`renameFrontmatter`,
-  the value emitted by the yaml library; a key a line edit cannot reach is re-emitted whole); text
-  with no frontmatter gets a block. A block that does not parse (invalid YAML or fence) cannot take
+  the value emitted by the yaml library; a key a line edit cannot reach is re-emitted whole); an
+  entry with no frontmatter takes the block jcfm supplies, name included (`pinName` leaves it to
+  `supply`, which a name-only block would shut out), and stays nameless when no description is
+  supplied. A block that does not parse (invalid YAML or fence) cannot take
   it: 422 `frontmatter_invalid`, so the import skips the unit ("its frontmatter is not valid YAML,
   so it cannot take the prefixed name '<n>'") instead of importing it bare, and a source update or
   re-import refuses and leaves the item unchanged. `keepPrefix` pins an upstream that dropped
@@ -345,6 +352,37 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   gets `lint_waived = 1` (migration 11), and every later source write (`versionFromSource`:
   source/update and re-imports) accepts the same errors without asking. A local edit is still
   gated. Any other lint error skips the unit in every mode.
+- Supplied frontmatter (v3 jcfm, `pack.ts supply`, `lib/frontmatter.ts prependFrontmatter`):
+  `description` (trimmed, at most 1024 characters, lint's cap; blank is none) applies to an import
+  of exactly one unit that is not a package (a package's entry is README.md or its first .md, so
+  none is fixed), else 400 before anything is written. When the unit's entry (`SKILL.md`,
+  `DESIGN.md`, a single-file kind's file) has no frontmatter block upstream, SCP puts one in front
+  of it: `name` (skills and agents only: the item name, so a 5ef6 prefix carries over) and
+  `description`, emitted by the `yaml` library (never concatenated), so `:`, `#` and newlines
+  round-trip and the same fields always give the same bytes. The fields are stored on the item
+  (`supplied_frontmatter`, JSON; migration 13). An entry with a block of its own (even a broken one)
+  keeps it and nothing is stored. Every later source write (`versionFromSource`: source/update and
+  re-imports, which take the stored fields when the request gives none, before the previews, so
+  nothing is asked) applies the same rule: upstream still without one gets the stored block byte
+  for byte; upstream with its own wins (but a supplied `name` is pinned on it, `pack.ts keepPrefix`
+  with pin: a skill's name is its install folder and the item's identity), the fields stay as the fallback and `upstream_frontmatter`
+  is 1 (`ItemDetail.upstreamFrontmatter`; the item page says "upstream now provides its own
+  frontmatter"). The stored fields always describe the block the latest version carries: a source
+  write that adds no version (op 'unchanged', a local edit since staying the latest) leaves them.
+  `PUT /items/:id/source/frontmatter {description}` (edit rights) edits the stored
+  description: while the supplied block is in use, a new version with the latest version's block
+  swapped for the new one, and `source_tree_sha256` moved to the source's last tree with the same
+  swap, so the same upstream file is still no change and a local edit survives it; while upstream
+  has its own, only the fallback. A block edited by hand
+  since is 409 `frontmatter_edited`, never overwritten. `ItemDetail.suppliedFrontmatter` is
+  `{name?, description}` or null.
+- One file as a skill (v3 mas4): a GitHub `path` naming one `.md` file with `kind: skill` makes
+  that file the skill's `SKILL.md` (`importTree`; `updateTree` re-homes it again on every update,
+  matched by `source_path` naming that file). The name defaults to the file stem, or the
+  repository name when the stem is generic (`skill(s)`, `agent(s)`, `readme`, `index`, `claude`,
+  `instructions`; `pack.ts fileSkillName`): `cesarferreira/stax` `skills.md` is `stax`. With a
+  `description` and no upstream frontmatter, SCP supplies `name` and `description` as above, so the
+  skill passes lint and tracks the upstream file. Without `kind: skill` the file imports as before.
 - Provenance: `source_kind`, `source_repo` (`owner/repo` as GitHub's `full_name` spells it, zip: the
   file name), `source_ref`, `source_path`, `source_commit` (zip: sha256 of the zip bytes),
   `source_tree_sha256` (the tree the source last wrote), `source_scope` (`root` for a root
@@ -377,9 +415,10 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   the root skill before the fallback is reached).
   Re-import updates the item of that kind with the same `source_repo` (compared
   case-insensitively: GitHub names and zip file names are) + `source_path` and the unit's name, or
-  that name under its 5ef6 prefix; two source paths never resolve to one item. A unit renamed
-  upstream is a new unit: created under the new name, or skipped when an unrelated item holds it,
-  never written into the item that kept the old name. At the same commit the
+  that name under its 5ef6 prefix, or whatever its name when SCP supplied it (mas4: pinned, its
+  identity); two source paths never resolve to one item. A unit renamed upstream is a new unit:
+  created under the new name, or skipped when an unrelated item holds it, never written into the
+  item that kept the old name. At the same commit the
   row's `source_ref` still follows the ref named (a tag, then the branch at that commit).
   A private repository is refused to non-admins with the very text a missing repository gets.
 - Body caps: pack `import.max_archive_mb` (default 35 MB, read per request; added to `UPLOAD_ROUTES` by D0), single-file import the same at most 35 MB, github JSON 1 MB.

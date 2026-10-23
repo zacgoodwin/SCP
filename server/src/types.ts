@@ -65,6 +65,12 @@ export interface ItemSource {
   commit: string | null;
 }
 
+/** jcfm: frontmatter SCP supplies to an imported file that has none: a skill's or agent's `name` (its item name) and `description`. */
+export type SuppliedFrontmatter = {
+  name?: string;
+  description: string;
+};
+
 export interface ItemRow {
   id: string;
   owner_id: string;
@@ -92,6 +98,10 @@ export interface ItemRow {
   lint_waived: number;
   /** 5ef6: what an import put in front of the unit's bare name (in-import, cross-source or both: 'fork-discord'); null when unprefixed or imported before it was recorded. */
   source_prefix: string | null;
+  /** jcfm: JSON of the SuppliedFrontmatter an import added to an upstream file with none; re-applied on every source write. */
+  supplied_frontmatter: string | null;
+  /** jcfm: 1 when the last source write found upstream's own frontmatter, so the supplied fields wait as a fallback. */
+  upstream_frontmatter: number;
   forked_from: string | null;
   created_at: string;
   updated_at: string;

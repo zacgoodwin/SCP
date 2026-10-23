@@ -4,14 +4,15 @@ import { tx, type Db } from '../db.ts';
 import { canEditGroup } from '../access.ts';
 import { addMemberTx, createGroup, getGroupRow, isMember } from '../groups/service.ts';
 import { FRONTMATTER_ERRORS } from '../items/lint.ts';
-import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewItem, renameFrontmatter, resolveVersion, slugify, type CreateItemInput, type Lint } from '../items/service.ts';
-import { parseFrontmatter } from '../lib/frontmatter.ts';
+import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewItem, readTree, renameFrontmatter, resolveVersion, slugify, suppliedOf, versionSha, type CreateItemInput, type Lint } from '../items/service.ts';
+import { sha256Hex } from '../lib/crypto.ts';
+import { parseFrontmatter, prependFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, MB, badRequest, notFound } from '../lib/http.ts';
 import { isJunkPath, normalizePath } from '../lib/paths.ts';
-import { stripTopFolder, type TreeFile } from '../lib/tree.ts';
+import { stripTopFolder, treeSha256, type TreeFile } from '../lib/tree.ts';
 import { PACK_LIMITS, safeUnzip, type ZipLimits, type ZipLink } from '../lib/zip.ts';
 import { MARKETPLACE_JSON, PLUGIN_JSON, isObject, marketplaceIgnored, parseManifest, pluginMeta, shownValue } from './manifest.ts';
-import { aKind, type Ctx, type GroupRow, type ItemRow, type ItemSource, type Kind, type Principal } from '../types.ts';
+import { aKind, type Ctx, type GroupRow, type ItemRow, type ItemSource, type Kind, type Principal, type SuppliedFrontmatter } from '../types.ts';
 
 export const ARTIFACT_FROM_TREE = 'an artifact imports from a single file, not from a repository or pack';
 
@@ -32,6 +33,8 @@ export interface Unit {
   prefix?: string;
   /** 5ef6: the name the unit took before it was renamed (renamed); its item records what was put in front (source_prefix). */
   bare?: string;
+  /** jcfm: frontmatter put in front of the unit's entry, which has none upstream (supply). `tree` stays upstream's. */
+  supplied?: SuppliedFrontmatter;
 }
 
 export interface Skipped {
@@ -115,6 +118,8 @@ export interface ImportOpts {
    * written; 'import' them anyway (errors kept as waived warnings); 'skip' them, as before.
    */
   frontmatterErrors?: 'ask' | 'import' | 'skip';
+  /** jcfm: frontmatter description (and a skill's or agent's name) SCP supplies when the one unit's entry has no frontmatter upstream. */
+  description?: string;
 }
 
 const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
@@ -139,6 +144,10 @@ const baseOf = (p: string) => p.slice(p.lastIndexOf('/') + 1);
 const dirOf = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 const stem = (file: string) => file.replace(/\.(md|markdown)$/i, '');
 const isMd = (p: string) => /\.md$/i.test(p);
+/** File stems that name a convention, not a product (`skills.md`, `README.md`). */
+const GENERIC_STEMS = new Set(['skill', 'skills', 'agent', 'agents', 'readme', 'index', 'claude', 'instructions']);
+/** mas4: a skill imported from one .md file is named by its stem, or by its repository when the stem is generic (cesarferreira/stax `skills.md` -> stax). */
+export const fileSkillName = (file: string, repoName: string) => (GENERIC_STEMS.has(stem(file).toLowerCase()) ? repoName : stem(file));
 /** A skill's entry in any case; the unit re-homes it to SKILL.md the way mdKind does for a loose file. */
 const isSkillMd = (name: string) => name.toLowerCase() === 'skill.md';
 /** A skill unit's files: the root entry, in whatever case the tree spelled it, lives at SKILL.md. */
@@ -614,18 +623,74 @@ const reasonOf = (e: HttpError) =>
  * equal to either adds no version (op 'unchanged') but still records the commit it was checked against.
  * Frontmatter errors are accepted when this write was asked to (waive) or the import accepted them
  * (0rdh: the user already chose), and a prefixed item keeps its prefix (5ef6, keepPrefix).
+ * jcfm: the frontmatter an import supplies (`supplied`, this import's; else the item's stored fields)
+ * goes in front of an upstream entry that has none, byte for byte the same each time. An upstream entry
+ * with its own wins, but for a name SCP supplied (sourceTree); the stored fields stay as the fallback and the item says so (upstream_frontmatter).
  */
-export function versionFromSource(ctx: Ctx, p: Principal, item: ItemRow, tree: TreeFile[], source: ItemSource, note: string, waive = false): UnitResult {
+export function versionFromSource(ctx: Ctx, p: Principal, item: ItemRow, tree: TreeFile[], source: ItemSource, note: string, waive = false, supplied?: SuppliedFrontmatter): UnitResult {
   const { db } = ctx;
+  const fields = supplied ?? suppliedOf(item);
+  const own = fields && suppliedFor(item, fields);
+  const withFm = own && supply(item.kind, tree, own);
   return tx(db, () => {
     const prev = resolveVersion(db, item);
     db.exec('SAVEPOINT ver');
-    const v = addVersion(ctx, p, item, { tree: keepPrefix(item, tree), note }, { waiveFrontmatter: waive || !!item.lint_waived });
+    const v = addVersion(ctx, p, item, { tree: sourceTree(item, tree, own), note }, { waiveFrontmatter: waive || !!item.lint_waived });
     // Items imported before source_tree_sha256 was recorded fall back to the latest version.
     const changed = v.tree_sha256 !== prev.tree_sha256 && v.tree_sha256 !== (item.source_tree_sha256 ?? prev.tree_sha256);
     db.exec(changed ? 'RELEASE ver' : 'ROLLBACK TO ver; RELEASE ver');
     db.prepare('UPDATE items SET source_ref = ?, source_commit = ?, source_tree_sha256 = ? WHERE id = ?').run(source.ref, source.commit, v.tree_sha256, item.id);
+    // The stored fields describe the block the latest version carries: a tree that did not land (a local edit since stays the latest) leaves them.
+    if (changed || v.tree_sha256 === prev.tree_sha256) {
+      db.prepare('UPDATE items SET supplied_frontmatter = ?, upstream_frontmatter = ? WHERE id = ?').run(own ? JSON.stringify(own) : null, own && !withFm ? 1 : 0, item.id);
+    }
     return { item: getItemRow(db, item.id)!, op: changed ? 'version' : 'unchanged' };
+  });
+}
+
+/**
+ * jcfm: the item page's edit of the supplied description. While the supplied block is in use, the latest
+ * version's entry has it swapped for the new one in a new version; while upstream ships its own, only the
+ * stored fallback changes. A block edited by hand since is not overwritten (409). What the source last
+ * wrote (source_tree_sha256) takes the new block too, so a source write of the same upstream file is still
+ * no change (versionFromSource) and a local edit made before this one survives it.
+ */
+export function editSupplied(ctx: Ctx, p: Principal, item: ItemRow, description: string): ItemRow {
+  const old = suppliedOf(item);
+  if (!old) throw notFound('supplied frontmatter');
+  return swapSupplied(ctx, p, item, suppliedFor(item, { ...old, description }), 'edit supplied frontmatter');
+}
+
+/**
+ * editSupplied's write, shared with a re-import whose only news is the supplied frontmatter (importUnit: the same commit, or one that left the unit alone):
+ * the stored block (none yet: the new one goes in front of an entry without frontmatter) swapped for `next`.
+ */
+function swapSupplied(ctx: Ctx, p: Principal, item: ItemRow, next: SuppliedFrontmatter, note: string, waive = false): ItemRow {
+  const { db } = ctx;
+  const old = suppliedOf(item);
+  const block = old ? prependFrontmatter('', suppliedFor(item, old))! : '';
+  // tree with the old block swapped for the new one, or null when its entry no longer opens with the old block.
+  const swap = (tree: TreeFile[]) => {
+    const entry = entryOf(item.kind, tree);
+    const text = entry ? utf8.decode(entry.bytes) : '';
+    return text.startsWith(block) ? supply(item.kind, tree.map((f) => (f === entry ? { ...f, bytes: new TextEncoder().encode(text.slice(block.length)) } : f)), next) : null;
+  };
+  return tx(db, () => {
+    let sourceSha = item.source_tree_sha256;
+    if (!item.upstream_frontmatter) {
+      const latest = resolveVersion(db, item);
+      const swapped = swap(readTree(db, latest.id));
+      if (!swapped) throw new HttpError(409, 'frontmatter_edited', "the entry's frontmatter was written by hand, not the block SCP supplied; edit the file instead");
+      const v = addVersion(ctx, p, item, { tree: swapped, note }, { waiveFrontmatter: waive });
+      if (sourceSha === latest.tree_sha256) sourceSha = v.tree_sha256;
+      else if (sourceSha) {
+        const src = db.prepare('SELECT id FROM item_versions WHERE item_id = ? AND tree_sha256 = ? ORDER BY seq DESC LIMIT 1').get(item.id, sourceSha) as { id: string } | undefined;
+        const t = src && swap(readTree(db, src.id));
+        if (t) sourceSha = treeSha256(t.map((f) => ({ path: f.path, mode: f.mode, sha256: sha256Hex(f.bytes) })));
+      }
+    }
+    db.prepare('UPDATE items SET supplied_frontmatter = ?, source_tree_sha256 = ? WHERE id = ?').run(JSON.stringify(next), sourceSha, item.id);
+    return getItemRow(db, item.id)!;
   });
 }
 
@@ -647,6 +712,8 @@ export function updateTree(db: Db, item: ItemRow, tree: TreeFile[]): TreeFile[] 
     if (kind === item.kind) return [{ ...tree[0], path }];
     // A loose .md imported as a design (mvfp folderKinds) holds it as DESIGN.md.
     if (item.kind === 'design' && isMd(tree[0].path)) return [{ ...tree[0], path: 'DESIGN.md' }];
+    // mas4: the one .md file a skill was imported from (its source path names that file) is its SKILL.md again.
+    if (item.kind === 'skill' && isMd(tree[0].path) && item.source_path !== null && baseOf(item.source_path) === tree[0].path) return [{ ...tree[0], path: 'SKILL.md' }];
   }
   if (item.kind !== 'skill') return tree;
   const cut = new Set<string>(item.source_carve ? JSON.parse(item.source_carve) : []);
@@ -690,6 +757,9 @@ function pinName(kind: Kind, tree: TreeFile[], name: string, what = 'prefixed na
   if (kind !== 'skill' && kind !== 'agent') return tree;
   return tree.map((f) => {
     if (kind === 'skill' ? f.path !== 'SKILL.md' : tree.length !== 1) return f;
+    // jcfm: an entry with no frontmatter takes the block SCP supplies (supply), which carries the name;
+    // a name-only block here would keep it out. ponytail: with no description to supply it stays nameless.
+    if (!parseFrontmatter(utf8.decode(f.bytes)).hasFrontmatter) return f;
     const text = renameFrontmatter(utf8.decode(f.bytes), name);
     if (text === null) throw new HttpError(422, 'frontmatter_invalid', `its frontmatter is not valid YAML, so it cannot take the ${what} '${name}'`);
     return { ...f, bytes: new TextEncoder().encode(text) };
@@ -698,10 +768,16 @@ function pinName(kind: Kind, tree: TreeFile[], name: string, what = 'prefixed na
 
 /**
  * u, which took the name `from`, under the name `to` (5ef6). Its frontmatter name follows, as a renamed
- * fork's does: a skill's must match its install folder. A second rename (an in-import prefix, then a
- * cross-source one) keeps the first `from` as the bare name.
+ * fork's does (a supplied one too, jcfm): a skill's must match its install folder. A second rename (an
+ * in-import prefix, then a cross-source one) keeps the first `from` as the bare name.
  */
-const renamed = (u: Unit, from: string, to: string): Unit => ({ ...u, name: to, tree: pinName(u.kind, u.tree, to), bare: u.bare ?? from });
+const renamed = (u: Unit, from: string, to: string): Unit => ({
+  ...u,
+  name: to,
+  tree: pinName(u.kind, u.tree, to),
+  bare: u.bare ?? from,
+  ...(u.supplied?.name !== undefined && { supplied: { ...u.supplied, name: to } }),
+});
 
 /** 5ef6: what u's renames put in front of its bare name ('fork-discord' for fork-discord-access), recorded as source_prefix. */
 const prefixOfName = (u: Unit) => (u.bare && u.name?.endsWith(`-${u.bare}`) ? u.name.slice(0, -(u.bare.length + 1)) : undefined);
@@ -726,24 +802,64 @@ function wasPrefixed(item: ItemRow, bare: string): boolean {
 /**
  * 5ef6: the upstream entry of a prefixed skill or agent names it bare, or nothing at all (or its YAML
  * does not parse); it takes the item's prefixed name again, as at import (pinName refuses what it cannot set).
+ * pin (mas4): SCP supplied the name, so whatever name upstream's own frontmatter gives becomes the item's (its install folder).
  * ponytail: a nameless entry counts as prefixed only by a recorded source_prefix; a row from before the
  * column keeps upstream's nameless entry, still installed under its prefixed folder.
  */
-function keepPrefix(item: ItemRow, tree: TreeFile[]): TreeFile[] {
+function keepPrefix(item: ItemRow, tree: TreeFile[], pin = false): TreeFile[] {
   const entry = item.kind === 'skill' ? tree.find((f) => f.path === 'SKILL.md') : item.kind === 'agent' && tree.length === 1 ? tree[0] : undefined;
   if (!entry) return tree;
   const fmName = parseFrontmatter(utf8.decode(entry.bytes)).data.name;
+  if (fmName === item.name) return tree;
   const bare = typeof fmName === 'string' ? slugify(fmName) : '';
-  const pin = bare ? isPrefixed(item, bare) : !!item.source_prefix && item.name.startsWith(`${item.source_prefix}-`);
-  return pin ? pinName(item.kind, tree, item.name) : tree;
+  const isPre = bare ? isPrefixed(item, bare) : !!item.source_prefix && item.name.startsWith(`${item.source_prefix}-`);
+  return pin || isPre ? pinName(item.kind, tree, item.name, isPre ? 'prefixed name' : 'name') : tree;
 }
+
+/**
+ * The tree a source write versions upstream's unit tree as: `own` (the supplied fields) in front of an
+ * entry without frontmatter; else upstream's own block, wins for everything but a skill's or agent's name
+ * when SCP supplied it or a prefix (keepPrefix).
+ */
+const sourceTree = (item: ItemRow, tree: TreeFile[], own: SuppliedFrontmatter | null | undefined): TreeFile[] =>
+  (own && supply(item.kind, tree, own)) || keepPrefix(item, tree, own?.name !== undefined);
+
+/** The file a kind's frontmatter lives in, when the tree has it at the entry path. */
+function entryOf(kind: Kind, tree: TreeFile[]): TreeFile | undefined {
+  if (kind === 'skill' || kind === 'design') return tree.find((f) => f.path === (kind === 'skill' ? 'SKILL.md' : 'DESIGN.md'));
+  return SINGLE_FILE.has(kind) && tree.length === 1 ? tree[0] : undefined;
+}
+
+/** jcfm: tree with `fields` as its entry's frontmatter, or null when upstream's entry has its own (which wins) or there is no entry. */
+function supply(kind: Kind, tree: TreeFile[], fields: SuppliedFrontmatter): TreeFile[] | null {
+  const entry = entryOf(kind, tree);
+  const text = entry && prependFrontmatter(utf8.decode(entry.bytes), fields);
+  return text ? tree.map((f) => (f === entry ? { ...f, bytes: new TextEncoder().encode(text) } : f)) : null;
+}
+
+/** A skill's or agent's supplied name is always its item's: a prefixed (5ef6) item keeps the prefix. */
+const suppliedFor = (item: ItemRow, fields: SuppliedFrontmatter): SuppliedFrontmatter => (fields.name === undefined ? fields : { ...fields, name: item.name });
 
 function unitInput(u: Unit, opts: ImportOpts): CreateItemInput & { source: ItemSource } {
   // A file path re-rooted to its name (subtree) would otherwise join to '<file>/<name>', which no update finds.
   const source: ItemSource = { ...opts.source, path: opts.pathIsFile ? opts.source.path : [opts.source.path, u.path].filter(Boolean).join('/') || null };
   // The root detection unit is the one carved from its siblings; a kind override, a folder import or any folder unit took the whole tree (updateTree).
   const sourceScope: NonNullable<ItemRow['source_scope']> = u.scope ?? (!opts.kind && u.path === '' && u.kind === 'skill' ? 'root' : 'tree');
-  return { kind: u.kind, name: u.name, tree: u.tree, visibility: opts.visibility, source, sourceScope, sourceCarve: u.carve, sourcePrefix: prefixOfName(u), note: opts.note, fallbackName: u.fallbackName, folderName: u.folderName };
+  const supplied = u.supplied && supply(u.kind, u.tree, u.supplied);
+  return {
+    kind: u.kind,
+    name: u.name,
+    tree: supplied || u.tree,
+    visibility: opts.visibility,
+    source,
+    sourceScope,
+    sourceCarve: u.carve,
+    sourcePrefix: prefixOfName(u),
+    note: opts.note,
+    fallbackName: u.fallbackName,
+    folderName: u.folderName,
+    suppliedFrontmatter: supplied ? u.supplied : undefined,
+  };
 }
 
 /** waive: accept the unit's frontmatter errors (0rdh). retried: this is the `<repo>-` prefixed attempt, of the name that was taken (5ef6). */
@@ -753,26 +869,40 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
   // Re-import = update: the item of this kind from this very unit (same repo and path) under the name the
   // unit takes, or under that name's prefix (5ef6) once the clash that forced it is gone. A unit renamed
   // upstream must not write its new name into the item that kept the old one: it is a new unit, created
-  // beside it or skipped on the name. The oldest wins should an earlier bug have left two. A recorded
-  // prefix is matched against the unit's bare name, so fork-discord-access is found whether this import
-  // prefixes the unit inside it again (discord-access) or not (access).
+  // beside it or skipped on the name. A recorded prefix is matched against the unit's bare name, so
+  // fork-discord-access is found whether this import prefixes the unit inside it again (discord-access) or
+  // not (access). A name SCP supplied (mas4) is the item's identity whatever name upstream's own
+  // frontmatter later gives (sourceTree pins it). The oldest wins should an earlier bug have left two.
   const takes = previewItem(input, waive)?.name;
   const bare = u.bare ?? takes;
   const own = takes
     ? (ctx.db.prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND source_path IS ? AND source_repo IS NOT NULL ORDER BY created_at, rowid').all(p.userId, u.kind, source.path) as unknown as ItemRow[])
-      .find((h) => sameRepo(h.source_repo, source.repo) && (h.name === takes || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes))))
+      .find(
+        (h) =>
+          sameRepo(h.source_repo, source.repo) &&
+          (h.name === takes || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes)) || suppliedOf(h)?.name !== undefined),
+      )
     : undefined;
   if (own) {
+    // Found under its prefix: the unit's tree names it takes (or bare), and the item keeps its own name.
+    const tree = own.name === takes ? u.tree : pinName(u.kind, u.tree, own.name);
     // How this import carved the unit replaces the last one's: the next source/update follows the manifest as it is now.
     ctx.db.prepare('UPDATE items SET source_scope = ?, source_carve = ? WHERE id = ?').run(input.sourceScope ?? null, u.carve ? JSON.stringify(u.carve) : null, own.id);
-    // The same commit (or the same zip) again: nothing changed upstream, so a local edit made since stays
-    // the latest version. The ref still follows the one named (a tag, then the branch at the same commit).
-    if (own.source_commit === source.commit) {
-      if (own.source_ref !== source.ref) ctx.db.prepare('UPDATE items SET source_ref = ? WHERE id = ?').run(source.ref, own.id);
-      return { item: getItemRow(ctx.db, own.id)!, op: 'unchanged' };
+    // The same commit (or the same zip) again, or one whose unit tree, with the stored block, is what the
+    // source last wrote: nothing changed upstream here, so a local edit made since stays the latest version.
+    // The ref and commit still follow the ones named (a tag, then the branch at the same commit).
+    // jcfm: frontmatter supplied that the item does not store yet is news of its own, but only the block
+    // changes (swapSupplied, as the item page's edit): the rest of the latest version stays.
+    const stored = suppliedOf(own);
+    const untouched = own.source_commit === source.commit || (!!own.source_tree_sha256 && versionSha(own, sourceTree(own, tree, stored && suppliedFor(own, stored))) === own.source_tree_sha256);
+    if (untouched) {
+      ctx.db.prepare('UPDATE items SET source_ref = ?, source_commit = ? WHERE id = ?').run(source.ref, source.commit, own.id);
+      const fm = u.supplied && suppliedFor(own, u.supplied);
+      if (!fm || JSON.stringify(fm) === own.supplied_frontmatter) return { item: getItemRow(ctx.db, own.id)!, op: 'unchanged' };
+      const item = swapSupplied(ctx, p, own, fm, opts.note, waive || !!own.lint_waived);
+      return { item, op: item.latest_seq === own.latest_seq ? 'unchanged' : 'version' };
     }
-    // Found under its prefix: the unit's tree names it takes (or bare), and the item keeps its own name.
-    return versionFromSource(ctx, p, own, own.name === takes ? u.tree : pinName(u.kind, u.tree, own.name), source, opts.note, waive);
+    return versionFromSource(ctx, p, own, tree, source, opts.note, waive, u.supplied);
   }
   try {
     return { item: createItemTx(ctx, p, input, { waiveFrontmatter: waive }), op: 'create' };
@@ -868,9 +998,13 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   if (opts.kind === 'artifact') throw badRequest(ARTIFACT_FROM_TREE);
   let skippedFolders: SkippedFolder[] = [];
   // A kind override makes the tree one item, except a single-file kind on a folder (jwz6): one item per .md.
-  // A supplied name is the entry's frontmatter name too (5ef6 pinName), as a prefixed one is.
-  if (opts.kind && (!SINGLE_FILE.has(opts.kind) || opts.pathIsFile)) units = [{ path: '', kind: opts.kind, tree: opts.name === undefined ? tree : pinName(opts.kind, tree, opts.name, 'name'), name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
-  else {
+  if (opts.kind && (!SINGLE_FILE.has(opts.kind) || opts.pathIsFile)) {
+    // mas4: one .md imported as a skill is that skill's SKILL.md, re-homed the same way on every source update (updateTree).
+    const fileSkill = opts.kind === 'skill' && opts.pathIsFile && tree.length === 1 && isMd(tree[0].path);
+    const unitTree = fileSkill ? [{ ...tree[0], path: 'SKILL.md' }] : tree;
+    // A supplied name is the entry's frontmatter name too (5ef6 pinName), as a prefixed one is.
+    units = [{ path: '', kind: opts.kind, tree: opts.name === undefined ? unitTree : pinName(opts.kind, unitTree, opts.name, 'name'), name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
+  } else {
     if (opts.kind) units = fileUnits(tree, opts.kind, opts.rootName, skipped);
     else {
       const { folderKinds, layoutDir, folderRoot, includeRepoTooling } = opts;
@@ -894,9 +1028,26 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   if (!units.length) throw failed(400, 'nothing_to_import', 'no skills, agents, commands, prompts, instructions or design files found', skipped.length ? skipped : undefined);
   const maxItems = importLimit(ctx, 'maxItems');
   if (units.length > maxItems) throw new HttpError(400, 'too_many_items', `at most ${maxItems} item${maxItems === 1 ? '' : 's'} per import (found ${units.length})`);
+  // jcfm: one description cannot fit many items.
+  if (opts.description !== undefined && units.length !== 1) throw badRequest(`description applies to an import of exactly one item (found ${units.length})`);
+  // A package's entry is README.md or else its first .md, which can move between source updates: no one file to supply.
+  if (opts.description !== undefined && units[0].kind === 'package') {
+    throw badRequest('description applies to an item kind with one entry file (skill, agent, command, prompt, instructions or design); a package has none');
+  }
   const { db } = ctx;
   // A one-file import's unit is the root of its one-file tree (''): it is reported at the file's path.
   const at = (u: Unit) => (opts.pathIsFile && opts.source.path) || u.path;
+  // jcfm: the description, else the fields an earlier import of the same unit stored, become the frontmatter of
+  // a unit whose entry has none upstream (a skill or agent gets its name too); before the previews, so lint sees them.
+  const storedFm = db.prepare('SELECT supplied_frontmatter AS s FROM items WHERE owner_id = ? AND kind = ? AND lower(source_repo) = lower(?) AND source_path IS ? AND supplied_frontmatter IS NOT NULL');
+  units.forEach((u, i) => {
+    const stored = opts.description === undefined && (storedFm.get(p.userId, u.kind, opts.source.repo, unitInput(u, opts).source.path) as { s: string } | undefined);
+    const description = opts.description ?? (stored ? (JSON.parse(stored.s) as SuppliedFrontmatter).description : undefined);
+    if (description === undefined) return;
+    const name = u.kind === 'skill' || u.kind === 'agent' ? previewItem(unitInput(u, opts))?.name : undefined;
+    const fields: SuppliedFrontmatter = name ? { name, description } : { description };
+    if (supply(u.kind, u.tree, fields)) units[i] = { ...u, supplied: fields };
+  });
   // Each unit named and linted as createItemTx will see it, before anything is written (5ef6, 0rdh).
   const mode = opts.frontmatterErrors ?? 'ask';
   const previews = units.map((u) => previewItem(unitInput(u, opts), mode === 'import'));
