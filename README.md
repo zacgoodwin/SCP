@@ -41,6 +41,14 @@ semver. Release tags are immutable (a repository ruleset blocks moving or deleti
 each image carries a signed build provenance attestation:
 `gh attestation verify oci://ghcr.io/zacgoodwin/scp:<version> --owner zacgoodwin`.
 
+Merging into `main` takes a PR with two green checks from `.github/workflows/ci.yml`: `gate`
+(`npm run gate`) and `sast`, an [OpenGrep](https://github.com/opengrep/opengrep) scan with the
+repo's own rules in `.opengrep/rules.yml` (request input in SQL text or a redirect target, shell
+exec, eval, gray-matter, hosted LLM endpoints, disabled TLS checks, weak hashes, `Math.random()`,
+cookies without `httpOnly`, raw HTML sinks). Run it locally with
+`opengrep test .opengrep && opengrep scan --config .opengrep/rules.yml --exclude .opengrep --error .`;
+a deliberate exception gets a `// nosemgrep: <rule id>` comment saying why it is safe.
+
 ### Configuration
 
 Set these in your shell or in a `.env` file next to `docker-compose.yml`:

@@ -165,7 +165,9 @@ oauthRoutes.get('/oauth/authorize', (c) => {
     // RFC 6749 4.1.2.1: an unknown client or an unregistered redirect_uri is a page, never a redirect
     // (validateAuthorize checks those two first). Every other failure (PKCE, scope, resource) goes to
     // the registered redirect_uri as error=, or the host's pending flow waits for a code that never comes.
+    // OpenGrep cannot see that check (it throws from validateAuthorize), hence the nosemgrep.
     if (e.code === 'invalid_client' || e.code === 'invalid_redirect_uri') return c.html(errorPage(e.code, e.message), 400, noStore);
+    // nosemgrep: scp.open-redirect.request-input-in-redirect
     return c.redirect(withParams(q.redirect_uri, { error: e.code, error_description: e.message, state: q.state }), 302);
   }
   return c.redirect(`${config.publicUrl}/consent${new URL(c.req.url).search}`, 302);

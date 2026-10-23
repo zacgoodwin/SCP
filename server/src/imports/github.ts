@@ -243,6 +243,8 @@ async function gitBlob(ctx: Ctx, repo: string, e: GitEntry): Promise<Uint8Array>
   } catch (err) {
     throw githubError(`GitHub download failed: ${(err as Error).message}`);
   }
+  // A git blob's object id is SHA-1 by definition: this checks the bytes against the tree listing, not a secret.
+  // nosemgrep: scp.crypto.weak-hash
   if (createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') !== e.sha) throw githubError(`GitHub sent the wrong bytes for '${e.path}'`);
   return bytes;
 }
