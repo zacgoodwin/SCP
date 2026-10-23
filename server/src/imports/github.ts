@@ -1,6 +1,9 @@
-import { HttpError, MB } from '../lib/http.ts';
-import { normalizePath } from '../lib/paths.ts';
-import { tooLarge } from '../lib/tree.ts';
+import { createHash } from 'node:crypto';
+import { importLimit } from '../admin/settings.ts';
+import { HttpError, MB, badRequest } from '../lib/http.ts';
+import { isJunkPath, normalizePath } from '../lib/paths.ts';
+import { LIMITS, modeOf, tooLarge, type TreeFile } from '../lib/tree.ts';
+import type { ZipLink } from '../lib/zip.ts';
 import type { Ctx, Principal } from '../types.ts';
 
 export interface GithubSource {
@@ -12,17 +15,11 @@ export interface GithubSource {
   path: string | null;
 }
 
-/**
- * Zipball cap (compressed) for the whole repository: GitHub serves no subtree archives, so a folder
- * import downloads the repo's archive and inflates only that folder (pack.ts underPath), which the
- * per-version limits then apply to.
- */
-export const MAX_ZIPBALL = 35 * MB;
 const TIMEOUT_MS = 60_000;
 /**
- * Zipball downloads in flight at once, process-wide: each holds up to MAX_ZIPBALL of chunks, their
- * concatenation and the inflated tree for up to a minute, so an unbounded number is the memory bill
- * of one write key. ponytail: refused (503, Retry-After) rather than queued.
+ * Zipball downloads in flight at once, process-wide: each holds up to the archive cap
+ * (`import.max_archive_mb`) of chunks, their concatenation and the inflated tree for up to a minute,
+ * so an unbounded number is the memory bill of one write key. ponytail: refused (503, Retry-After) rather than queued.
  */
 export const ZIPBALL_SLOTS = 3;
 let zipballsInFlight = 0;
@@ -174,13 +171,19 @@ export async function resolveCommit(ctx: Ctx, p: Principal, repo: string, ref: s
   return { repo, ref, sha: c.sha };
 }
 
-/** The repo zipball at sha, read in chunks and abandoned once it passes MAX_ZIPBALL (413). */
-export async function fetchZipball(ctx: Ctx, repo: string, sha: string): Promise<Uint8Array> {
+/** The archive cap (00tr `import.max_archive_mb`), checked per download. */
+export const archiveTooLarge = (ctx: Ctx) => tooLarge(`the repository archive is over ${importLimit(ctx, 'maxArchiveMb')} MB`);
+
+/**
+ * The repo zipball at sha, read in chunks and abandoned once it passes the archive cap: null then, and
+ * the caller answers archiveTooLarge or, for a folder, fetches it file by file (fetchFolder).
+ */
+export async function fetchZipball(ctx: Ctx, repo: string, sha: string): Promise<Uint8Array | null> {
+  const cap = importLimit(ctx, 'maxArchiveMb') * MB;
   const res = await ghGet(ctx, `/repos/${repo}/zipball/${sha}`, '*/*');
-  const over = () => tooLarge(`the repository archive is over ${MAX_ZIPBALL / MB} MB`);
-  if (Number(res.headers.get('content-length')) > MAX_ZIPBALL) {
+  if (Number(res.headers.get('content-length')) > cap) {
     await res.body?.cancel();
-    throw over();
+    return null;
   }
   if (!res.body) return new Uint8Array();
   const reader = res.body.getReader();
@@ -190,15 +193,139 @@ export async function fetchZipball(ctx: Ctx, repo: string, sha: string): Promise
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if ((total += value.length) > MAX_ZIPBALL) {
+      if ((total += value.length) > cap) {
         await reader.cancel();
-        throw over();
+        return null;
       }
       chunks.push(value);
     }
   } catch (e) {
-    if (e instanceof HttpError) throw e;
     throw githubError(`GitHub download failed: ${(e as Error).message}`);
   }
   return new Uint8Array(Buffer.concat(chunks));
+}
+
+interface GitEntry {
+  path: string;
+  mode: string;
+  type: string;
+  sha: string;
+  size?: number;
+}
+const GIT_SHA = /^[0-9a-f]{40}$/;
+/** Blob downloads in flight at once for one folder. */
+const BLOB_CONCURRENCY = 8;
+
+/** One git/trees listing, with what GitHub says is left of the quota (Infinity when it does not say). */
+async function gitTree(ctx: Ctx, repo: string, sha: string, recursive: boolean): Promise<{ entries: GitEntry[]; truncated: boolean; remaining: number }> {
+  const res = await ghGet(ctx, `/repos/${repo}/git/trees/${sha}${recursive ? '?recursive=1' : ''}`, 'application/vnd.github+json');
+  const left = res.headers.get('x-ratelimit-remaining');
+  let v: { tree?: unknown; truncated?: unknown } | null;
+  try {
+    v = await res.json();
+  } catch {
+    throw githubError('GitHub answered with malformed JSON');
+  }
+  const ok = (e: unknown) => {
+    const x = e as Partial<GitEntry> | null;
+    return typeof x?.path === 'string' && typeof x.mode === 'string' && typeof x.type === 'string' && typeof x.sha === 'string' && GIT_SHA.test(x.sha) && (x.type !== 'blob' || typeof x.size === 'number');
+  };
+  if (!Array.isArray(v?.tree) || !v.tree.every(ok)) throw githubError('GitHub answered with a malformed tree');
+  return { entries: v.tree as GitEntry[], truncated: v.truncated === true, remaining: left === null ? Infinity : Number(left) };
+}
+
+/** One blob's bytes, checked against its git object id. */
+async function gitBlob(ctx: Ctx, repo: string, e: GitEntry): Promise<Uint8Array> {
+  const res = await ghGet(ctx, `/repos/${repo}/git/blobs/${e.sha}`, 'application/vnd.github.raw+json');
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await res.arrayBuffer());
+  } catch (err) {
+    throw githubError(`GitHub download failed: ${(err as Error).message}`);
+  }
+  if (createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') !== e.sha) throw githubError(`GitHub sent the wrong bytes for '${e.path}'`);
+  return bytes;
+}
+
+/** What fetchFolder found, repository-relative like an unpacked zipball: files, links (mode 120000) and submodules (160000). */
+export interface Folder {
+  files: TreeFile[];
+  links: ZipLink[];
+  submodules: { path: string; sha: string }[];
+}
+
+/**
+ * a4q8: the files at or under `path` in repo@sha through the Git Data API, for a folder whose
+ * repository archive is over the cap. One listing per path segment walks the tree shas down (a
+ * recursive listing of a whole repository truncates on exactly the repositories that land here),
+ * then one recursive listing of the folder itself. The folder is held to the per-version limits from
+ * the listing's sizes, and to what GitHub says is left of the quota, before any blob is fetched.
+ * `charge` spends every call on the caller's own bucket as it is made, a refused folder's listings
+ * included. Links and submodules are returned
+ * apart, to be reported: never imported, resolved or followed.
+ */
+export async function fetchFolder(ctx: Ctx, repo: string, sha: string, path: string, charge: (calls: number) => void): Promise<Folder> {
+  const out: Folder = { files: [], links: [], submodules: [] };
+  let remaining = Infinity;
+  let at: GitEntry = { path: '', mode: '040000', type: 'tree', sha };
+  for (const seg of path.split('/')) {
+    if (at.type !== 'tree') return out;
+    charge(1);
+    const l = await gitTree(ctx, repo, at.sha, false);
+    remaining = l.remaining;
+    const next = l.entries.find((e) => e.path === seg);
+    if (!next) {
+      if (l.truncated) throw tooLarge(`GitHub cannot list the folder holding '${path}' in full`);
+      return out;
+    }
+    at = next;
+  }
+  let listed: GitEntry[] = [{ ...at, path }];
+  if (at.type === 'tree') {
+    charge(1);
+    const l = await gitTree(ctx, repo, at.sha, true);
+    remaining = l.remaining;
+    if (l.truncated) throw tooLarge(`'${path}' holds more files than GitHub lists at once`);
+    listed = l.entries.map((e) => ({ ...e, path: `${path}/${e.path}` }));
+  }
+  const over = (what: string) => tooLarge(`the repository archive is over ${importLimit(ctx, 'maxArchiveMb')} MB, and '${path}' is too large to fetch file by file: ${what}`);
+  const blobs: GitEntry[] = [];
+  let total = 0;
+  for (const e of listed) {
+    if (isJunkPath(e.path)) continue;
+    if (e.type === 'commit') out.submodules.push({ path: e.path, sha: e.sha });
+    if (e.type !== 'blob') continue;
+    normalizePath(e.path);
+    if (blobs.push(e) > LIMITS.files) throw over(`at most ${LIMITS.files} files`);
+    if (e.size! > LIMITS.fileBytes) throw over(`'${e.path}' is over ${LIMITS.fileBytes / MB} MB`);
+    if ((total += e.size!) > LIMITS.totalBytes) throw over(`at most ${LIMITS.totalBytes / MB} MB`);
+  }
+  if (blobs.length > remaining) {
+    throw badRequest(
+      githubToken(ctx)
+        ? `'${path}' needs ${blobs.length} GitHub requests and this server's token has ${remaining} left; try again after GitHub's hourly reset`
+        : `'${path}' needs ${blobs.length} GitHub requests, more than the ${remaining} anonymous ones left this hour; set a github.token to import it`,
+    );
+  }
+  charge(blobs.length);
+  const bytes: Uint8Array[] = new Array(blobs.length);
+  let next = 0;
+  let failed = false;
+  const worker = async () => {
+    while (!failed && next < blobs.length) {
+      const i = next++;
+      try {
+        bytes[i] = await gitBlob(ctx, repo, blobs[i]);
+      } catch (e) {
+        failed = true;
+        throw e;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(BLOB_CONCURRENCY, blobs.length) }, worker));
+  blobs.forEach((e, i) => {
+    if (e.mode === '120000') out.links.push({ path: e.path, target: new TextDecoder().decode(bytes[i]).slice(0, 255) });
+    else out.files.push({ path: e.path, bytes: bytes[i], mode: modeOf(parseInt(e.mode, 8)) });
+  });
+  return out;
 }

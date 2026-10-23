@@ -1,12 +1,13 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import { strToU8, zipSync } from 'fflate';
 import { listenLocal, makeTestCtx, type TestCtx } from './helpers.ts';
 import { buildZip } from '../src/lib/zip.ts';
 import { sha256Hex } from '../src/lib/crypto.ts';
 import { HttpError } from '../src/lib/http.ts';
-import { MAX_ZIPBALL, ZIPBALL_SLOTS, parseGithubSource, withZipballSlot } from '../src/imports/github.ts';
+import { ZIPBALL_SLOTS, parseGithubSource, withZipballSlot } from '../src/imports/github.ts';
 import { ARTIFACT_FROM_TREE, detectUnits, subtree, unpack } from '../src/imports/pack.ts';
 import { UNDOUBLE_SOURCE_PATHS } from '../src/db.ts';
 
@@ -36,6 +37,10 @@ const sha2 = (pair: string) => pair.repeat(20);
 /** A Files value that is a symlink to `target` (fake zipballs and pack()). */
 const LINK = '\u0000symlink:';
 const link = (target: string) => LINK + target;
+/** A Files value that is a git submodule (a mode 160000 tree entry; `git archive` leaves it out of the zipball). */
+const SUBMODULE = '\u0000submodule';
+/** Incompressible text of about `mb` MB, so a fake zipball or pack really is that large. */
+const noise = (mb: number) => randomBytes(Math.ceil(mb * 786432)).toString('base64');
 const zipEntry = (text: string): Uint8Array | [Uint8Array, { os: number; attrs: number }] =>
   text.startsWith(LINK) ? [strToU8(text.slice(LINK.length)), { os: 3, attrs: (0o120777 << 16) >>> 0 }] : strToU8(text);
 
@@ -46,13 +51,62 @@ interface Repo {
   private?: boolean;
 }
 
-/** A node:http stand-in for api.github.com: repo metadata, commit resolution and zipballs behind a redirect. */
+const sha1 = (...parts: (string | Uint8Array)[]) => parts.reduce((h, p) => h.update(p), createHash('sha1')).digest('hex');
+
+/**
+ * A node:http stand-in for api.github.com: repo metadata, commit resolution, zipballs behind a
+ * redirect, and the Git Data API (git/trees, git/blobs) over the same trees. Tree ids are the sha1 of
+ * '<commit>:<dir>', blob ids the real git object id. `quota.remaining`, when set, is sent as
+ * x-ratelimit-remaining on tree listings.
+ */
 async function fakeGithub() {
   const repos: Record<string, Repo> = {};
   const requests: { url: string; headers: IncomingHttpHeaders }[] = [];
+  const quota: { remaining: number | null } = { remaining: null };
+  const treeIds = new Map<string, { files: Files; dir: string }>();
+  const blobs = new Map<string, Uint8Array>();
+  const entry = (rel: string, text: string) => {
+    if (text === SUBMODULE) return { path: rel, mode: '160000', type: 'commit', sha: sha1('submodule', rel) };
+    const bytes = strToU8(text.startsWith(LINK) ? text.slice(LINK.length) : text);
+    const id = sha1(`blob ${bytes.length}\0`, bytes);
+    blobs.set(id, bytes);
+    return { path: rel, mode: text.startsWith(LINK) ? '120000' : rel.endsWith('.sh') ? '100755' : '100644', type: 'blob', sha: id, size: bytes.length };
+  };
+  const listing = (files: Files, commit: string, dir: string, recursive: boolean) => {
+    const prefix = dir ? dir + '/' : '';
+    const out = new Map<string, object>();
+    for (const [p, text] of Object.entries(files)) {
+      if (!p.startsWith(prefix)) continue;
+      const segs = p.slice(prefix.length).split('/');
+      for (let i = 1; i <= (recursive ? segs.length : 1); i++) {
+        const rel = segs.slice(0, i).join('/');
+        if (i === segs.length) out.set(rel, entry(rel, text));
+        else if (!out.has(rel)) {
+          const id = sha1(`${commit}:${prefix}${rel}`);
+          treeIds.set(id, { files, dir: prefix + rel });
+          out.set(rel, { path: rel, mode: '040000', type: 'tree', sha: id });
+        }
+      }
+    }
+    return [...out.values()];
+  };
   const server = createServer((req, res) => {
     requests.push({ url: req.url!, headers: req.headers });
     const json = (status: number, body: unknown) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+    const git = /^\/repos\/[^/]+\/[^/]+\/git\/(trees|blobs)\/([0-9a-f]{40})(\?recursive=1)?$/.exec(req.url!);
+    if (git) {
+      if (git[1] === 'blobs') {
+        const bytes = blobs.get(git[2]);
+        return bytes ? res.writeHead(200, { 'content-type': 'application/vnd.github.raw' }).end(bytes) : json(404, { message: 'Not Found' });
+      }
+      // A commit sha lists its root tree, as on GitHub.
+      const owner = Object.values(repos).find((r) => r.trees[git[2]]);
+      const at = owner ? { files: owner.trees[git[2]], dir: '' } : treeIds.get(git[2]);
+      if (!at) return json(404, { message: 'Not Found' });
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (quota.remaining !== null) headers['x-ratelimit-remaining'] = String(quota.remaining);
+      return res.writeHead(200, headers).end(JSON.stringify({ sha: git[2], tree: listing(at.files, git[2], at.dir, !!git[3]), truncated: false }));
+    }
     const m = /^\/repos\/([^/]+\/[^/]+)(?:\/(commits|zipball)\/(.+))?$/.exec(req.url!);
     const zip = /^\/zip\/([0-9a-f]{40})$/.exec(req.url!);
     if (zip) {
@@ -61,10 +115,13 @@ async function fakeGithub() {
         res.on('error', () => {});
         const chunk = new Uint8Array(1024 * 1024);
         let n = 0;
+        // Exactly 40 MiB: every write counts, the one that fills the buffer included.
         const pump = () => {
-          while (n < 40 && res.write(chunk)) n++;
-          if (n >= 40) res.end();
-          else res.once('drain', pump);
+          while (n < 40) {
+            n++;
+            if (!res.write(chunk)) return void res.once('drain', pump);
+          }
+          res.end();
         };
         pump();
         return;
@@ -72,9 +129,9 @@ async function fakeGithub() {
       const owner = Object.values(repos).find((r) => r.trees[zip[1]]);
       if (!owner) return json(404, { message: 'Not Found' });
       const files = owner.trees[zip[1]];
-      // Like `git archive`: a symlink is a mode 120000 entry holding its target.
+      // Like `git archive`: a symlink is a mode 120000 entry holding its target; a submodule is left out.
       const bytes = buildZip(
-        Object.entries(files).map(([path, text]) => ({
+        Object.entries(files).filter(([, text]) => text !== SUBMODULE).map(([path, text]) => ({
           path: `owner-repo-${zip[1].slice(0, 7)}/${path}`,
           bytes: strToU8(text.startsWith(LINK) ? text.slice(LINK.length) : text),
           mode: text.startsWith(LINK) ? 0o120777 : path.endsWith('.sh') ? 493 : 420,
@@ -99,7 +156,7 @@ async function fakeGithub() {
     return res.writeHead(302, { location: `/zip/${m[3]}` }).end();
   });
   const base = `http://127.0.0.1:${await listenLocal(server)}`;
-  return { base, repos, requests, server };
+  return { base, repos, requests, server, quota };
 }
 
 const gh = await fakeGithub();
@@ -647,7 +704,6 @@ test('github errors: unknown repo or ref is bad_source, no request ever leaves f
   assert.equal(noRef.status, 400);
   assert.match(noRef.json.error.message, /acme\/err\/commits\/ghost/);
   assert.equal((await github(t, h, { json: 1 })).status, 400, 'zod');
-  assert.ok(MAX_ZIPBALL < 40 * 1024 * 1024);
   const huge = await github(t, h, { repo: 'acme/err', ref: 'huge' });
   assert.equal(huge.status, 413, huge.text);
   assert.equal(huge.json.error.code, 'too_large');
@@ -1220,4 +1276,213 @@ test('qarz: the name clash reads with the right article for every kind', async (
     assert.equal(clash.status, 409, kind);
     assert.equal(clash.json.error.message, `you already have ${phrase} named 'dup'`);
   }
+});
+
+/** Set import limits the way an admin does (PUT /admin/settings), so these tests cover the route too. */
+async function setLimits(t: TestCtx, imports: Record<string, number | ''>) {
+  const admin = t.createUser({ isAdmin: true });
+  const r = await t.req('PUT', `${API}/admin/settings`, { headers: t.session(admin), json: { imports } });
+  assert.equal(r.status, 200, r.text);
+}
+const prompts = (prefix: string, n: number): Files => Object.fromEntries(Array.from({ length: n }, (_, i) => [`prompts/${prefix}${i}.md`, `Prompt ${i}.\n`]));
+const itemCount = (t: TestCtx) => (t.db.prepare('SELECT COUNT(*) AS n FROM items').get() as { n: number }).n;
+
+test('dhje: the items-per-import cap is the import.max_items setting: 200 by default, 5 refuses 6 units naming 5, 500 lets 300 through', async () => {
+  const { t, h } = setup();
+  const at200 = await pack(t, h, 'a.zip', prompts('a', 200));
+  assert.equal(at200.status, 201, at200.text);
+  assert.equal(at200.json.items.length, 200);
+  const at201 = await pack(t, h, 'b.zip', prompts('b', 201));
+  assert.equal(at201.status, 400);
+  assert.equal(at201.json.error.code, 'too_many_items');
+  assert.equal(at201.json.error.message, 'at most 200 items per import (found 201)');
+
+  await setLimits(t, { maxItems: 5 });
+  const six = await pack(t, h, 'c.zip', prompts('c', 6));
+  assert.equal(six.status, 400);
+  assert.equal(six.json.error.code, 'too_many_items');
+  assert.equal(six.json.error.message, 'at most 5 items per import (found 6)');
+  assert.equal((await pack(t, h, 'd.zip', prompts('d', 5))).status, 201);
+  await setLimits(t, { maxItems: 1 });
+  assert.equal((await pack(t, h, 'g.zip', prompts('g', 2))).json.error.message, 'at most 1 item per import (found 2)');
+
+  await setLimits(t, { maxItems: 500 });
+  const at300 = await pack(t, h, 'e.zip', prompts('e', 300));
+  assert.equal(at300.status, 201, at300.text);
+  assert.equal(at300.json.items.length, 300);
+  // Cleared, the default applies again.
+  await setLimits(t, { maxItems: '' });
+  assert.equal((await pack(t, h, 'f.zip', prompts('f', 201))).json.error.code, 'too_many_items');
+});
+
+test('00tr: import.max_archive_mb caps the GitHub download and the pack upload, import.max_pack_mb the unpacked pack; each 413 names the current limit', async () => {
+  gh.repos['acme/sized'] = { default_branch: 'main', refs: { main: sha2('7a'), huge: SHA_HUGE }, trees: { [sha2('7a')]: { 'SKILL.md': skill('sized'), 'assets/noise.txt': noise(2) } } };
+  const { t, h } = setup();
+  const noisyPack: Files = { 'SKILL.md': skill('noisy'), 'noise.txt': noise(1.5) };
+  // Defaults: a 2 MB zipball and a 1.5 MB pack import as before; 40 MB is over the 35 MB cap.
+  assert.equal((await github(t, h, { repo: 'acme/sized' })).status, 201);
+  assert.equal((await pack(t, h, 'noisy.zip', noisyPack)).status, 201);
+  const huge = await github(t, h, { repo: 'acme/sized', ref: 'huge' });
+  assert.equal(huge.status, 413);
+  assert.equal(huge.json.error.message, 'the repository archive is over 35 MB');
+
+  await setLimits(t, { maxArchiveMb: 1 });
+  const small = await github(t, h, { repo: 'acme/sized' });
+  assert.equal(small.status, 413, small.text);
+  assert.equal(small.json.error.code, 'too_large');
+  assert.equal(small.json.error.message, 'the repository archive is over 1 MB');
+  const upload = await pack(t, h, 'noise.zip', { 'SKILL.md': skill('n'), 'noise.txt': noise(2) });
+  assert.equal(upload.status, 413);
+  assert.equal(upload.json.error.message, 'request body is over 1 MB');
+
+  // Raised to 40 MB, the 40 MB download is let through (the fake's bytes are not a zip: the unzip refuses them, not the cap).
+  await setLimits(t, { maxArchiveMb: 40 });
+  const through = await github(t, h, { repo: 'acme/sized', ref: 'huge' });
+  assert.equal(through.status, 400, through.text);
+  assert.match(through.json.error.message, /not a valid zip file/);
+
+  await setLimits(t, { maxArchiveMb: '', maxPackMb: 1 });
+  const unpacked = await pack(t, h, 'noisy2.zip', noisyPack);
+  assert.equal(unpacked.status, 413, unpacked.text);
+  assert.equal(unpacked.json.error.message, "'noise.txt' is over 1 MB");
+});
+
+test('00tr: the single-file import is capped by import.max_archive_mb too, never above 35 MB; GET /imports/limits tells any signed-in user the caps', async () => {
+  const { t, h } = setup();
+  const bigSkill = zipSync({ 'SKILL.md': zipEntry(skill('big')), 'noise.txt': zipEntry(noise(2)) }, { level: 0 });
+  assert.equal((await importOne(t, h, 'big.zip', bigSkill)).status, 201);
+  const limits = async () => (await t.req('GET', `${API}/imports/limits`, { headers: h })).json;
+  assert.equal((await t.req('GET', `${API}/imports/limits`)).status, 401);
+  assert.deepEqual(await limits(), { maxItems: 200, maxArchiveMb: 35, maxPackMb: 64, maxFileMb: 35 });
+
+  await setLimits(t, { maxArchiveMb: 1, maxItems: 7 });
+  const refused = await importOne(t, h, 'big2.zip', bigSkill);
+  assert.equal(refused.status, 413, refused.text);
+  assert.equal(refused.json.error.message, 'request body is over 1 MB');
+  assert.deepEqual(await limits(), { maxItems: 7, maxArchiveMb: 1, maxPackMb: 64, maxFileMb: 1 });
+  // Raised over 35 MB, the pack upload follows; the single-file upload stays at 35 (a version is 30 MB).
+  await setLimits(t, { maxArchiveMb: 100 });
+  assert.equal((await limits()).maxFileMb, 35);
+});
+
+const BIG_REPO = (desc: string): Files => ({
+  'skills/alpha/SKILL.md': skill('alpha', desc),
+  'skills/alpha/scripts/run.sh': '#!/bin/sh\necho alpha\n',
+  'skills/beta/SKILL.md': skill('beta'),
+  'skills/beta/ref': link('../alpha'),
+  'skills/vendor': SUBMODULE,
+  'skills/.DS_Store': 'junk',
+  'assets/noise.txt': noise(2),
+});
+const gitCalls = (from: number, kind: 'trees' | 'blobs') => gh.requests.slice(from).filter((r) => r.url.includes(`/git/${kind}/`)).length;
+
+test('a4q8: a folder of a repository whose archive is over the cap imports file by file, with the trees a zipball import gives; source/update falls back too; the calls are spent on the user', async () => {
+  gh.repos['acme/huge-mono'] = { default_branch: 'main', refs: { main: sha2('7b') }, trees: { [sha2('7b')]: BIG_REPO('v1'), [sha2('7c')]: BIG_REPO('v2') } };
+  // The reference: the same commit and folder through the zipball, under the default cap.
+  const ref = setup();
+  const viaZip = await github(ref.t, ref.h, { repo: 'acme/huge-mono', path: 'skills' });
+  assert.equal(viaZip.status, 201, viaZip.text);
+  assert.equal(gitCalls(0, 'trees'), 0, 'under the cap nothing is listed');
+
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  let from = gh.requests.length;
+  const r = await github(t, h, { repo: 'acme/huge-mono', path: 'skills' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:alpha', 'skill:beta']);
+  assert.ok(gh.requests.slice(from).some((q) => q.url.includes('/zipball/')), 'the zipball is tried first');
+  assert.equal(gitCalls(from, 'trees'), 2, 'one listing per path segment, then the folder');
+  assert.equal(gitCalls(from, 'blobs'), 4, 'one per file and link; none for junk or the submodule');
+  const trees = (items: { name: string; version: { treeSha256: string } }[]) => Object.fromEntries(items.map((i) => [i.name, i.version.treeSha256]));
+  assert.deepEqual(trees(r.json.items), trees(viaZip.json.items));
+  assert.deepEqual(r.json.items.map((i: { source: { path: string; commit: string } }) => [i.source.path, i.source.commit]).sort(), [['skills/alpha', sha2('7b')], ['skills/beta', sha2('7b')]]);
+  // The link is reported as the zipball reports it; the submodule (which a zipball leaves out) too.
+  assert.deepEqual(r.json.skipped[0], viaZip.json.skipped[0]);
+  assert.deepEqual(r.json.skipped[0], { path: 'beta/ref', reason: "symlink to '../alpha', not imported" });
+  assert.equal(r.json.skipped[1].path, 'vendor');
+  assert.match(r.json.skipped[1].reason, /^submodule at [0-9a-f]{7}, not imported$/);
+
+  // A whole-repository import keeps the 413: there is no folder to fetch file by file.
+  from = gh.requests.length;
+  const whole = await github(t, h, { repo: 'acme/huge-mono' });
+  assert.equal(whole.status, 413);
+  assert.equal(whole.json.error.message, 'the repository archive is over 1 MB');
+  assert.equal(gitCalls(from, 'trees'), 0);
+
+  // source/update takes the same path: the folder is listed and fetched at the new commit.
+  gh.repos['acme/huge-mono'].refs.main = sha2('7c');
+  const alpha = r.json.items.find((i: { name: string }) => i.name === 'alpha');
+  from = gh.requests.length;
+  const up = await t.req('POST', `${API}/items/${alpha.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.description, 'v2');
+  assert.deepEqual(up.json.skipped, []);
+  assert.equal(gitCalls(from, 'trees'), 3, 'skills, skills/alpha, then the folder');
+  assert.equal(gitCalls(from, 'blobs'), 2);
+
+  // Every call was spent on this user's bucket (burst 10): 1 + 6 for the import, 1 for the 413, 1 + 5 for the update.
+  const next = await github(t, h, { repo: 'acme/huge-mono', path: 'skills' });
+  assert.equal(next.status, 429);
+  assert.equal(next.json.error.code, 'rate_limited');
+});
+
+test('a4q8: a folder over the version limits is refused from the listing, and one that needs more calls than the anonymous quota has left is a 400 naming github.token; no blob is fetched', async () => {
+  const many = Object.fromEntries(Array.from({ length: 1001 }, (_, i) => [`docs/f${i}.md`, `# ${i}\n`]));
+  gh.repos['acme/huge-docs'] = {
+    default_branch: 'main',
+    refs: { main: sha2('7d') },
+    trees: { [sha2('7d')]: { ...many, 'big/SKILL.md': skill('big'), 'big/huge.txt': 'x'.repeat(11 * 1024 * 1024), 'assets/noise.txt': noise(2) } },
+  };
+  gh.repos['acme/huge-quota'] = { default_branch: 'main', refs: { main: sha2('7e') }, trees: { [sha2('7e')]: BIG_REPO('v1') } };
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  let from = gh.requests.length;
+  const files = await github(t, h, { repo: 'acme/huge-docs', path: 'docs' });
+  assert.equal(files.status, 413, files.text);
+  assert.match(files.json.error.message, /'docs' is too large to fetch file by file: at most 1000 files/);
+  const size = await github(t, h, { repo: 'acme/huge-docs', path: 'big' });
+  assert.equal(size.status, 413, size.text);
+  assert.match(size.json.error.message, /'big\/huge.txt' is over 10 MB/);
+  assert.equal(gitCalls(from, 'trees'), 4, 'listed');
+  assert.equal(gitCalls(from, 'blobs'), 0, 'refused before any blob');
+
+  from = gh.requests.length;
+  gh.quota.remaining = 3;
+  try {
+    const q = await github(t, h, { repo: 'acme/huge-quota', path: 'skills' });
+    assert.equal(q.status, 400, q.text);
+    assert.match(q.json.error.message, /needs 4 GitHub requests, more than the 3 anonymous ones left this hour; set a github\.token/);
+  } finally {
+    gh.quota.remaining = null;
+  }
+  assert.equal(gitCalls(from, 'blobs'), 0);
+  assert.equal(itemCount(t), 0, 'no partial import');
+});
+
+test('a4q8: an import admitted with its last token still completes and pays every listing and blob call in debt', async () => {
+  gh.repos['acme/huge-last'] = { default_branch: 'main', refs: { main: sha2('7f') }, trees: { [sha2('7f')]: BIG_REPO('v1') } };
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  // Nine calls that stop at GitHub's 400 leave the burst of 10 with about one token.
+  for (let i = 0; i < 9; i++) assert.equal((await github(t, h, { repo: 'acme/no-such-repo' })).status, 400);
+  const from = gh.requests.length;
+  const r = await github(t, h, { repo: 'acme/huge-last', path: 'skills' });
+  assert.equal(r.status, 201, r.text);
+  assert.equal(gitCalls(from, 'trees'), 2);
+  assert.equal(gitCalls(from, 'blobs'), 4);
+  // 2 listings and 4 blobs are owed: about 30 s before the next GitHub call.
+  assert.equal((await github(t, h, { repo: 'acme/no-such-repo' })).status, 429);
+});
+
+test('a4q8: a folder refused from its listing still pays for the listings it made', async () => {
+  gh.repos['acme/huge-refused'] = {
+    default_branch: 'main',
+    refs: { main: sha2('80') },
+    trees: { [sha2('80')]: { ...Object.fromEntries(Array.from({ length: 1001 }, (_, i) => [`docs/f${i}.md`, `# ${i}\n`])), 'assets/noise.txt': noise(2) } },
+  };
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  // Each refusal spends 1 token to start and 2 for its listings: the burst of 10 admits four.
+  for (let i = 0; i < 4; i++) assert.equal((await github(t, h, { repo: 'acme/huge-refused', path: 'docs' })).status, 413);
+  assert.equal((await github(t, h, { repo: 'acme/huge-refused', path: 'docs' })).status, 429);
 });

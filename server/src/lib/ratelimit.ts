@@ -37,8 +37,8 @@ const bucketsByDb = new WeakMap<object, Map<string, Bucket>>();
 const FULL_AFTER_MS = Math.max(...Object.values(AUTH_LIMITS).map((l) => l.burst / l.perSec)) * 1000;
 const MAX_BUCKETS = 50_000;
 
-/** Token bucket: true and one token spent, or false when the bucket is empty. */
-export function take(c: Context<AppEnv>, key: string, { burst, perSec }: Rate): boolean {
+/** The key's bucket, refilled to now. */
+function bucket(c: Context<AppEnv>, key: string, { burst, perSec }: Rate): Bucket {
   let m = bucketsByDb.get(c.var.ctx.db);
   if (!m) bucketsByDb.set(c.var.ctx.db, (m = new Map()));
   const t = Date.now();
@@ -50,9 +50,24 @@ export function take(c: Context<AppEnv>, key: string, { burst, perSec }: Rate): 
   b.tokens = Math.min(burst, b.tokens + ((t - b.at) / 1000) * perSec);
   b.at = t;
   m.set(key, b);
+  return b;
+}
+
+/** Token bucket: true and one token spent, or false when the bucket is empty. */
+export function take(c: Context<AppEnv>, key: string, rate: Rate): boolean {
+  const b = bucket(c, key, rate);
   if (b.tokens < 1) return false;
   b.tokens -= 1;
   return true;
+}
+
+/**
+ * `cost` tokens spent whatever is left, for calls a request admitted by `take` has made or must make
+ * (a GitHub folder fetched file by file): the bucket may go into debt, so the key waits out every
+ * call before its next one.
+ */
+export function spend(c: Context<AppEnv>, key: string, rate: Rate, cost: number): void {
+  bucket(c, key, rate).tokens -= cost;
 }
 
 export const rateLimited = (what = 'attempts') => new HttpError(429, 'rate_limited', `too many ${what}; wait a minute and try again`);

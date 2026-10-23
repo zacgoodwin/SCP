@@ -1,15 +1,15 @@
+import { importLimit } from '../admin/settings.ts';
 import { requireScope } from '../auth/middleware.ts';
 import { tx, type Db } from '../db.ts';
 import { addMemberTx, createGroup } from '../groups/service.ts';
 import { addVersion, createItemTx, getItemRow, listFiles, resolveVersion, slugify, type Lint } from '../items/service.ts';
 import { parseFrontmatter } from '../lib/frontmatter.ts';
-import { HttpError, badRequest } from '../lib/http.ts';
+import { HttpError, MB, badRequest } from '../lib/http.ts';
 import { isJunkPath } from '../lib/paths.ts';
 import { stripTopFolder, type TreeFile } from '../lib/tree.ts';
-import { PACK_LIMITS, safeUnzip, type ZipLink } from '../lib/zip.ts';
+import { PACK_LIMITS, safeUnzip, type ZipLimits, type ZipLink } from '../lib/zip.ts';
 import type { Ctx, GroupRow, ItemRow, ItemSource, Kind, Principal } from '../types.ts';
 
-export const MAX_ITEMS = 200;
 export const ARTIFACT_FROM_TREE = 'an artifact imports from a single file, not from a repository or pack';
 
 /** One item-to-be inside an imported tree. */
@@ -97,13 +97,19 @@ const NOT_AN_ITEM = 'repository documentation, not an item';
  * Symlinks (`CLAUDE.md -> AGENTS.md`, `.agents/skills -> ../.claude/skills`) are left out and returned
  * in `links`, re-rooted with the files, for the import to report (linkSkips).
  */
-export function unpack(bytes: Uint8Array, keep?: (name: string) => boolean): { files: TreeFile[]; top: string | null; links: ZipLink[] } {
+export function unpack(bytes: Uint8Array, keep?: (name: string) => boolean, limits: ZipLimits = PACK_LIMITS): { files: TreeFile[]; top: string | null; links: ZipLink[] } {
   const links: ZipLink[] = [];
-  const entries: (TreeFile | ZipLink)[] = [...safeUnzip(bytes, keep, PACK_LIMITS, links), ...links].filter((f) => !isJunkPath(f.path));
+  const entries: (TreeFile | ZipLink)[] = [...safeUnzip(bytes, keep, limits, links), ...links].filter((f) => !isJunkPath(f.path));
   let { files: all, top } = stripTopFolder(entries);
   if (top && LAYOUT_DIRS.has(top)) [all, top] = [entries, null];
   const isLink = (f: TreeFile | ZipLink): f is ZipLink => 'target' in f;
   return { files: all.filter((f): f is TreeFile => !isLink(f)), top, links: all.filter(isLink) };
+}
+
+/** PACK_LIMITS with the instance's `import.max_pack_mb` (00tr) as the per-file and total cap. */
+export function packLimits(ctx: Ctx): ZipLimits {
+  const bytes = importLimit(ctx, 'maxPackMb') * MB;
+  return { ...PACK_LIMITS, fileBytes: bytes, totalBytes: bytes };
 }
 
 /** A pack's symlinks as skip reasons. */
@@ -167,7 +173,7 @@ export function detectUnits(tree: TreeFile[], rootName: string, opts: { layoutDi
   if (opts.folderRoot && rootSkillMd) return { units: [{ path: '', kind: 'skill', tree: skillTree(tree), fallbackName: rootName, folderName: rootName, scope: 'tree' }], skipped };
   // The files under every folder (each ancestor), indexed once in tree order: a folder unit that
   // filtered the whole tree made detection O(folders x files), tens of seconds of blocked event loop
-  // for a pack of 10,000 skill folders, before MAX_ITEMS was even checked.
+  // for a pack of 10,000 skill folders, before the item cap was even checked.
   const byDir = new Map<string, TreeFile[]>();
   for (const f of tree) {
     for (let i = f.path.indexOf('/'); i >= 0; i = f.path.indexOf('/', i + 1)) {
@@ -368,7 +374,8 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   }
   // The skip reasons travel as details, like the 422 below, so the UI can list what was passed over and why.
   if (!units.length) throw new HttpError(400, 'nothing_to_import', 'no skills, agents, commands, prompts, instructions or design files found', skipped.length ? skipped : undefined);
-  if (units.length > MAX_ITEMS) throw new HttpError(400, 'too_many_items', `at most ${MAX_ITEMS} items per import (found ${units.length})`);
+  const maxItems = importLimit(ctx, 'maxItems');
+  if (units.length > maxItems) throw new HttpError(400, 'too_many_items', `at most ${maxItems} item${maxItems === 1 ? '' : 's'} per import (found ${units.length})`);
   const { db } = ctx;
   return tx(db, () => {
     const group = opts.group ? createGroup(ctx, p, { slug: opts.group, name: opts.groupName ?? opts.rootName }) : null;

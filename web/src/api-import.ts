@@ -18,6 +18,25 @@ export interface ImportGroupOpts {
   groupName?: string;
 }
 
+/** The instance's caps (GET /imports/limits): admin settings, read by any signed-in user. */
+export interface ImportLimits {
+  maxItems: number;
+  maxArchiveMb: number;
+  maxPackMb: number;
+  /** The File tab's body cap: the archive cap, at most 35 MB. */
+  maxFileMb: number;
+}
+
+export const getImportLimits = () => json<ImportLimits>('GET', '/imports/limits');
+
+/**
+ * The server's own 413, raised before the upload starts: a browser whose body is cut off by that 413
+ * sees a connection reset instead. A few KB are left for the multipart framing and form fields.
+ */
+export function refuseOversize(file: File, mb: number): void {
+  if (file.size + 4096 > mb * 1024 * 1024) throw new ApiError(413, 'too_large', `request body is over ${mb} MB`);
+}
+
 export function importPack(file: File, opts: ImportGroupOpts = {}) {
   const fd = new FormData();
   fd.set('file', file);
@@ -74,7 +93,7 @@ export function sourceUrl(s: ItemSource): string | null {
 export function importErrorMessage(e: unknown): string {
   if (e instanceof ApiError) {
     if (e.status === 404 && e.code === 'not_found' && /route/.test(e.message)) return 'This server does not have the import API yet (404).';
-    if (e.status === 413) return `Too large: ${e.message}. A pack upload is limited to 35 MB including the form fields, so keep the zip a little under that.`;
+    if (e.status === 413) return `Too large: ${e.message}. A pack upload's limit counts the form fields too, so keep the zip a little under it.`;
     if (e.code === 'bad_source') return `Bad source: ${e.message}`;
     if (e.code === 'up_to_date') return 'Already up to date.';
     return e.message;

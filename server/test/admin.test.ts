@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { insertGroup, makeTestCtx, type TestCtx, type TestUser } from './helpers.ts';
 import { sweepBlobs } from '../src/items/gc.ts';
 import { readSetting } from '../src/admin/settings.ts';
+import { loadConfig } from '../src/config.ts';
 
 const API = '/api/v1';
 type H = Record<string, string>;
@@ -148,6 +150,73 @@ test('a label-only environment leaves the IdP fields editable and does not read 
   const label = await t.req('PUT', `${API}/admin/settings`, { headers: ah, json: { oidc: { label: 'Other' } } });
   assert.equal(label.status, 400);
   assert.equal(label.json.error.code, 'env_managed');
+});
+
+test('dhje/00tr: import limits round trip under the import.* keys, are range-checked, audited, admin-only, and "" clears back to the default', async () => {
+  const { t, admin, ah, uh } = setup();
+  const get = await t.req('GET', `${API}/admin/settings`, { headers: ah });
+  assert.deepEqual(get.json.imports, { maxItems: 200, maxArchiveMb: 35, maxPackMb: 64, envFields: [] });
+  const put = await t.req('PUT', `${API}/admin/settings`, { headers: ah, json: { imports: { maxItems: 2000, maxArchiveMb: 1, maxPackMb: 256 } } });
+  assert.equal(put.status, 200, put.text);
+  assert.deepEqual(put.json.imports, { maxItems: 2000, maxArchiveMb: 1, maxPackMb: 256, envFields: [] });
+  assert.deepEqual(
+    (t.db.prepare("SELECT key, value FROM settings WHERE key LIKE 'import.%' ORDER BY key").all() as { key: string; value: string }[]).map((r) => ({ ...r })),
+    [
+      { key: 'import.max_archive_mb', value: '1' },
+      { key: 'import.max_items', value: '2000' },
+      { key: 'import.max_pack_mb', value: '256' },
+    ],
+  );
+  const log = t.db.prepare("SELECT detail FROM audit WHERE action = 'admin.settings' AND user_id = ?").all(admin.id) as { detail: string }[];
+  assert.deepEqual(JSON.parse(log[0].detail).keys.sort(), ['import.max_archive_mb', 'import.max_items', 'import.max_pack_mb']);
+
+  // Outside 1..2000 (items) or 1..256 (MB), or not a whole number: 400, nothing written.
+  const bad = [{ maxItems: 0 }, { maxItems: 2001 }, { maxItems: -1 }, { maxItems: '5' }, { maxArchiveMb: 0 }, { maxArchiveMb: 257 }, { maxPackMb: 257 }, { maxPackMb: 1.5 }];
+  for (const imports of bad) {
+    const r = await t.req('PUT', `${API}/admin/settings`, { headers: ah, json: { imports } });
+    assert.equal(r.status, 400, JSON.stringify(imports));
+  }
+  assert.equal((await t.req('PUT', `${API}/admin/settings`, { headers: ah, json: { imports: {} } })).status, 400, 'nothing to change');
+  // Non-admins are refused like every admin route (403), and write nothing.
+  assert.equal((await t.req('PUT', `${API}/admin/settings`, { headers: uh, json: { imports: { maxItems: 7 } } })).status, 403);
+  assert.equal(readSetting(t.db, 'import.max_items'), '2000');
+
+  const cleared = await t.req('PUT', `${API}/admin/settings`, { headers: ah, json: { imports: { maxArchiveMb: '' } } });
+  assert.equal(cleared.status, 200, cleared.text);
+  assert.equal(cleared.json.imports.maxArchiveMb, 35);
+  assert.equal(readSetting(t.db, 'import.max_archive_mb'), null);
+  assert.equal((t.db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'admin.settings'").get() as { n: number }).n, 2, 'one audit row per change');
+});
+
+test('import limits set by SCP_IMPORT_* win over a stored row and are read-only per field (400 env_managed); a bad value stops the boot', async () => {
+  const { t, ah } = setup({ SCP_IMPORT_MAX_ITEMS: '50' });
+  t.db.prepare("INSERT INTO settings (key, value) VALUES ('import.max_items', '900')").run();
+  const get = await t.req('GET', `${API}/admin/settings`, { headers: ah });
+  assert.deepEqual(get.json.imports, { maxItems: 50, maxArchiveMb: 35, maxPackMb: 64, envFields: ['maxItems'] });
+  const locked = await t.req('PUT', `${API}/admin/settings`, { headers: ah, json: { imports: { maxItems: 10, maxPackMb: 100 } } });
+  assert.equal(locked.status, 400);
+  assert.equal(locked.json.error.code, 'env_managed');
+  assert.match(locked.json.error.message, /SCP_IMPORT_MAX_ITEMS/);
+  assert.equal(readSetting(t.db, 'import.max_pack_mb'), null, 'nothing written');
+  const ok = await t.req('PUT', `${API}/admin/settings`, { headers: ah, json: { imports: { maxPackMb: 100 } } });
+  assert.equal(ok.status, 200, ok.text);
+  assert.deepEqual(ok.json.imports, { maxItems: 50, maxArchiveMb: 35, maxPackMb: 100, envFields: ['maxItems'] });
+  const base = { SCP_PUBLIC_URL: 'http://a.test', SCP_ARTIFACT_URL: 'http://b.test' };
+  for (const [name, v] of [['SCP_IMPORT_MAX_ITEMS', '0'], ['SCP_IMPORT_MAX_ITEMS', '2001'], ['SCP_IMPORT_MAX_ARCHIVE_MB', '257'], ['SCP_IMPORT_MAX_PACK_MB', '1.5'], ['SCP_IMPORT_MAX_PACK_MB', 'lots']]) {
+    assert.throws(() => loadConfig({ ...base, [name]: v }), new RegExp(name), `${name}=${v}`);
+  }
+  assert.equal(loadConfig({ ...base, SCP_IMPORT_MAX_ARCHIVE_MB: '' }).imports.maxArchiveMb, null, "compose's unset ''");
+});
+
+test('every variable the README Configuration table names reaches the container: docker-compose.yml passes it through', () => {
+  const read = (f: string) => readFileSync(new URL(`../../${f}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const table = /### Configuration[\s\S]*?\n\n(\|[\s\S]*?)\n\s*\n/.exec(read('README.md'))![1];
+  const names = new Set(table.match(/SCP_[A-Z_]+/g));
+  assert.ok(names.has('SCP_IMPORT_MAX_ITEMS'), 'the table was found');
+  const compose = read('docker-compose.yml');
+  // SCP_HOST_* are compose's own port mappings, read where they are used.
+  const missing = [...names].filter((n) => !n.startsWith('SCP_HOST_') && !new RegExp(`^\\s+${n}: \\$\\{${n}:-`, 'm').test(compose));
+  assert.deepEqual(missing, []);
 });
 
 // ---------- blob GC ----------

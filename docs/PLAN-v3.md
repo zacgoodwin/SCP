@@ -51,6 +51,9 @@ onto the top of lane I before shipping. Deferred tickets (`deferred` label) are 
   frontmatter. The registry starts empty (no seeded rows); seeding stays a human decision.
 - dnxq part 2 (serving hooks / MCP servers / output styles as items) is not built. Until a human
   decides, SCP reports those components in `skipped` and never stores or serves them.
+- dhje / 00tr: their criteria say non-admins get 404 on the settings route. The route keeps 403,
+  like every admin route (PLAN-v2 D4 and `admin.test.ts` settle 403; an admin route's existence is no
+  secret, unlike a resource). Kata c5j3 decides whether all admin routes move to 404 together.
 - Migrations stay append-only (`db.ts` `MIGRATIONS`); parallel lanes each append theirs and the
   restack orders them. No deployed database has run a v3 migration before the batch merges.
 

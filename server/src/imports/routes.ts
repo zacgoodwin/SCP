@@ -1,15 +1,17 @@
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { z } from 'zod';
+import { fileImportMb, importLimit } from '../admin/settings.ts';
 import { audit } from '../audit.ts';
 import { reauthenticate, requireScope, requireUser } from '../auth/middleware.ts';
 import { groupDetail } from '../groups/service.ts';
 import { itemDetail, itemSource, loadEditableItem } from '../items/service.ts';
 import { sha256Hex } from '../lib/crypto.ts';
 import { HttpError, MB, badRequest, limitBody as limit, notFound, parseJson } from '../lib/http.ts';
-import { AUTH_LIMITS, rateLimited, take } from '../lib/ratelimit.ts';
+import { AUTH_LIMITS, rateLimited, spend, take } from '../lib/ratelimit.ts';
+import type { TreeFile } from '../lib/tree.ts';
 import { KINDS, type AppEnv, type ItemRow, type ItemSource, type Principal } from '../types.ts';
-import { SHA_REF, badSource, fetchZipball, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
-import { ARTIFACT_FROM_TREE, importTree, linkSkips, subtree, underPath, unpack, updateTree, versionFromSource, type ImportOutcome } from './pack.ts';
+import { SHA_REF, archiveTooLarge, badSource, fetchFolder, fetchZipball, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
+import { ARTIFACT_FROM_TREE, importTree, linkSkips, packLimits, subtree, underPath, unpack, updateTree, versionFromSource, type ImportOutcome, type Skipped } from './pack.ts';
 
 const groupFields = {
   visibility: z.enum(['private', 'public']).optional(),
@@ -49,10 +51,32 @@ function requireImporter(c: Context<AppEnv>): Principal {
 /**
  * Every route that contacts GitHub spends 2-3 calls of the instance's one shared quota (its token, or
  * the egress IP for anonymous calls), so each user gets a bucket of their own before anything leaves.
+ * A folder fetched file by file (a4q8) then spends one token per call it makes, into debt if need be.
  */
 function limitGithub(c: Context<AppEnv>, p: Principal): void {
   if (!take(c, `github:${p.userId}`, AUTH_LIMITS.github)) throw rateLimited('GitHub requests');
 }
+
+/**
+ * repo@sha at or under `path`: repository-relative files, and what was passed over (links, submodules)
+ * re-rooted at `path`. The zipball, inflating only the folder; over the archive cap, a whole repository
+ * is a 413 and a folder is fetched file by file instead (a4q8, github.ts fetchFolder).
+ */
+async function download(c: Context<AppEnv>, p: Principal, repo: string, sha: string, path: string | null): Promise<{ files: TreeFile[]; skipped: Skipped[] }> {
+  const ctx = c.var.ctx;
+  const zip = await fetchZipball(ctx, repo, sha);
+  if (zip) {
+    const { files, links } = unpack(zip, underPath(path), packLimits(ctx));
+    return { files, skipped: linkSkips(subtree(links, path)) };
+  }
+  if (path === null) throw archiveTooLarge(ctx);
+  const { files, links, submodules } = await fetchFolder(ctx, repo, sha, path, (calls) => spend(c, `github:${p.userId}`, AUTH_LIMITS.github, calls));
+  const subs = subtree(submodules, path).map((s) => ({ path: s.path, reason: `submodule at ${short(s.sha)}, not imported` }));
+  return { files, skipped: [...linkSkips(subtree(links, path)), ...subs] };
+}
+
+/** The pack upload's body cap is the archive cap (00tr), read per request. */
+const archiveBody: MiddlewareHandler<AppEnv> = (c, next) => limit(importLimit(c.var.ctx, 'maxArchiveMb') * MB)(c, next);
 
 /** Audit each unit and the group, then the ImportResult. Runs after the import transaction committed. */
 function respond(c: Context<AppEnv>, p: Principal, out: ImportOutcome, source: ItemSource) {
@@ -76,7 +100,18 @@ function respond(c: Context<AppEnv>, p: Principal, out: ImportOutcome, source: I
   );
 }
 
-importRoutes.post('/items/import/pack', limit(35 * MB), async (c) => {
+/**
+ * The effective upload and item caps, for any signed-in user: the Import dialog refuses an oversize
+ * file before sending it, because a browser whose upload is cut off by the 413 (the body limit stops
+ * reading) sees a connection reset, not the answer. The settings route stays admin-only.
+ */
+importRoutes.get('/imports/limits', (c) => {
+  requireUser(c);
+  const ctx = c.var.ctx;
+  return c.json({ maxItems: importLimit(ctx, 'maxItems'), maxArchiveMb: importLimit(ctx, 'maxArchiveMb'), maxPackMb: importLimit(ctx, 'maxPackMb'), maxFileMb: fileImportMb(ctx) });
+});
+
+importRoutes.post('/items/import/pack', archiveBody, async (c) => {
   requireImporter(c);
   const form = await c.req.parseBody();
   const p = reauthenticate(c);
@@ -87,7 +122,7 @@ importRoutes.post('/items/import/pack', limit(35 * MB), async (c) => {
   if (!fields.success) throw badRequest('invalid fields', fields.error.issues);
   const bytes = new Uint8Array(await file.arrayBuffer());
   const name = baseOf(file.name) || 'pack.zip';
-  const { files, top, links } = unpack(bytes);
+  const { files, top, links } = unpack(bytes, undefined, packLimits(c.var.ctx));
   const rootName = top ?? name.replace(/\.(zip|skill)$/i, '');
   const source: ItemSource = { kind: 'zip', repo: name, ref: null, path: null, commit: sha256Hex(bytes) };
   // A stripped wrapper folder (`zip -r my-skill.zip my-skill/`) is one folder, so its SKILL.md is the whole folder's.
@@ -106,7 +141,7 @@ importRoutes.post('/items/import/github', async (c) => {
   // `repo` as GitHub spells it, whatever case the user typed: it identifies the items on re-import.
   const { repo, ref, sha } = await resolveCommit(ctx, importer, src.repo, src.ref);
   return withZipballSlot(async () => {
-    const { files, links } = unpack(await fetchZipball(ctx, repo, sha), underPath(src.path));
+    const { files, skipped } = await download(c, importer, repo, sha, src.path);
     const pathIsFile = files.some((f) => f.path === src.path);
     const tree = subtree(files, src.path);
     if (!tree.length) throw badSource(`'${src.path}' holds no files in ${repo}@${short(sha)}`);
@@ -121,7 +156,7 @@ importRoutes.post('/items/import/github', async (c) => {
       // A /tree/<ref>/<path> or /blob/.../SKILL.md import is one folder: its SKILL.md takes the folder, as under skills/ in a whole-repository import.
       folderRoot: !!src.path,
       pathIsFile,
-      skipped: linkSkips(subtree(links, src.path)),
+      skipped,
       visibility: body.visibility,
       kind: body.kind,
       name: body.name,
@@ -166,7 +201,7 @@ importRoutes.post('/items/:id/source/update', async (c) => {
   // The same commit check reports as up to date: re-applying its tree would overwrite a local edit made since.
   if (sha === item.source_commit) throw upToDate();
   return withZipballSlot(async () => {
-    const { files, links } = unpack(await fetchZipball(ctx, repo, sha), underPath(item.source_path));
+    const { files, skipped } = await download(c, editor, repo, sha, item.source_path);
     const tree = subtree(files, item.source_path);
     if (!tree.length) throw badSource(`'${item.source_path}' no longer exists in ${repo}@${short(sha)}`);
     const p = reauthenticate(c);
@@ -174,6 +209,6 @@ importRoutes.post('/items/:id/source/update', async (c) => {
     const r = versionFromSource(ctx, p, item, updateTree(ctx.db, item, tree), source, body.note ?? `import github ${repo}@${short(sha)} ${item.source_path ?? ''}`.trimEnd());
     if (r.op === 'unchanged') throw upToDate();
     audit(c, p, { action: 'item.version', targetType: 'item', targetId: item.id, detail: { kind: item.kind, name: item.name, seq: r.item.latest_seq, via: 'github', commit: sha } });
-    return c.json({ item: itemDetail(ctx.db, p, r.item), skipped: linkSkips(subtree(links, item.source_path)) });
+    return c.json({ item: itemDetail(ctx.db, p, r.item), skipped });
   });
 });

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router';
 import * as api from '../api.ts';
 import * as imp from '../api-import.ts';
@@ -36,6 +36,22 @@ export function ImportDialog({
   const nav = useNavigate();
   const [tab, setTab] = useState<Tab>('file');
   const [result, setResult] = useState<imp.ImportResult | null>(null);
+  const [limits, setLimits] = useState<imp.ImportLimits | null>(null);
+
+  // Read on every open: an admin may have changed them. Unreadable (an older server), the server's 413 is the only check.
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    imp.getImportLimits().then(
+      (l) => {
+        if (live) setLimits(l);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [open]);
 
   const close = () => {
     setResult(null);
@@ -65,9 +81,9 @@ export function ImportDialog({
           <Tabs tabs={tabs} value={tab} onChange={setTab} label="Import source" idPrefix="itab" panelId="import-panel" />
           <div id="import-panel" role="tabpanel" aria-labelledby={`itab-${tab}`}>
             {tab === 'file' ? (
-              <FileForm plane={plane} onCancel={close} />
+              <FileForm plane={plane} limits={limits} onCancel={close} />
             ) : tab === 'pack' ? (
-              <PackForm onCancel={close} onDone={done} />
+              <PackForm limits={limits} onCancel={close} onDone={done} />
             ) : (
               <GithubForm plane={plane} onCancel={close} onDone={done} />
             )}
@@ -157,7 +173,7 @@ function GroupFields({ group, groupName, onGroup, onGroupName }: { group: string
   );
 }
 
-function FileForm({ plane, onCancel }: { plane?: api.Plane; onCancel: () => void }) {
+function FileForm({ plane, limits, onCancel }: { plane?: api.Plane; limits: imp.ImportLimits | null; onCancel: () => void }) {
   const nav = useNavigate();
   const [file, setFile] = useState<File | null>(null);
   const kinds = plane ? api.KINDS_BY_PLANE[plane] : ALL_KINDS;
@@ -169,6 +185,7 @@ function FileForm({ plane, onCancel }: { plane?: api.Plane; onCancel: () => void
 
   const go = submit(async () => {
     if (!file) return;
+    if (limits) imp.refuseOversize(file, limits.maxFileMb);
     const { item } = await api.importItem(file, { kind: kind || undefined, visibility });
     onCancel();
     nav(`/items/${item.id}`);
@@ -179,7 +196,9 @@ function FileForm({ plane, onCancel }: { plane?: api.Plane; onCancel: () => void
       <label className="field">
         <span>File</span>
         <input type="file" accept={ACCEPT} required onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-        <small className="muted">A .md file, a skill folder as .zip or .skill, or an artifact (.html, .md, .svg, .mmd, .jsx, .tsx).</small>
+        <small className="muted">
+          A .md file, a skill folder as .zip or .skill, or an artifact (.html, .md, .svg, .mmd, .jsx, .tsx){limits && `, up to ${limits.maxFileMb} MB`}.
+        </small>
       </label>
       <KindSelect value={kind} kinds={kinds} onChange={setKind} />
       <VisibilitySelect value={visibility} onChange={setVisibility} />
@@ -189,7 +208,7 @@ function FileForm({ plane, onCancel }: { plane?: api.Plane; onCancel: () => void
   );
 }
 
-function PackForm({ onCancel, onDone }: { onCancel: () => void; onDone: (r: imp.ImportResult) => void }) {
+function PackForm({ limits, onCancel, onDone }: { limits: imp.ImportLimits | null; onCancel: () => void; onDone: (r: imp.ImportResult) => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [visibility, setVisibility] = useState<api.Visibility>('private');
   const [group, setGroup] = useState('');
@@ -198,6 +217,7 @@ function PackForm({ onCancel, onDone }: { onCancel: () => void; onDone: (r: imp.
 
   const go = submit(async () => {
     if (!file) return;
+    if (limits) imp.refuseOversize(file, limits.maxArchiveMb);
     onDone(await imp.importOrSkipped(imp.importPack(file, { visibility, group: group.trim() || undefined, groupName: groupName.trim() || undefined })));
   });
 
@@ -208,8 +228,11 @@ function PackForm({ onCancel, onDone }: { onCancel: () => void; onDone: (r: imp.
         <input type="file" accept=".zip" required onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
         <small className="muted">
           A zip holding many skills, agents, commands or MDs (a Claude Code plugin, a <code>.claude/</code> folder, <code>skills/*/SKILL.md</code>, or loose .md
-          files). Each unit becomes one item, held to the per-version limits (1000 files, 30 MB); the upload may be 35 MB (zip and form fields together), the archive 20,000 files and
-          64 MB unpacked. Re-uploading a zip under the same file name updates the items it created; a renamed file is treated as a new pack.
+          files). Each unit becomes one item, held to the per-version limits (1000 files, 30 MB);{' '}
+          {limits
+            ? `at most ${limits.maxItems} item${limits.maxItems === 1 ? '' : 's'} per import, the upload ${limits.maxArchiveMb} MB (zip and form fields together), the archive 20,000 files and ${limits.maxPackMb} MB unpacked.`
+            : 'the upload and the unpacked archive are held to the size limits an admin sets.'}{' '}
+          Re-uploading a zip under the same file name updates the items it created; a renamed file is treated as a new pack.
         </small>
       </label>
       <VisibilitySelect value={visibility} onChange={setVisibility} />

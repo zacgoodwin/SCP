@@ -31,10 +31,33 @@ export interface Config {
     autoRegister: boolean | null;
     label: string | null;
   };
+  /** Env-provided import limits; each one set here overrides the matching `import.*` setting. */
+  imports: Record<ImportLimit, number | null>;
 }
 
 /** OIDC label when neither env nor settings name one. */
 export const OIDC_DEFAULT_LABEL = 'Single sign-on';
+
+/**
+ * Admin-settable import limits (docs/PLAN-v2.md "Settings keys"), each a whole number in 1..max so a
+ * typo cannot ask for 10 GB: the archive cap is held in memory once per download slot (github.ts
+ * ZIPBALL_SLOTS) and the pack cap once per unpacked import.
+ */
+export const IMPORT_LIMITS = {
+  maxItems: { key: 'import.max_items', env: 'SCP_IMPORT_MAX_ITEMS', def: 200, max: 2000 },
+  maxArchiveMb: { key: 'import.max_archive_mb', env: 'SCP_IMPORT_MAX_ARCHIVE_MB', def: 35, max: 256 },
+  maxPackMb: { key: 'import.max_pack_mb', env: 'SCP_IMPORT_MAX_PACK_MB', def: 64, max: 256 },
+} as const;
+export type ImportLimit = keyof typeof IMPORT_LIMITS;
+
+/** Unset or '' is null (the setting applies); anything but a whole number in 1..max stops the boot. */
+function envLimit(env: NodeJS.ProcessEnv, name: string, max: number): number | null {
+  const v = env[name]?.trim();
+  if (!v) return null;
+  const n = Number(v);
+  if (!/^\d+$/.test(v) || n < 1 || n > max) throw new Error(`${name} must be a whole number from 1 to ${max}, not '${env[name]}'`);
+  return n;
+}
 
 const trimSlash = (s: string) => s.replace(/\/+$/, '');
 
@@ -91,6 +114,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       // null = not set in the environment; the admin setting (or the default true) applies.
       autoRegister: env.SCP_OIDC_AUTO_REGISTER?.trim() ? envBool(env, 'SCP_OIDC_AUTO_REGISTER', true) : null,
       label: env.SCP_OIDC_LABEL?.trim() || null,
+    },
+    imports: {
+      maxItems: envLimit(env, IMPORT_LIMITS.maxItems.env, IMPORT_LIMITS.maxItems.max),
+      maxArchiveMb: envLimit(env, IMPORT_LIMITS.maxArchiveMb.env, IMPORT_LIMITS.maxArchiveMb.max),
+      maxPackMb: envLimit(env, IMPORT_LIMITS.maxPackMb.env, IMPORT_LIMITS.maxPackMb.max),
     },
   };
 }

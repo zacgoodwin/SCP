@@ -1,5 +1,6 @@
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { z } from 'zod';
+import { fileImportMb } from '../admin/settings.ts';
 import { audit } from '../audit.ts';
 import { reauthenticate, requireScope, requireUser } from '../auth/middleware.ts';
 import { canReadGroup } from '../access.ts';
@@ -120,7 +121,10 @@ itemRoutes.post('/items', limit(45 * MB), async (c) => {
   return c.json({ item: itemDetail(ctxOf(c).db, p, item) }, 201);
 });
 
-itemRoutes.post('/items/import', limit(35 * MB), async (c) => {
+/** Read per request, so the admin archive setting (00tr) caps this upload too. */
+const fileBody: MiddlewareHandler<AppEnv> = (c, next) => limit(fileImportMb(ctxOf(c)) * MB)(c, next);
+
+itemRoutes.post('/items/import', fileBody, async (c) => {
   requireScope(requireUser(c), 'write');
   const form = await c.req.parseBody();
   const p = reauthenticate(c);

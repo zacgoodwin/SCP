@@ -1,10 +1,10 @@
 import { z } from 'zod';
-import { OIDC_DEFAULT_LABEL } from '../config.ts';
+import { IMPORT_LIMITS, OIDC_DEFAULT_LABEL, type ImportLimit } from '../config.ts';
 import { tx, type Db } from '../db.ts';
 import { HttpError, badRequest } from '../lib/http.ts';
 import type { Ctx } from '../types.ts';
 
-/** Settings table keys (docs/PLAN-v2.md "Settings keys"). D1 reads github.token, D3 reads oidc.*. */
+/** Settings table keys (docs/PLAN-v2.md "Settings keys"). D1 reads github.token, D3 reads oidc.*; the import.* keys are in config.ts IMPORT_LIMITS. */
 export const SETTING_KEYS = {
   oidcIssuer: 'oidc.issuer',
   oidcClientId: 'oidc.client_id',
@@ -21,6 +21,8 @@ export interface SettingsView {
   /** `envFields`: the fields the environment sets (read-only, 400 env_managed); `source` 'env' when one of the IdP values comes from it. */
   oidc: { issuer: string | null; clientId: string | null; clientSecretSet: boolean; autoRegister: boolean; label: string; source: Source; envFields: OidcField[] };
   github: { tokenSet: boolean; source: Source };
+  /** Effective import limits; `envFields` are set by the environment (read-only, 400 env_managed). */
+  imports: Record<ImportLimit, number> & { envFields: ImportLimit[] };
   registration: { enabled: boolean; source: 'env' };
   storage: { blobs: number; blobBytes: number; orphanBlobs: number; orphanBytes: number; items: number; versions: number; users: number; groups: number };
 }
@@ -32,6 +34,9 @@ const url = (what: string) =>
     .max(500)
     .refine((s) => s === '' || /^https?:\/\/[^\s/]+/.test(s), `${what} must be an http(s) URL`)
     .transform((s) => s.replace(/\/+$/, ''));
+
+/** A whole number in the limit's range; '' clears it back to the default. */
+const limit = (k: ImportLimit) => z.number().int().min(1).max(IMPORT_LIMITS[k].max).or(z.literal('')).optional();
 
 /** '' clears a value, omitted keeps it; autoRegister clears with ''. */
 export const settingsPatchSchema = z.object({
@@ -45,6 +50,7 @@ export const settingsPatchSchema = z.object({
     })
     .optional(),
   github: z.object({ token: z.string().trim().max(500).optional() }).optional(),
+  imports: z.object({ maxItems: limit('maxItems'), maxArchiveMb: limit('maxArchiveMb'), maxPackMb: limit('maxPackMb') }).optional(),
 });
 export type SettingsPatch = z.infer<typeof settingsPatchSchema>;
 
@@ -55,6 +61,18 @@ function writeSetting(db: Db, key: string, value: string): void {
   if (value === '') db.prepare('DELETE FROM settings WHERE key = ?').run(key);
   else db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
 }
+
+/** An import limit: env, else the settings row, else the default (a row out of range, written by hand, reads as the default). */
+export function importLimit(ctx: Ctx, field: ImportLimit): number {
+  const l = IMPORT_LIMITS[field];
+  const env = ctx.config.imports[field];
+  if (env !== null) return env;
+  const n = Number(readSetting(ctx.db, l.key) ?? NaN);
+  return Number.isInteger(n) && n >= 1 && n <= l.max ? n : l.def;
+}
+
+/** The single-file import's body cap (POST /items/import): the archive cap, never above 35 MB (a version is 30 MB unpacked anyway). */
+export const fileImportMb = (ctx: Ctx): number => Math.min(importLimit(ctx, 'maxArchiveMb'), 35);
 
 const count = (db: Db, sql: string) => (db.prepare(sql).get() as { n: number }).n;
 
@@ -86,6 +104,12 @@ export function settingsView(ctx: Ctx): SettingsView {
     github: {
       tokenSet: !!(config.githubToken ?? row(SETTING_KEYS.githubToken)),
       source: config.githubToken ? 'env' : row(SETTING_KEYS.githubToken) !== null ? 'settings' : 'none',
+    },
+    imports: {
+      maxItems: importLimit(ctx, 'maxItems'),
+      maxArchiveMb: importLimit(ctx, 'maxArchiveMb'),
+      maxPackMb: importLimit(ctx, 'maxPackMb'),
+      envFields: (Object.keys(IMPORT_LIMITS) as ImportLimit[]).filter((k) => config.imports[k] !== null),
     },
     registration: { enabled: config.allowRegistration, source: 'env' },
     storage: {
@@ -123,6 +147,12 @@ export function applySettings(ctx: Ctx, patch: SettingsPatch): string[] {
   if (patch.github?.token !== undefined) {
     if (config.githubToken) throw envManaged('SCP_GITHUB_TOKEN');
     writes.push([SETTING_KEYS.githubToken, patch.github.token]);
+  }
+  for (const k of Object.keys(IMPORT_LIMITS) as ImportLimit[]) {
+    const value = patch.imports?.[k];
+    if (value === undefined) continue;
+    if (config.imports[k] !== null) throw envManaged(IMPORT_LIMITS[k].env);
+    writes.push([IMPORT_LIMITS[k].key, String(value)]);
   }
   if (!writes.length) throw badRequest('nothing to change');
   tx(db, () => {
