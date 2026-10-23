@@ -5,13 +5,23 @@ import { BlockList, isIP } from 'node:net';
 import { z } from 'zod';
 import { randomToken, sha256Hex, signPayload, verifyPayload } from '../lib/crypto.ts';
 import { HttpError, notFound, parseJson, parseQuery } from '../lib/http.ts';
-import { limitIp } from '../lib/ratelimit.ts';
+import { limitAnonymous, limitIp } from '../lib/ratelimit.ts';
 import { THEME_CSS, escapeHtml } from '../artifacts/render.ts';
 import { OIDC_DEFAULT_LABEL } from '../config.ts';
 import { isUniqueViolation, newId, now, tx, type Db } from '../db.ts';
 import { audit } from '../audit.ts';
 import { SESSION_COOKIE } from './middleware.ts';
-import { SESSION_TTL_MS, createSession, deleteExpiredSessions, getUser, sessionPrincipal, usernameSchema } from './service.ts';
+import {
+  SESSION_TTL_MS,
+  createSession,
+  deleteExpiredSessions,
+  getUser,
+  invalidCredentials,
+  sessionPrincipal,
+  userJson,
+  usernameSchema,
+  verifyLogin,
+} from './service.ts';
 import type { AppEnv, Ctx, UserRow } from '../types.ts';
 
 /** D3 (docs/PLAN-v2.md): /auth/oidc/start and /auth/oidc/callback, mounted under /api/v1. */
@@ -253,10 +263,16 @@ const link = (db: Db, cfg: OidcConfig, claims: IdClaims, userId: string) => {
 /**
  * The user for a verified identity. With `linkUserId` (a signed-in user linking from their account
  * menu): that user, linked to the identity. Else by (issuer, sub); else by verified email, linked
- * only when the account has no password (nobody else can hold it); else auto-register when enabled,
- * with -2/-3 suffixing on a username clash. 403 otherwise.
+ * only when the account has no password (nobody else can hold it), or `confirm` (nothing linked yet)
+ * for a password account, which links only once its password is proven; else auto-register when
+ * enabled, with -2/-3 suffixing on a username clash. 403 otherwise.
  */
-export function resolveOidcUser(c: Context<AppEnv>, cfg: OidcConfig, claims: IdClaims, linkUserId?: string): { user: UserRow; created: boolean; linked: boolean } {
+export function resolveOidcUser(
+  c: Context<AppEnv>,
+  cfg: OidcConfig,
+  claims: IdClaims,
+  linkUserId?: string,
+): { user: UserRow; created: boolean; linked: boolean; confirm?: true } {
   const { db } = c.var.ctx;
   const bySub = db.prepare('SELECT * FROM users WHERE oidc_issuer = ? AND oidc_sub = ?').get(cfg.issuer, claims.sub) as UserRow | undefined;
   if (linkUserId !== undefined) {
@@ -280,11 +296,10 @@ export function resolveOidcUser(c: Context<AppEnv>, cfg: OidcConfig, claims: IdC
         throw noAccount('this email belongs to an account linked to a different identity, or to this provider under a previous issuer URL; an admin can unlink it');
       }
       // An unauthenticated callback must not take over a password account: anyone may have registered
-      // this email first and kept the password (and keys). Only a signed-in session links one
-      // (linkUserId above). An account with no password has no other holder, so it links here.
-      if (byEmail.password_hash !== OIDC_PASSWORD_HASH) {
-        throw noAccount('an account with this email already exists; sign in with your password and link single sign-on from your account menu');
-      }
+      // this email first and kept the password (and keys). It links only with that password as the
+      // second factor (POST /link/confirm), or from a signed-in session (linkUserId above). An account
+      // with no password has no other holder, so it links here.
+      if (byEmail.password_hash !== OIDC_PASSWORD_HASH) return { user: byEmail, created: false, linked: false, confirm: true };
       return link(db, cfg, claims, byEmail.id);
     }
   }
@@ -448,7 +463,7 @@ oidcRoutes.post('/auth/oidc/unlink', (c) => {
   const { db } = c.var.ctx;
   const me = getUser(db, p.userId)!;
   if (!me.oidc_sub) throw new HttpError(409, 'not_linked', 'this account is not linked to single sign-on');
-  if (me.password_hash === OIDC_PASSWORD_HASH) throw new HttpError(409, 'no_password', 'this account has no password; ask an admin to set one before unlinking single sign-on');
+  if (me.password_hash === OIDC_PASSWORD_HASH) throw new HttpError(409, 'no_password', 'this account has no password; set one from your account menu before unlinking single sign-on');
   db.prepare('UPDATE users SET oidc_issuer = NULL, oidc_sub = NULL WHERE id = ?').run(me.id);
   audit(c, p, { action: 'user.oidc_unlink', targetType: 'user', targetId: me.id });
   return c.body(null, 204);
@@ -504,25 +519,131 @@ oidcRoutes.get('/auth/oidc/callback', async (c) => {
     if (!tokens.success) throw idpError('the identity provider sent no id_token');
     const claims = await verifyIdToken(cfg, tokens.data.id_token, st.nonce);
 
-    const { user, created, linked } = resolveOidcUser(c, cfg, claims, st.userId);
+    const { user, created, linked, confirm } = resolveOidcUser(c, cfg, claims, st.userId);
     if (user.disabled) throw noAccount('this account is disabled');
+    if (confirm) {
+      // Park the verified identity; the SPA's /login/link page asks for the account's password.
+      const token = randomToken();
+      db.prepare('DELETE FROM oidc_pending_links WHERE expires_at <= ?').run(now());
+      db.prepare('INSERT INTO oidc_pending_links (token_hash, issuer, sub, email, user_id, next, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+        sha256Hex(token),
+        cfg.issuer,
+        claims.sub,
+        user.email,
+        user.id,
+        st.next,
+        now(),
+        new Date(Date.now() + PENDING_LINK_TTL_S * 1000).toISOString(),
+      );
+      setCookie(c, PENDING_LINK_COOKIE, token, { httpOnly: true, sameSite: 'Lax', path: PENDING_LINK_PATH, maxAge: PENDING_LINK_TTL_S, secure: config.secureCookies });
+      return c.redirect(`/login/link?t=${encodeURIComponent(token)}`, 302);
+    }
     const p = sessionPrincipal(user);
     if (created) audit(c, p, { action: 'user.register', targetType: 'user', targetId: user.id, detail: { via: 'oidc' } });
     if (linked) audit(c, p, { action: 'user.oidc_link', targetType: 'user', targetId: user.id });
 
-    // Exactly the cookie /auth/login sets (auth/routes.ts startSession).
     deleteExpiredSessions(db);
-    const { sid } = createSession(db, user.id);
-    setCookie(c, SESSION_COOKIE, sid, {
-      httpOnly: true,
-      sameSite: 'Lax',
-      path: '/',
-      maxAge: SESSION_TTL_MS / 1000,
-      secure: config.secureCookies,
-    });
+    setSessionCookie(c, createSession(db, user.id, 'oidc').sid);
     audit(c, p, { action: 'login', detail: { via: 'oidc' } });
     return c.redirect(st.next, 302);
   } catch (e) {
     return errorPage(c, e);
   }
+});
+
+/** Exactly the cookie /auth/login sets (auth/routes.ts startSession). */
+function setSessionCookie(c: Context<AppEnv>, sid: string) {
+  setCookie(c, SESSION_COOKIE, sid, {
+    httpOnly: true,
+    sameSite: 'Lax',
+    path: '/',
+    maxAge: SESSION_TTL_MS / 1000,
+    secure: c.var.ctx.config.secureCookies,
+  });
+}
+
+// ---------- link to a password account after confirming its password (59b0) ----------
+
+const PENDING_LINK_TTL_S = 300;
+const PENDING_LINK_MAX_ATTEMPTS = 5;
+/**
+ * The pending-link token rides in the /login/link URL and, set by the callback, in this cookie: the
+ * confirmation needs both, so a token seen in a URL (history, a shared screen) is useless in another browser.
+ */
+const PENDING_LINK_COOKIE = 'scp_oidc_link';
+const PENDING_LINK_PATH = '/api/v1/auth/oidc/link';
+
+interface PendingLinkRow {
+  token_hash: string;
+  issuer: string;
+  sub: string;
+  email: string;
+  user_id: string;
+  next: string;
+  failures: number;
+}
+
+const badLinkToken = () => new HttpError(400, 'bad_link_token', 'this link request expired or was already used; sign in with single sign-on again');
+
+/** The live pending link for `token` in this browser, or 400 (forged, expired, used, out of attempts, or another browser). */
+function pendingLink(c: Context<AppEnv>, token: string): PendingLinkRow {
+  if (getCookie(c, PENDING_LINK_COOKIE) !== token) throw badLinkToken();
+  const row = c.var.ctx.db
+    .prepare('SELECT * FROM oidc_pending_links WHERE token_hash = ? AND expires_at > ? AND failures < ?')
+    .get(sha256Hex(token), now(), PENDING_LINK_MAX_ATTEMPTS) as PendingLinkRow | undefined;
+  if (!row) throw badLinkToken();
+  return row;
+}
+
+const tokenSchema = z.string().min(1).max(256);
+
+/** What the confirm page shows: which account the identity would be linked to. */
+oidcRoutes.get('/auth/oidc/link/pending', (c) => {
+  requireOidc(c);
+  const { t } = parseQuery(c, z.object({ t: tokenSchema }));
+  limitIp(c);
+  const row = pendingLink(c, t);
+  const u = getUser(c.var.ctx.db, row.user_id)!; // the row cascades away with the user
+  return c.json({ email: u.email, username: u.username });
+});
+
+/**
+ * Prove the matched account's password, then link the parked identity and sign in, in one
+ * transaction. Wrong password: the generic invalid_credentials under the login rate limits; the
+ * token dies after 5 attempts or 5 minutes, and is spent by the first success.
+ */
+oidcRoutes.post('/auth/oidc/link/confirm', async (c) => {
+  requireOidc(c);
+  const { db } = c.var.ctx;
+  const body = await parseJson(c, z.object({ token: tokenSchema, password: z.string().max(200) }));
+  const row = pendingLink(c, body.token);
+  limitAnonymous(c, row.email);
+  // The attempt is spent before the scrypt, so concurrent guesses cannot overrun the cap.
+  const spent = db.prepare('UPDATE oidc_pending_links SET failures = failures + 1 WHERE token_hash = ? AND failures < ?').run(row.token_hash, PENDING_LINK_MAX_ATTEMPTS);
+  if (!spent.changes) throw badLinkToken();
+  // verifyLogin refuses a disabled account like a wrong password.
+  const u = await verifyLogin(db, row.email, body.password);
+  if (!u || u.id !== row.user_id) throw invalidCredentials();
+  const sid = tx(db, () => {
+    if (!db.prepare('DELETE FROM oidc_pending_links WHERE token_hash = ? AND expires_at > ?').run(row.token_hash, now()).changes) throw badLinkToken();
+    let linked;
+    try {
+      // Still the account the password was checked against: not linked meanwhile, enabled, same password and email.
+      linked = db
+        .prepare('UPDATE users SET oidc_issuer = ?, oidc_sub = ? WHERE id = ? AND oidc_sub IS NULL AND disabled = 0 AND password_hash = ? AND email = ?')
+        .run(row.issuer, row.sub, u.id, u.password_hash, row.email);
+    } catch (e) {
+      if (isUniqueViolation(e)) throw noAccount('this identity is already linked to another account');
+      throw e;
+    }
+    if (!linked.changes) throw noAccount('the account changed since the sign-in; sign in with single sign-on again');
+    deleteExpiredSessions(db);
+    return createSession(db, u.id, 'oidc').sid;
+  });
+  deleteCookie(c, PENDING_LINK_COOKIE, { path: PENDING_LINK_PATH });
+  setSessionCookie(c, sid);
+  const p = sessionPrincipal(u);
+  audit(c, p, { action: 'user.oidc_link', targetType: 'user', targetId: u.id, detail: { via: 'callback-confirm' } });
+  audit(c, p, { action: 'login', detail: { via: 'oidc' } });
+  return c.json({ user: userJson(getUser(db, u.id)!), next: row.next });
 });

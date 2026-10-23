@@ -14,8 +14,9 @@ export interface Rate {
 
 /**
  * `ip`: per client IP across the anonymous auth routes (login and register, each one scrypt; the OIDC
- * start and callback, each an outbound call carrying the client secret). `login`: per login name from
- * one IP (guessing); `loginAll`: per login name from everywhere, looser, against distributed guessing.
+ * start and callback, each an outbound call carrying the client secret; the SSO link confirmation, one
+ * scrypt). `login`: per login name from one IP (guessing; the link confirmation spends the target
+ * account's email); `loginAll`: per login name from everywhere, looser, against distributed guessing.
  * The tight login bucket is per IP so a stranger cannot lock an account out of every other client.
  * `github`: per user id on the routes that spend the instance's one shared GitHub quota (imports).
  * `oauthToken`: per client IP and per client id on /oauth/token, which any client_id may call and
@@ -77,4 +78,12 @@ export function limitIp(c: Context<AppEnv>): string {
   const ip = clientIp(c, c.var.ctx.config.trustProxy) ?? 'unknown';
   if (!take(c, `ip:${ip}`, AUTH_LIMITS.ip)) throw rateLimited();
   return ip;
+}
+
+/** The anonymous scrypt limiter: the per-IP bucket, plus the per-login ones when a password for `login` is tried. */
+export function limitAnonymous(c: Context<AppEnv>, login?: string): void {
+  const ip = limitIp(c);
+  if (login === undefined) return;
+  const name = JSON.stringify(login.trim().toLowerCase()); // quoted: a name cannot forge another key
+  if (!take(c, `login:${ip}:${name}`, AUTH_LIMITS.login) || !take(c, `loginAll:${name}`, AUTH_LIMITS.loginAll)) throw rateLimited();
 }

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router';
 import * as api from '../api.ts';
 import { useAuth, useUser } from '../auth.tsx';
-import { ChangePasswordDialog } from './ChangePasswordDialog.tsx';
+import { ChangePasswordDialog, SET_PASSWORD_HASH } from './ChangePasswordDialog.tsx';
 import { useToast } from './Toast.tsx';
 
 const NAV: { to: string; label: string }[] = [
@@ -24,14 +24,21 @@ const ADMIN_NAV: { to: string; label: string }[] = [
 
 export function Layout() {
   const user = useUser();
-  const { signOut, config, refresh } = useAuth();
+  const { me, signOut, config, refresh } = useAuth();
+  const hasPassword = me?.hasPassword !== false;
   const toast = useToast();
   const nav = useNavigate();
-  const { pathname } = useLocation();
+  const { pathname, search, hash } = useLocation();
   const [open, setOpen] = useState(false);
   const [pwOpen, setPwOpen] = useState(false);
 
   useEffect(() => setOpen(false), [pathname]);
+  // Back from the SSO sign-in the set-password dialog asked for: reopen it, and drop the hash.
+  useEffect(() => {
+    if (hash !== SET_PASSWORD_HASH) return;
+    setPwOpen(true);
+    nav(pathname + search, { replace: true });
+  }, [hash, pathname, search, nav]);
 
   const logout = async () => {
     await signOut();
@@ -105,7 +112,7 @@ export function Layout() {
             </summary>
             <div className="user-menu-items">
               <button type="button" className="btn btn-block" onClick={() => setPwOpen(true)}>
-                Change password
+                {hasPassword ? 'Change password' : 'Set a password'}
               </button>
               {user.oidcLinked ? (
                 <button type="button" className="btn btn-block" onClick={() => void unlink()}>
@@ -128,7 +135,7 @@ export function Layout() {
       <main id="main" className="content" tabIndex={-1}>
         <Outlet />
       </main>
-      <ChangePasswordDialog open={pwOpen} onClose={() => setPwOpen(false)} />
+      <ChangePasswordDialog open={pwOpen} hasPassword={hasPassword} onClose={() => setPwOpen(false)} />
     </div>
   );
 }

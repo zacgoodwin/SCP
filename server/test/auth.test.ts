@@ -169,6 +169,21 @@ test('password change keeps this session, kills others, rejects wrong current an
   assert.equal((await login(t, u.username, 'brand-new-pw')).status, 200);
 });
 
+test('a password account must send current, even from a fresh SSO session; /me says it has a password', async () => {
+  const t = makeTestCtx();
+  const u = t.createUser();
+  const r = await login(t, u.username);
+  const mine = cookieOf(r);
+  assert.equal((await t.req('GET', '/api/v1/auth/me', { headers: mine })).json.hasPassword, true);
+  // Mark this session as an SSO sign-in minutes ago: the no-current path is for SSO-only accounts only.
+  t.db.prepare("UPDATE sessions SET auth_method = 'oidc' WHERE user_id = ?").run(u.id);
+  const missing = await t.req('POST', '/api/v1/auth/password', { headers: mine, json: { next: 'brand-new-pw' } });
+  assert.equal(missing.status, 400, missing.text);
+  assert.match(missing.json.error.message, /current password is required/);
+  assert.equal((await login(t, u.username, 'brand-new-pw')).status, 401);
+  assert.equal((await login(t, u.username)).status, 200);
+});
+
 test('key create returns the token once; list hides it; the key authenticates', async () => {
   const t = makeTestCtx();
   const u = t.createUser();

@@ -98,15 +98,16 @@ export async function verifyLogin(db: Db, login: string, password: string): Prom
   return cur && ok && cur.password_hash === u.password_hash && !cur.disabled ? cur : null;
 }
 
-/** Create a session; returns the raw id for the cookie (only its sha256 is stored). */
-export function createSession(db: Db, userId: string): { sid: string; expiresAt: string } {
+/** Create a session; returns the raw id for the cookie (only its sha256 is stored). `authMethod` 'oidc' marks an SSO sign-in. */
+export function createSession(db: Db, userId: string, authMethod: 'oidc' | null = null): { sid: string; expiresAt: string } {
   const sid = randomToken();
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  db.prepare('INSERT INTO sessions (id_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(
+  db.prepare('INSERT INTO sessions (id_hash, user_id, created_at, expires_at, auth_method) VALUES (?, ?, ?, ?, ?)').run(
     sha256Hex(sid),
     userId,
     now(),
     expiresAt,
+    authMethod,
   );
   return { sid, expiresAt };
 }

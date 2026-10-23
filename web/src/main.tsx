@@ -15,6 +15,7 @@ import { GroupsPage } from './pages/Groups.tsx';
 import { ItemDetailPage } from './pages/ItemDetail.tsx';
 import { ItemsListPage } from './pages/ItemsList.tsx';
 import { KeysPage } from './pages/Keys.tsx';
+import { LinkSsoPage } from './pages/LinkSso.tsx';
 import { LoginPage } from './pages/Login.tsx';
 import { NewItemPage } from './pages/NewItem.tsx';
 import { NotFoundPage, RouteErrorPage } from './pages/NotFound.tsx';
@@ -24,6 +25,7 @@ import './styles.css';
 const router = createBrowserRouter([
   { path: '/login', element: <LoginPage />, errorElement: <RouteErrorPage /> },
   { path: '/register', element: <RegisterPage />, errorElement: <RouteErrorPage /> },
+  { path: '/login/link', element: <LinkSsoPage />, errorElement: <RouteErrorPage /> },
   // Consent is a standalone card, like login: an OAuth client sent the user here, not the app's nav.
   {
     path: '/consent',
