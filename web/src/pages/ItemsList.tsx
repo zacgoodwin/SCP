@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import * as api from '../api.ts';
+import { useAuth } from '../auth.tsx';
+import { idRange, keepLoaded } from '../bulk.ts';
+import { BulkBar } from '../components/BulkBar.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { ItemCard } from '../components/ItemCard.tsx';
@@ -25,8 +28,13 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
   const [error, setError] = useState<unknown>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  // Bumped when an import finished, so the first page reloads with the new items.
-  const [imported, setImported] = useState(0);
+  // Bumped when an import or a bulk action finished, so the first page reloads (and the selection shrinks to it).
+  const [reloads, setReloads] = useState(0);
+  const { me } = useAuth();
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [anchor, setAnchor] = useState<string | null>(null);
+  // Mirrors canEditItem (server/src/access.ts): the owner or an admin, holding the write scope.
+  const canEdit = (it: api.ItemSummary) => !!me && me.principal.scopes.includes('write') && (me.user.isAdmin || it.owner.id === me.user.id);
 
   // setParams closes over the params of its render, so the debounced search must call the latest
   // one or it would revert a chip/toggle clicked during the debounce window.
@@ -62,13 +70,47 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
         if (!live) return;
         setItems(r.items);
         setTotal(r.total);
+        setSelected((s) => keepLoaded(s, r.items.map((it) => it.id)));
       },
       (e) => live && (setError(e), setItems([])),
     );
     return () => {
       live = false;
     };
-  }, [plane, q, kind, mine, imported]);
+  }, [plane, q, kind, mine, reloads]);
+
+  // A new filter is a new list: drop the selection.
+  useEffect(() => {
+    setSelected(new Set());
+    setAnchor(null);
+  }, [plane, q, kind, mine]);
+
+  // Escape clears the selection, unless a dialog (the import dialog) has it.
+  useEffect(() => {
+    if (selected.size === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !(e.target instanceof Element && e.target.closest('dialog'))) setSelected(new Set());
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selected.size]);
+
+  const editable = (items ?? []).filter(canEdit);
+  const selectedItems = editable.filter((it) => selected.has(it.id));
+  const allSelected = editable.length > 0 && selectedItems.length === editable.length;
+
+  // Shift extends from the last ticked item over the editable items between, to the clicked box's new state.
+  const toggle = (id: string, shift: boolean) => {
+    const on = !selected.has(id);
+    const ids = shift ? idRange(editable.map((it) => it.id), anchor, id) : [id];
+    const next = new Set(selected);
+    for (const x of ids) {
+      if (on) next.add(x);
+      else next.delete(x);
+    }
+    setSelected(next);
+    setAnchor(id);
+  };
 
   const loadMore = async () => {
     if (!items) return;
@@ -127,6 +169,15 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
       )}
 
       <ErrorBox error={error} />
+      {/* Outside the list branches, so the result summary survives deleting every item. */}
+      <BulkBar
+        items={selectedItems}
+        onClear={() => setSelected(new Set())}
+        onDone={(failedIds) => {
+          setSelected(new Set(failedIds));
+          setReloads((n) => n + 1);
+        }}
+      />
       {items === null ? (
         <p className="muted" role="status">Loading…</p>
       ) : items.length === 0 ? (
@@ -145,7 +196,7 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
                 </Link>{' '}
                 or{' '}
                 <button type="button" className="btn" onClick={() => setImportOpen(true)}>
-                  import a file
+                  Import
                 </button>
               </p>
             </>
@@ -153,12 +204,20 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
         </div>
       ) : (
         <>
-          <p className="muted">
-            {items.length} of {total}
-          </p>
+          <div className="row wrap">
+            <p className="muted">
+              {items.length} of {total}
+            </p>
+            {editable.length > 0 && (
+              <label className="toggle">
+                <input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? new Set() : new Set(editable.map((it) => it.id)))} />
+                Select all on this page
+              </label>
+            )}
+          </div>
           <ul className="item-grid">
             {items.map((it) => (
-              <ItemCard key={it.id} item={it} />
+              <ItemCard key={it.id} item={it} select={{ checked: selected.has(it.id), disabled: !canEdit(it), onToggle: (shift) => toggle(it.id, shift) }} />
             ))}
           </ul>
           {items.length < total && (
@@ -168,7 +227,7 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
           )}
         </>
       )}
-      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} onImported={() => setImported((n) => n + 1)} plane={plane} />
+      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} onImported={() => setReloads((n) => n + 1)} plane={plane} />
     </div>
   );
 }

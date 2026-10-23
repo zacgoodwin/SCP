@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router';
 import * as api from '../api.ts';
 import * as imp from '../api-import.ts';
+import { groupLabel } from '../format.ts';
 import { ErrorBox } from './ErrorBox.tsx';
 import { KindBadges } from './ItemCard.tsx';
 import { Modal } from './Modal.tsx';
@@ -191,11 +192,11 @@ function KindSelect({ value, kinds, onChange }: { value: api.Kind | ''; kinds: a
   );
 }
 
-function VisibilitySelect({ value, onChange }: { value: api.Visibility; onChange: (v: api.Visibility) => void }) {
+export function VisibilitySelect({ value, onChange, autoFocus }: { value: api.Visibility; onChange: (v: api.Visibility) => void; autoFocus?: boolean }) {
   return (
     <label className="field">
       <span>Visibility</span>
-      <select value={value} onChange={(e) => onChange(e.target.value as api.Visibility)}>
+      <select value={value} autoFocus={autoFocus} onChange={(e) => onChange(e.target.value as api.Visibility)}>
         <option value="private">private</option>
         <option value="public">public</option>
       </select>
@@ -267,7 +268,7 @@ function GroupFields({ value, onChange }: { value: GroupChoice; onChange: (g: Gr
             {value.into && !groups?.some((g) => g.slug === value.into) && <option value={value.into}>{value.into}</option>}
             {groups?.map((g) => (
               <option key={g.id} value={g.slug}>
-                {g.name} ({g.slug})
+                {groupLabel(g)}
               </option>
             ))}
           </select>

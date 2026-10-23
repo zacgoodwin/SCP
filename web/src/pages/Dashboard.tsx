@@ -4,6 +4,7 @@ import * as api from '../api.ts';
 import { useAuth, useUser } from '../auth.tsx';
 import { CopyBlock } from '../components/CopyBlock.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
+import { groupLabel } from '../format.ts';
 import { ImportDialog } from '../components/ImportDialog.tsx';
 import { PlaneCounts, VisibilityBadge } from './Groups.tsx';
 
@@ -95,7 +96,7 @@ export function DashboardPage() {
           <Link className="btn" to="/items/new?plane=skill">New skill</Link>
           <Link className="btn" to="/items/new?plane=md">New prompt or MD</Link>
           <Link className="btn" to="/items/new?plane=artifact">New artifact</Link>
-          <button type="button" className="btn" onClick={() => setImportOpen(true)}>Import (file, zip pack, GitHub)</button>
+          <button type="button" className="btn" onClick={() => setImportOpen(true)}>Import</button>
           <Link className="btn" to="/groups">Build a group</Link>
           <Link className="btn" to="/keys">Mint an API key</Link>
         </div>
@@ -238,7 +239,7 @@ export function DashboardPage() {
             <select value={group} onChange={(e) => setGroup(e.target.value)}>
               {groups.map((x) => (
                 <option key={x.id} value={x.slug}>
-                  {x.name} ({x.slug})
+                  {groupLabel(x)}
                 </option>
               ))}
             </select>

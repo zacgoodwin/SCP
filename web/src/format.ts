@@ -23,6 +23,9 @@ export function bytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/** Group picker label: the slug only when it adds something. */
+export const groupLabel = (g: { name: string; slug: string }) => (g.name === g.slug ? g.slug : `${g.name} (${g.slug})`);
+
 export const parseTags = (s: string) => [...new Set(s.split(',').map((t) => t.trim()).filter(Boolean))];
 
 /**

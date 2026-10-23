@@ -296,6 +296,23 @@ input:user-invalid { border-color: var(--danger); }
 .item-card-title { font-weight: 600; color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
 .item-card-title:hover { color: var(--accent); text-decoration: underline; }
 .item-card-meta { margin-top: auto; font-size: var(--text-sm); }
+.item-card.is-selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.item-card-name { display: flex; align-items: flex-start; gap: var(--space-2); min-width: 0; }
+.item-card-select { display: inline-flex; padding-top: 3px; cursor: pointer; }
+.item-card-select:has(input:disabled) { cursor: not-allowed; opacity: 0.5; }
+/* Bulk actions (y79w): pinned to the viewport bottom and out of flow, so ticking the first box never
+   moves the grid under the pointer and the bar stays in reach at any scroll. The left edge and
+   max-width track .content's padding and .page's width; the page reserves room underneath so the last
+   row can scroll clear of the bar. */
+.bulk-bar {
+  position: fixed; z-index: 5; left: calc(var(--sidebar-w) + var(--space-6)); right: var(--space-6);
+  bottom: calc(var(--space-4) + env(safe-area-inset-bottom, 0px)); max-width: 1200px; max-height: calc(100vh - 2 * var(--space-6)); overflow: auto;
+  display: flex; flex-direction: column; gap: var(--space-3); border-color: var(--accent); box-shadow: var(--shadow-lg);
+}
+.page:has(> .bulk-bar) { padding-bottom: 10rem; }
+.bulk-names { margin: 0; padding-left: var(--space-5); max-height: 10rem; overflow: auto; }
+.bulk-result { padding: var(--space-3); border-radius: var(--radius-sm); background: var(--ok-soft); color: var(--ok); }
+@media (max-width: 760px) { .bulk-bar { left: var(--space-4); right: var(--space-4); max-height: calc(100vh - var(--topbar-h) - 2 * var(--space-4)); } }
 .clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .badges { display: inline-flex; flex-wrap: wrap; gap: var(--space-1); }
 .badge {
