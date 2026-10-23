@@ -21,20 +21,27 @@ const TABS: [Tab, string][] = [
 /** The API error with the statuses that read badly (404 route, 413, bad_source) spelled out; details kept for ErrorBox. */
 const friendly = (e: unknown) => (e instanceof api.ApiError ? new api.ApiError(e.status, e.code, imp.importErrorMessage(e), e.details) : e);
 
+/** The same import again (same zip File, or the same GitHub source) with more options: folderKinds from the result screen. */
+type Rerun = (more: imp.ImportGroupOpts) => Promise<imp.ImportResult>;
+type OnDone = (r: imp.ImportResult, rerun: Rerun) => void;
+
 export function ImportDialog({
   open,
   onClose,
   onImported,
   plane,
+  intoGroup,
 }: {
   open: boolean;
   onClose: () => void;
   /** A pack or GitHub import finished (whatever it wrote): the page behind reloads what it lists. */
   onImported?: (r: imp.ImportResult) => void;
   plane?: api.Plane;
+  /** Preselect this existing group (the group page's "Import into this group"); the File tab, which takes no group, is left out. */
+  intoGroup?: string;
 }) {
   const nav = useNavigate();
-  const [tab, setTab] = useState<Tab>('file');
+  const [tab, setTab] = useState<Tab>(intoGroup ? 'pack' : 'file');
   const [result, setResult] = useState<imp.ImportResult | null>(null);
   const [limits, setLimits] = useState<imp.ImportLimits | null>(null);
 
@@ -52,14 +59,19 @@ export function ImportDialog({
       live = false;
     };
   }, [open]);
+  const [rerun, setRerun] = useState<Rerun | null>(null);
+  // Folder kinds picked so far: each re-run sends them all, so an earlier pick is not offered again.
+  const [folderKinds, setFolderKinds] = useState<Record<string, imp.FolderKind>>({});
 
   const close = () => {
     setResult(null);
+    setFolderKinds({});
     onClose();
   };
   // Per docs/PLAN-v2.md D6: a created group wins, else the single item, else the list. Anything skipped
   // shows the list first (it links to the group), or the skip reasons would be lost.
-  const done = (r: imp.ImportResult) => {
+  const done: OnDone = (r, again) => {
+    setRerun(() => again);
     onImported?.(r);
     if (r.group && r.items.length > 0 && r.skipped.length === 0) {
       close();
@@ -69,13 +81,21 @@ export function ImportDialog({
       nav(`/items/${r.items[0].id}`);
     } else setResult(r);
   };
+  // A group this import created is joined, not created again (its slug is taken now).
+  const importFolders = async (picked: Record<string, imp.FolderKind>) => {
+    if (!rerun || !result) return;
+    const all = { ...folderKinds, ...picked };
+    const r = await rerun({ folderKinds: all, ...(result.group ? { group: undefined, groupName: undefined, intoGroup: result.group.slug } : {}) });
+    setFolderKinds(all);
+    done(r, rerun);
+  };
   // An artifact is one file with a format; a pack or repository tree cannot become one (the server refuses kind: artifact).
-  const tabs = plane === 'artifact' ? TABS.filter(([t]) => t === 'file') : TABS;
+  const tabs = plane === 'artifact' ? TABS.filter(([t]) => t === 'file') : intoGroup ? TABS.filter(([t]) => t !== 'file') : TABS;
 
   return (
-    <Modal open={open} title="Import" onClose={close}>
+    <Modal open={open} title={intoGroup ? `Import into ${intoGroup}` : 'Import'} onClose={close}>
       {result ? (
-        <ImportResultView result={result} onClose={close} />
+        <ImportResultView result={result} onClose={close} onImportFolders={rerun ? importFolders : undefined} />
       ) : (
         <div className="stack">
           <Tabs tabs={tabs} value={tab} onChange={setTab} label="Import source" idPrefix="itab" panelId="import-panel" />
@@ -83,9 +103,9 @@ export function ImportDialog({
             {tab === 'file' ? (
               <FileForm plane={plane} limits={limits} onCancel={close} />
             ) : tab === 'pack' ? (
-              <PackForm limits={limits} onCancel={close} onDone={done} />
+              <PackForm limits={limits} intoGroup={intoGroup} onCancel={close} onDone={done} />
             ) : (
-              <GithubForm plane={plane} onCancel={close} onDone={done} />
+              <GithubForm plane={plane} intoGroup={intoGroup} onCancel={close} onDone={done} />
             )}
           </div>
         </div>
@@ -154,19 +174,60 @@ function VisibilitySelect({ value, onChange }: { value: api.Visibility; onChange
   );
 }
 
-/** Optional "also create group <slug>" for pack and GitHub imports. */
-function GroupFields({ group, groupName, onGroup, onGroupName }: { group: string; groupName: string; onGroup: (s: string) => void; onGroupName: (s: string) => void }) {
+/** The group a pack or GitHub import lands in: none, a new one (slug + name), or an existing one the user owns. */
+interface GroupChoice {
+  mode: 'none' | 'new' | 'existing';
+  slug: string;
+  name: string;
+  into: string;
+}
+const initialGroup = (into?: string): GroupChoice => ({ mode: into ? 'existing' : 'none', slug: '', name: '', into: into ?? '' });
+const groupOpts = (g: GroupChoice): imp.ImportGroupOpts =>
+  g.mode === 'new' ? { group: g.slug.trim() || undefined, groupName: g.name.trim() || undefined } : g.mode === 'existing' ? { intoGroup: g.into || undefined } : {};
+
+function GroupFields({ value, onChange }: { value: GroupChoice; onChange: (g: GroupChoice) => void }) {
+  const [groups, setGroups] = useState<api.GroupSummary[] | null>(null);
+  const existing = value.mode === 'existing';
+  useEffect(() => {
+    if (existing && !groups) api.listGroups({ owner: 'me', limit: 200 }).then((r) => setGroups(r.groups), () => setGroups([]));
+  }, [existing]);
+  const set = (patch: Partial<GroupChoice>) => onChange({ ...value, ...patch });
   return (
     <>
       <label className="field">
-        <span>Also create a group (optional)</span>
-        <input className="code-input" value={group} spellCheck={false} placeholder="group-slug" onChange={(e) => onGroup(e.target.value.toLowerCase())} />
-        <small className="muted">Every imported item becomes a member. Leave empty to import the items on their own.</small>
+        <span>Group</span>
+        <select value={value.mode} onChange={(e) => set({ mode: e.target.value as GroupChoice['mode'] })}>
+          <option value="none">None, import the items on their own</option>
+          <option value="new">New group</option>
+          <option value="existing">Existing group</option>
+        </select>
+        <small className="muted">Every imported item becomes a member of the group. Importing into a group again updates its items without adding them twice.</small>
       </label>
-      {group.trim() && (
+      {value.mode === 'new' && (
+        <>
+          <label className="field">
+            <span>Group slug</span>
+            <input className="code-input" value={value.slug} required spellCheck={false} placeholder="group-slug" onChange={(e) => set({ slug: e.target.value.toLowerCase() })} />
+          </label>
+          <label className="field">
+            <span>Group name</span>
+            <input value={value.name} placeholder="Defaults to the repo or zip name" onChange={(e) => set({ name: e.target.value })} />
+          </label>
+        </>
+      )}
+      {existing && (
         <label className="field">
-          <span>Group name</span>
-          <input value={groupName} placeholder="Defaults to the repo or zip name" onChange={(e) => onGroupName(e.target.value)} />
+          <span>Existing group</span>
+          <select value={value.into} required onChange={(e) => set({ into: e.target.value })}>
+            <option value="">{groups ? 'Pick one of your groups' : 'Loading…'}</option>
+            {/* The preselected group while the list loads, or one an admin can edit but does not own (not among "my" groups). */}
+            {value.into && !groups?.some((g) => g.slug === value.into) && <option value={value.into}>{value.into}</option>}
+            {groups?.map((g) => (
+              <option key={g.id} value={g.slug}>
+                {g.name} ({g.slug})
+              </option>
+            ))}
+          </select>
         </label>
       )}
     </>
@@ -208,17 +269,18 @@ function FileForm({ plane, limits, onCancel }: { plane?: api.Plane; limits: imp.
   );
 }
 
-function PackForm({ limits, onCancel, onDone }: { limits: imp.ImportLimits | null; onCancel: () => void; onDone: (r: imp.ImportResult) => void }) {
+function PackForm({ limits, intoGroup, onCancel, onDone }: { limits: imp.ImportLimits | null; intoGroup?: string; onCancel: () => void; onDone: OnDone }) {
   const [file, setFile] = useState<File | null>(null);
   const [visibility, setVisibility] = useState<api.Visibility>('private');
-  const [group, setGroup] = useState('');
-  const [groupName, setGroupName] = useState('');
+  const [group, setGroup] = useState(() => initialGroup(intoGroup));
   const { busy, error, submit } = useSubmit();
 
   const go = submit(async () => {
     if (!file) return;
     if (limits) imp.refuseOversize(file, limits.maxArchiveMb);
-    onDone(await imp.importOrSkipped(imp.importPack(file, { visibility, group: group.trim() || undefined, groupName: groupName.trim() || undefined })));
+    const opts = { visibility, ...groupOpts(group) };
+    const run: Rerun = (more) => imp.importOrSkipped(imp.importPack(file, { ...opts, ...more }));
+    onDone(await run({}), run);
   });
 
   return (
@@ -236,14 +298,14 @@ function PackForm({ limits, onCancel, onDone }: { limits: imp.ImportLimits | nul
         </small>
       </label>
       <VisibilitySelect value={visibility} onChange={setVisibility} />
-      <GroupFields group={group} groupName={groupName} onGroup={setGroup} onGroupName={setGroupName} />
+      <GroupFields value={group} onChange={setGroup} />
       <ErrorBox error={error} />
       <Actions busy={busy} label="Import pack" disabled={!file} onCancel={onCancel} />
     </form>
   );
 }
 
-function GithubForm({ plane, onCancel, onDone }: { plane?: api.Plane; onCancel: () => void; onDone: (r: imp.ImportResult) => void }) {
+function GithubForm({ plane, intoGroup, onCancel, onDone }: { plane?: api.Plane; intoGroup?: string; onCancel: () => void; onDone: OnDone }) {
   const [url, setUrl] = useState('');
   const [repo, setRepo] = useState('');
   const [ref, setRef] = useState('');
@@ -252,8 +314,7 @@ function GithubForm({ plane, onCancel, onDone }: { plane?: api.Plane; onCancel: 
   const kinds = (plane ? api.KINDS_BY_PLANE[plane] : ALL_KINDS).filter((k) => k !== 'artifact');
   const [kind, setKind] = useState<api.Kind | ''>('');
   const [visibility, setVisibility] = useState<api.Visibility>('private');
-  const [group, setGroup] = useState('');
-  const [groupName, setGroupName] = useState('');
+  const [group, setGroup] = useState(() => initialGroup(intoGroup));
   const { busy, error, submit } = useSubmit();
 
   const byUrl = url.trim() !== '';
@@ -261,17 +322,9 @@ function GithubForm({ plane, onCancel, onDone }: { plane?: api.Plane; onCancel: 
 
   const go = submit(async () => {
     const where: imp.GithubImport = byUrl ? { url: url.trim() } : { repo: repo.trim(), ref: ref.trim() || undefined, path: path.trim() || undefined };
-    onDone(
-      await imp.importOrSkipped(
-        imp.importGithub({
-          ...where,
-          kind: kind || undefined,
-          visibility,
-          group: group.trim() || undefined,
-          groupName: groupName.trim() || undefined,
-        }),
-      ),
-    );
+    const body: imp.GithubImport = { ...where, kind: kind || undefined, visibility, ...groupOpts(group) };
+    const run: Rerun = (more) => imp.importOrSkipped(imp.importGithub({ ...body, ...more }));
+    onDone(await run({}), run);
   });
 
   return (
@@ -305,24 +358,68 @@ function GithubForm({ plane, onCancel, onDone }: { plane?: api.Plane; onCancel: 
           <input className="code-input" value={path} spellCheck={false} placeholder="repo root" disabled={byUrl} onChange={(e) => setPath(e.target.value)} />
         </label>
       </div>
-      {/* The server's `kind` means "this whole tree is one item", not a hint for detection. */}
+      {/* The server's `kind` turns detection off (jwz6): one item per .md for the single-file kinds, the whole tree one item for the rest. */}
       <label className="field">
-        <span>Import the whole folder as one item</span>
+        <span>Import items in folder as one type</span>
         <select value={kind} onChange={(e) => setKind(e.target.value as api.Kind | '')}>
-          <option value="">No, detect every skill, agent, command, prompt and MD in it</option>
+          <option value="">No, detect each item's type</option>
           {kinds.map((k) => (
             <option key={k} value={k}>
-              Yes, as one {k}
+              Yes, all as {k}
             </option>
           ))}
         </select>
-        <small className="muted">Picking a kind turns unit detection off: the tree becomes a single item (a bare skill folder, a package). A repo of many units needs detection.</small>
+        <small className="muted">
+          Picking a type turns detection off. Agent, command, prompt and instructions: each .md file directly in the folder (not in subfolders) becomes its own item of that type (README-style docs are
+          left out). Skill, design and package: the whole folder becomes one item holding every file. A repo of many kinds of items needs detection.
+        </small>
       </label>
       <VisibilitySelect value={visibility} onChange={setVisibility} />
-      <GroupFields group={group} groupName={groupName} onGroup={setGroup} onGroupName={setGroupName} />
+      <GroupFields value={group} onChange={setGroup} />
       <p className="muted">Fetched through the GitHub API at the ref's current commit, which is pinned on every item for update checks.</p>
       <ErrorBox error={error} />
       <Actions busy={busy} label="Import from GitHub" disabled={!ready} onCancel={onCancel} />
+    </form>
+  );
+}
+
+/**
+ * mvfp: folders of Markdown files detection did not recognise, each with a kind to import them as.
+ * "Import selected" re-runs the same import with those folders mapped; re-imports version, never duplicate.
+ */
+function FolderOffer({ folders, onImport }: { folders: imp.SkippedFolder[]; onImport: (picked: Record<string, imp.FolderKind>) => Promise<void> }) {
+  const [kinds, setKinds] = useState<Record<string, imp.FolderKind | ''>>({});
+  const { busy, error, submit } = useSubmit();
+  const picked = Object.fromEntries(Object.entries(kinds).filter(([, k]) => k)) as Record<string, imp.FolderKind>;
+
+  return (
+    <form className="stack" aria-label="Unrecognised folders" onSubmit={submit(() => onImport(picked))}>
+      <p>These folders hold Markdown files SCP did not recognise. Import them as:</p>
+      <ul className="link-list">
+        {folders.map((f) => (
+          <li key={f.path}>
+            <label className="row wrap">
+              <span>
+                <code>{f.path ? `${f.path}/` : '(root)'}</code> has {f.count} Markdown file{f.count === 1 ? '' : 's'}
+              </span>
+              <select value={kinds[f.path] ?? ''} onChange={(e) => setKinds({ ...kinds, [f.path]: e.target.value as imp.FolderKind | '' })}>
+                <option value="">skip</option>
+                {imp.FOLDER_KINDS.map((k) => (
+                  <option key={k} value={k}>
+                    {k === 'package' ? 'package (the folder as one item)' : `${k} (one per file)`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </li>
+        ))}
+      </ul>
+      <ErrorBox error={error} />
+      <div className="row end">
+        <button type="submit" className="btn" disabled={busy || Object.keys(picked).length === 0}>
+          {busy ? 'Importing…' : 'Import selected'}
+        </button>
+      </div>
     </form>
   );
 }
@@ -338,8 +435,18 @@ function opSummary(items: imp.ImportResult['items']): string {
 }
 
 /** Pack/GitHub outcome when there is no single place to go: the items (as links), the group when one was created, and what was skipped. */
-function ImportResultView({ result, onClose }: { result: imp.ImportResult; onClose: () => void }) {
+function ImportResultView({
+  result,
+  onClose,
+  onImportFolders,
+}: {
+  result: imp.ImportResult;
+  onClose: () => void;
+  /** Re-run the import with these folders mapped to a kind. */
+  onImportFolders?: (picked: Record<string, imp.FolderKind>) => Promise<void>;
+}) {
   const { items, skipped, source, group } = result;
+  const folders = result.skippedFolders ?? [];
   return (
     <div className="stack">
       <p>
@@ -359,9 +466,10 @@ function ImportResultView({ result, onClose }: { result: imp.ImportResult; onClo
           <Link to={`/groups/${encodeURIComponent(group.slug)}`} onClick={onClose}>
             {group.name}
           </Link>{' '}
-          (<code>{group.slug}</code>) was created with the imported items as members.
+          (<code>{group.slug}</code>) holds the imported items as members.
         </p>
       )}
+      {folders.length > 0 && onImportFolders && <FolderOffer key={folders.map((f) => f.path).join('\n')} folders={folders} onImport={onImportFolders} />}
       {items.length === 0 ? (
         <p className="muted">Nothing in that source looked like a skill, agent, command, prompt or MD.</p>
       ) : (

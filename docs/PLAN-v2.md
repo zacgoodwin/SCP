@@ -133,11 +133,11 @@ API: `GET /admin/settings` reports `clientSecretSet: true`, `tokenSet: true`.
 ## D1 imports (`server/src/imports/*`, tests `server/test/imports.test.ts`)
 
 ```
-POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [includeRepoTooling=true]  -> 201 ImportResult
-POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, includeRepoTooling?  -> 201 ImportResult
+POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [intoGroup=<slug>] [kind] [folderKinds=<JSON>] [includeRepoTooling=true]  -> 201 ImportResult
+POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, intoGroup?, folderKinds?, includeRepoTooling?  -> 201 ImportResult
 POST /items/:id/source/check                                                                     -> {source, upToDate, latestCommit}
 POST /items/:id/source/update  {note?}                                                           -> {item, skipped}  (new version; 409 up_to_date when nothing changed; skipped: the path's symlinks)
-ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason}], source: ItemSource | null}
+ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason}], skippedFolders:[{path, count}], source: ItemSource | null}
 ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: string|null, commit: string|null}
 ```
 
@@ -269,6 +269,32 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   422 `nothing_imported` with `skipped` as `details`, never a 201 with `items: []`; with a group
   requested the group rolls back and its slug is not burnt. `kind: artifact` is 400 (a tree has no
   format), on the GitHub route before anything is fetched or the rate bucket charged (v3 xksr).
+- `intoGroup` (v3 p2wf): an existing group every imported item joins (`addMemberTx`, same
+  transaction), instead of `group` creating one; both together are 400, and an empty `group` or
+  `intoGroup` in the GitHub JSON is 400 too (the pack form reads `''` as absent). Resolved before anything is
+  fetched (`groups/service.ts loadEditableGroupOr404`): a group p can read but not edit is 404 like
+  one it cannot read. An item already a member (a re-import of the same source) is versioned and
+  not added again. Audit `group.members` `{op: 'import', count}` when members were added (never a
+  second `group.create`). A group-restricted key is still refused first.
+- `kind` on a tree (v3 jwz6, pack form field too): detection off. `agent`, `command`, `prompt`,
+  `instructions`: each `.md` directly in the folder is one item of that kind (`pack.ts fileUnits`;
+  commands and prompts named by file, like `prompts/`), source path the file's, so a re-import
+  versions each; README-style docs, non-`.md` files and subfolders' `.md` files (their names could
+  collide) land in `skipped`. A folder of exactly one such `.md` stays one item named after the
+  folder, source path the folder, as before, so an item imported that way versions on re-import. Before this a single-file kind on a
+  folder of 2+ files always failed (`a <kind> holds exactly one file`). `skill`, `design`,
+  `package`: the whole tree one item, as before; so is any kind on a GitHub `path` naming one file.
+- `skippedFolders` / `folderKinds` (v3 mvfp): every `.md` the detection fallback lists as passed
+  over is counted by parent folder (`[{path, count}]`, `''` the root; README-style docs are never
+  listed, so never counted). The 201 carries it, and the 400 `nothing_to_import` / 422
+  `nothing_imported` carry it beside `details` (`error.skippedFolders`, `HttpError.extra`), since a
+  code repository's `docs/prompts/` is exactly the 400 case. `folderKinds: {"<folder>": kind}`
+  (JSON text in the pack form; at most 100; kinds `agent|command|prompt|instructions|design|package`)
+  runs after every detection pass, so it only takes what conventions left: the folder's direct
+  loose `.md` files become one item each (`design` stored as `DESIGN.md`; `updateTree` re-homes it
+  the same way), or `package` the whole folder's remaining files one item. A key that fails
+  `normalizePath` (`../x`, `/abs`, `C:/x`) is 400 before anything is fetched; a folder with nothing
+  left lands in `skipped` as `folderKinds: no unrecognised files in this folder; ignored`.
 - Provenance: `source_kind`, `source_repo` (`owner/repo` as GitHub's `full_name` spells it, zip: the
   file name), `source_ref`, `source_path`, `source_commit` (zip: sha256 of the zip bytes),
   `source_tree_sha256` (the tree the source last wrote), `source_scope` (`root` for a root
@@ -577,6 +603,15 @@ conflict only.
   optional group). Pack/GitHub results: when nothing was skipped, go to the created group, else to
   the one item; otherwise show the list with links, the group link when one was created, and the
   `skipped` reasons (they are never discarded by a navigation).
+- v3 p2wf: the group field is "Group: none / new / existing" (existing: a picker of the user's own
+  groups, `listGroups({owner: 'me'})`); `ImportDialog` takes `intoGroup` to preselect one, and
+  GroupDetail's "Import into this group" (editors) opens it so, Zip pack and GitHub tabs only.
+- v3 jwz6: the GitHub kind option reads "Import items in folder as one type" ("No, detect each
+  item's type" / "Yes, all as {k}"), help text saying single-file kinds split per file and
+  skill/design/package keep the folder whole.
+- v3 mvfp: the result screen lists `skippedFolders` with a kind select each; "Import selected"
+  re-runs the same request (the zip `File` kept, or the same repo/ref/path) with the accumulated
+  `folderKinds`, and with `intoGroup` set to a group the first run created.
 - ItemDetail: a "Source" panel when `item.source` is set: kind, repo link
   (`https://github.com/<repo>/tree/<commit>/<path>`), ref, pinned commit (7 chars, full in
   title), and for GitHub sources a "Check for updates" button -> result line (up to date / new

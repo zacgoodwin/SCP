@@ -3,20 +3,46 @@ import { z } from 'zod';
 import { fileImportMb, importLimit } from '../admin/settings.ts';
 import { audit } from '../audit.ts';
 import { reauthenticate, requireScope, requireUser } from '../auth/middleware.ts';
-import { groupDetail } from '../groups/service.ts';
+import { groupDetail, loadEditableGroupOr404 } from '../groups/service.ts';
 import { itemDetail, itemSource, loadEditableItem } from '../items/service.ts';
 import { sha256Hex } from '../lib/crypto.ts';
 import { HttpError, MB, badRequest, limitBody as limit, notFound, parseJson } from '../lib/http.ts';
+import { normalizePath } from '../lib/paths.ts';
 import { AUTH_LIMITS, rateLimited, spend, take } from '../lib/ratelimit.ts';
 import type { TreeFile } from '../lib/tree.ts';
-import { KINDS, type AppEnv, type ItemRow, type ItemSource, type Principal } from '../types.ts';
+import { KINDS, type AppEnv, type GroupRow, type ItemRow, type ItemSource, type Principal } from '../types.ts';
 import { SHA_REF, archiveTooLarge, badSource, fetchFolder, fetchZipball, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
-import { ARTIFACT_FROM_TREE, importTree, linkSkips, packLimits, subtree, underPath, unpack, updateTree, versionFromSource, type ImportOutcome, type Skipped } from './pack.ts';
+import { ARTIFACT_FROM_TREE, FOLDER_KINDS, importTree, linkSkips, packLimits, subtree, underPath, unpack, updateTree, versionFromSource, type ImportOutcome, type Skipped } from './pack.ts';
 
+const isTreePath = (k: string) => {
+  try {
+    return !k || !!normalizePath(k);
+  } catch {
+    return false;
+  }
+};
+/** mvfp: folder -> kind, '' the root; a path escaping the tree (../x, /abs) is a 400. The pack form sends it as JSON text. */
+const folderKinds = z.preprocess(
+  (v) => {
+    if (typeof v !== 'string') return v;
+    try {
+      return JSON.parse(v);
+    } catch {
+      return v;
+    }
+  },
+  z
+    .record(z.string().refine(isTreePath, 'a folder path inside the tree (no ../, no leading /)'), z.enum(FOLDER_KINDS))
+    .refine((m) => Object.keys(m).length <= 100, 'at most 100 folders'),
+);
+// An empty slug is a 400, never "absent" (intoGroupOf tests truthiness); the pack form maps '' to absent before parsing.
 const groupFields = {
   visibility: z.enum(['private', 'public']).optional(),
-  group: z.string().max(100).optional(),
+  group: z.string().min(1).max(100).optional(),
   groupName: z.string().trim().min(1).max(100).optional(),
+  intoGroup: z.string().min(1).max(100).optional(),
+  kind: z.enum(KINDS).optional(),
+  folderKinds: folderKinds.optional(),
 };
 const packFields = z.object({ ...groupFields, includeRepoTooling: z.enum(['true', 'false']).optional() });
 const githubBody = z.object({
@@ -26,7 +52,6 @@ const githubBody = z.object({
   repo: z.string().max(201).optional(),
   ref: z.string().max(200).optional(),
   path: z.string().max(255).optional(),
-  kind: z.enum(KINDS).optional(),
   name: z.string().max(64).optional(),
 });
 const updateBody = z.object({ note: z.string().max(1000).optional() });
@@ -76,6 +101,16 @@ async function download(c: Context<AppEnv>, p: Principal, repo: string, sha: str
   return { files, skipped: [...linkSkips(subtree(links, path)), ...subs] };
 }
 
+/**
+ * p2wf: the existing group an import adds every item to. Exclusive with `group` (which creates one);
+ * one p cannot edit is a 404 like one it cannot read.
+ */
+function intoGroupOf(c: Context<AppEnv>, p: Principal, body: { group?: string; intoGroup?: string }): GroupRow | undefined {
+  if (!body.intoGroup) return undefined;
+  if (body.group) throw badRequest('give group (a new group) or intoGroup (an existing one), not both');
+  return loadEditableGroupOr404(c.var.ctx.db, p, body.intoGroup);
+}
+
 /** The pack upload's body cap is the archive cap (00tr), read per request. */
 const archiveBody: MiddlewareHandler<AppEnv> = (c, next) => limit(importLimit(c.var.ctx, 'maxArchiveMb') * MB)(c, next);
 
@@ -88,13 +123,15 @@ function respond(c: Context<AppEnv>, p: Principal, out: ImportOutcome, source: I
     if (r.op === 'create') audit(c, p, { action: 'item.create', targetType: 'item', targetId: r.item.id, detail });
     else if (r.op === 'version') audit(c, p, { action: 'item.version', targetType: 'item', targetId: r.item.id, detail: { ...detail, seq: r.item.latest_seq, commit: source.commit } });
   }
-  if (out.group) audit(c, p, { action: 'group.create', targetType: 'group', targetId: out.group.id, detail: { slug: out.group.slug, via } });
+  if (out.group && out.groupCreated) audit(c, p, { action: 'group.create', targetType: 'group', targetId: out.group.id, detail: { slug: out.group.slug, via } });
+  else if (out.group && out.added) audit(c, p, { action: 'group.members', targetType: 'group', targetId: out.group.id, detail: { slug: out.group.slug, op: 'import', count: out.added, via } });
   return c.json(
     {
       // op: create | version | unchanged, so a re-upload that wrote nothing does not read as N items created.
       items: out.results.map((r) => ({ ...itemDetail(db, p, r.item), op: r.op })),
       group: out.group ? groupDetail(db, p, out.group, config.publicUrl) : null,
       skipped: out.skipped,
+      skippedFolders: out.skippedFolders,
       source,
     },
     201,
@@ -119,16 +156,17 @@ importRoutes.post('/items/import/pack', archiveBody, async (c) => {
   const file = form.file;
   if (!(file instanceof File)) throw badRequest("multipart field 'file' is required");
   const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
-  const fields = packFields.safeParse({ visibility: str(form.visibility), group: str(form.group), groupName: str(form.groupName), includeRepoTooling: str(form.includeRepoTooling) });
+  const fields = packFields.safeParse(Object.fromEntries(Object.keys(packFields.shape).map((k) => [k, str(form[k])])));
   if (!fields.success) throw badRequest('invalid fields', fields.error.issues);
-  const { includeRepoTooling, ...groupOpts } = fields.data;
+  const { includeRepoTooling, intoGroup: slug, ...opts } = fields.data;
+  const intoGroup = intoGroupOf(c, p, { group: opts.group, intoGroup: slug });
   const bytes = new Uint8Array(await file.arrayBuffer());
   const name = baseOf(file.name) || 'pack.zip';
   const { files, top, links } = unpack(bytes, undefined, packLimits(c.var.ctx));
   const rootName = top ?? name.replace(/\.(zip|skill)$/i, '');
   const source: ItemSource = { kind: 'zip', repo: name, ref: null, path: null, commit: sha256Hex(bytes) };
   // A stripped wrapper folder (`zip -r my-skill.zip my-skill/`) is one folder, so its SKILL.md is the whole folder's.
-  const out = importTree(c.var.ctx, p, files, { ...groupOpts, includeRepoTooling: includeRepoTooling === 'true', source, rootName, folderRoot: top !== null, skipped: linkSkips(links), note: `import zip ${name}` });
+  const out = importTree(c.var.ctx, p, files, { ...opts, intoGroup, includeRepoTooling: includeRepoTooling === 'true', source, rootName, folderRoot: top !== null, skipped: linkSkips(links), note: `import zip ${name}` });
   return respond(c, p, out, source);
 });
 
@@ -138,6 +176,7 @@ importRoutes.post('/items/import/github', async (c) => {
   // Refused before GitHub is asked anything: the request can never succeed (importTree keeps the check as the backstop).
   if (body.kind === 'artifact') throw badRequest(ARTIFACT_FROM_TREE);
   const src = parseGithubSource(body);
+  const intoGroup = intoGroupOf(c, importer, body);
   limitGithub(c, importer);
   const ctx = c.var.ctx;
   // `repo` as GitHub spells it, whatever case the user typed: it identifies the items on re-import.
@@ -164,6 +203,8 @@ importRoutes.post('/items/import/github', async (c) => {
       name: body.name,
       group: body.group,
       groupName: body.groupName,
+      intoGroup,
+      folderKinds: body.folderKinds,
       defaultGroupName: repo,
       includeRepoTooling: body.includeRepoTooling,
       note: `import github ${repo}@${short(sha)} ${src.path ?? ''}`.trimEnd(),

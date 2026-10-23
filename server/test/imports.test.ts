@@ -8,8 +8,10 @@ import { buildZip } from '../src/lib/zip.ts';
 import { sha256Hex } from '../src/lib/crypto.ts';
 import { HttpError } from '../src/lib/http.ts';
 import { ZIPBALL_SLOTS, parseGithubSource, withZipballSlot } from '../src/imports/github.ts';
-import { ARTIFACT_FROM_TREE, detectUnits, subtree, unpack } from '../src/imports/pack.ts';
+import { ARTIFACT_FROM_TREE, detectUnits, importTree, subtree, unpack } from '../src/imports/pack.ts';
+import type { GroupRow, Principal } from '../src/types.ts';
 import { UNDOUBLE_SOURCE_PATHS } from '../src/db.ts';
+import { createItemTx } from '../src/items/service.ts';
 
 const API = '/api/v1';
 type H = Record<string, string>;
@@ -2197,4 +2199,283 @@ test('5w3w: a manifest that is not valid UTF-8 is malformed: the group falls bac
   const m = await pack(t2.t, t2.h, 'mk.zip', zip('.claude-plugin/marketplace.json'), { group: 'mk' });
   assert.equal(m.status, 201, m.text);
   assert.deepEqual([m.json.group.name, m.json.skipped], ['mk', [{ path: '.claude-plugin/marketplace.json', reason: 'marketplace manifest ignored: not valid UTF-8' }]]);
+});
+
+const count = (t: TestCtx, sql: string, ...params: string[]) => (t.db.prepare(sql).get(...params) as { n: number }).n;
+const memberNames = (g: { members: { item: { kind: string; name: string } }[] }) => names(g.members.map((m) => m.item));
+const newGroup = async (t: TestCtx, h: H, slug: string, visibility = 'private') => {
+  const r = await t.req('POST', `${API}/groups`, { headers: h, json: { slug, name: slug, visibility } });
+  assert.equal(r.status, 201, r.text);
+};
+
+test('p2wf: intoGroup adds every imported item to an existing own group (pack and GitHub); the result is that group', async () => {
+  const { t, h } = setup();
+  await newGroup(t, h, 'mine');
+  const r = await pack(t, h, 'kit.zip', PLUGIN, { intoGroup: 'mine' });
+  assert.equal(r.status, 201, r.text);
+  assert.equal(r.json.group.slug, 'mine');
+  assert.deepEqual(memberNames(r.json.group), ['agent:reviewer', 'command:ship', 'skill:pdf']);
+  const audit = (t.db.prepare("SELECT action, detail FROM audit WHERE action LIKE 'group.%'").all() as { action: string; detail: string }[]);
+  assert.deepEqual(audit.map((a) => [a.action, JSON.parse(a.detail).op, JSON.parse(a.detail).count]), [['group.create', undefined, undefined], ['group.members', 'import', 3]], 'members added, no second group.create');
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM scp_groups'), 1);
+
+  gh.repos['acme/into'] = { default_branch: 'main', refs: { main: sha2('1a') }, trees: { [sha2('1a')]: PLUGIN } };
+  const t2 = setup();
+  await newGroup(t2.t, t2.h, 'team');
+  const g = await github(t2.t, t2.h, { repo: 'acme/into', intoGroup: 'team' });
+  assert.equal(g.status, 201, g.text);
+  assert.equal(g.json.group.slug, 'team');
+  assert.deepEqual(memberNames(g.json.group), ['agent:reviewer', 'command:ship', 'skill:pdf']);
+});
+
+test('p2wf: intoGroup of a group the user cannot edit is 404 and imports nothing; group + intoGroup is 400; a restricted key is still refused', async () => {
+  const { t, u, h } = setup();
+  const other = t.createUser();
+  const oh = t.key(other).headers;
+  await newGroup(t, oh, 'theirs-private');
+  await newGroup(t, oh, 'theirs-public', 'public');
+  assert.equal((await t.req('GET', `${API}/groups/theirs-public`, { headers: h })).status, 200, 'readable');
+  gh.repos['acme/nope'] = { default_branch: 'main', refs: { main: sha2('1b') }, trees: { [sha2('1b')]: PLUGIN } };
+  for (const slug of ['theirs-private', 'theirs-public', 'missing']) {
+    const r = await pack(t, h, 'kit.zip', PLUGIN, { intoGroup: slug });
+    assert.equal(r.status, 404, `${slug}: ${r.text}`);
+    assert.equal(r.json.error.code, 'not_found');
+    const before = gh.requests.length;
+    const g = await github(t, h, { repo: 'acme/nope', intoGroup: slug });
+    assert.equal(g.status, 404, `${slug}: ${g.text}`);
+    assert.equal(gh.requests.length, before, 'refused before GitHub is contacted');
+  }
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM group_members'), 0);
+
+  await newGroup(t, h, 'mine');
+  const both = await pack(t, h, 'kit.zip', PLUGIN, { group: 'new-one', intoGroup: 'mine' });
+  assert.equal(both.status, 400, both.text);
+  const bothGh = await github(t, h, { repo: 'acme/nope', group: 'new-one', intoGroup: 'mine' });
+  assert.equal(bothGh.status, 400, bothGh.text);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
+  // An empty slug in JSON is a 400, not "absent": {group, intoGroup: ''} would otherwise create the group.
+  gh.repos['acme/empty-into'] = { default_branch: 'main', refs: { main: sha2('4a') }, trees: { [sha2('4a')]: PLUGIN } };
+  const before = gh.requests.length;
+  for (const body of [{ group: 'new-one', intoGroup: '' }, { group: '', intoGroup: 'mine' }, { group: '' }]) {
+    const r = await github(t, h, { repo: 'acme/empty-into', ...body });
+    assert.equal(r.status, 400, `${JSON.stringify(body)}: ${r.text}`);
+  }
+  assert.equal(gh.requests.length, before, 'refused before GitHub is contacted');
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
+  assert.equal(count(t, "SELECT COUNT(*) AS n FROM scp_groups WHERE slug = 'new-one'"), 0);
+
+  const g = t.db.prepare('SELECT id FROM scp_groups WHERE slug = ?').get('mine') as { id: string };
+  const rk = t.key(u, { groupIds: [g.id] }).headers;
+  const rp = await pack(t, rk, 'kit.zip', PLUGIN, { intoGroup: 'mine' });
+  assert.deepEqual([rp.status, rp.json.error.code], [403, 'restricted_key']);
+  const rg = await github(t, rk, { repo: 'acme/nope', intoGroup: 'mine' });
+  assert.deepEqual([rg.status, rg.json.error.code], [403, 'restricted_key']);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
+
+  // The pack form is different on purpose: a browser sends an empty input as '', which reads as absent.
+  const blank = await pack(t, h, 'kit.zip', PLUGIN, { group: 'new-one', intoGroup: '' });
+  assert.equal(blank.status, 201, blank.text);
+  assert.equal(blank.json.group.slug, 'new-one');
+});
+
+test('p2wf: re-importing the same repository into the same group versions the items and adds no duplicate members', async () => {
+  gh.repos['acme/regroup'] = { default_branch: 'main', refs: { main: sha2('1c') }, trees: { [sha2('1c')]: PLUGIN, [sha2('1d')]: { ...PLUGIN, 'skills/pdf/SKILL.md': skill('pdf', 'Better.') } } };
+  const { t, h } = setup();
+  await newGroup(t, h, 'mine');
+  const first = await github(t, h, { repo: 'acme/regroup', intoGroup: 'mine' });
+  assert.equal(first.status, 201, first.text);
+  gh.repos['acme/regroup'].refs.main = sha2('1d');
+  const again = await github(t, h, { repo: 'acme/regroup', intoGroup: 'mine' });
+  assert.equal(again.status, 201, again.text);
+  assert.equal(again.json.items.find((i: { name: string }) => i.name === 'pdf').op, 'version');
+  assert.deepEqual(memberNames(again.json.group), ['agent:reviewer', 'command:ship', 'skill:pdf']);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM group_members'), 3);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 3);
+  assert.equal(count(t, "SELECT COUNT(*) AS n FROM audit WHERE action = 'group.members'"), 1, 'nothing added, nothing audited');
+  // A pack re-uploaded into the group it already fills: unchanged, members included.
+  const t2 = setup();
+  await newGroup(t2.t, t2.h, 'mine');
+  const p1 = await pack(t2.t, t2.h, 'kit.zip', PLUGIN, { intoGroup: 'mine' });
+  const p2 = await pack(t2.t, t2.h, 'kit.zip', PLUGIN, { intoGroup: 'mine' });
+  assert.deepEqual([p1.status, p2.status], [201, 201], p2.text);
+  assert.ok(p2.json.items.every((i: { op: string }) => i.op === 'unchanged'));
+  assert.equal(count(t2.t, 'SELECT COUNT(*) AS n FROM group_members'), 3);
+});
+
+test('p2wf: a group deleted after the route resolved intoGroup (during a GitHub download) is a 404, not a foreign-key 500', async () => {
+  const { t, u, h } = setup();
+  await newGroup(t, h, 'gone');
+  const stale = t.db.prepare('SELECT * FROM scp_groups WHERE slug = ?').get('gone') as unknown as GroupRow;
+  assert.equal((await t.req('DELETE', `${API}/groups/gone`, { headers: h })).status, 204);
+  const p: Principal = { userId: u.id, username: u.username, isAdmin: false, via: 'key', scopes: ['read', 'write'], groupIds: null };
+  const source = { kind: 'zip' as const, repo: 'kit.zip', ref: null, path: null, commit: 'c' };
+  assert.throws(() => importTree(t.ctx, p, tree(PLUGIN), { source, rootName: 'kit', note: 'n', intoGroup: stale }), { status: 404, code: 'not_found' });
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
+});
+
+const PROMPTS: Files = { 'my-prompts/a.md': 'A {{x}}\n', 'my-prompts/b.md': AGENT, 'my-prompts/c.md': '# C\nSee.\n', 'my-prompts/README.md': '# About\n' };
+
+test('jwz6: kind prompt on a folder of md files imports each file as its own prompt (pack and GitHub); README stays out; re-import versions', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'my-prompts.zip', PROMPTS, { kind: 'prompt' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['prompt:a', 'prompt:b', 'prompt:c']);
+  assert.deepEqual(r.json.skipped, [{ path: 'README.md', reason: 'repository documentation, not an item' }]);
+  assert.deepEqual(r.json.items.map((i: { source: { path: string } }) => i.source.path).sort(), ['a.md', 'b.md', 'c.md']);
+  const changed = await pack(t, h, 'my-prompts.zip', { ...PROMPTS, 'my-prompts/a.md': 'A2 {{x}}\n' }, { kind: 'prompt' });
+  assert.equal(changed.status, 201, changed.text);
+  assert.deepEqual(changed.json.items.map((i: { name: string; op: string }) => `${i.name}:${i.op}`).sort(), ['a:version', 'b:unchanged', 'c:unchanged']);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 3);
+
+  const files = Object.fromEntries(Object.entries(PROMPTS).map(([k, v]) => [k.replace('my-prompts/', 'docs/prompts/'), v]));
+  gh.repos['acme/prompts'] = { default_branch: 'main', refs: { main: sha2('1e') }, trees: { [sha2('1e')]: { ...files, 'src/x.ts': 'x' }, [sha2('1f')]: { ...files, 'docs/prompts/a.md': 'A2\n', 'src/x.ts': 'x' } } };
+  const t2 = setup();
+  const g = await github(t2.t, t2.h, { repo: 'acme/prompts', path: 'docs/prompts', kind: 'prompt' });
+  assert.equal(g.status, 201, g.text);
+  assert.deepEqual(names(g.json.items), ['prompt:a', 'prompt:b', 'prompt:c']);
+  assert.deepEqual(g.json.items.map((i: { source: { path: string } }) => i.source.path).sort(), ['docs/prompts/a.md', 'docs/prompts/b.md', 'docs/prompts/c.md']);
+  assert.deepEqual(g.json.skipped.map((s: { path: string }) => s.path), ['README.md']);
+  gh.repos['acme/prompts'].refs.main = sha2('1f');
+  const again = await github(t2.t, t2.h, { repo: 'acme/prompts', path: 'docs/prompts', kind: 'prompt' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: { name: string; op: string }) => `${i.name}:${i.op}`).sort(), ['a:version', 'b:unchanged', 'c:unchanged']);
+  assert.equal(count(t2.t, 'SELECT COUNT(*) AS n FROM items'), 3, 'no duplicates');
+  // Each one updates from its own file.
+  const a = again.json.items.find((i: { name: string }) => i.name === 'a');
+  assert.equal((await t2.t.req('POST', `${API}/items/${a.id}/source/check`, { headers: t2.h })).json.upToDate, true);
+});
+
+test('jwz6: a folder holding one .md stays one item named after the folder, so an item imported so before jwz6 versions on re-import', async () => {
+  const before = { 'docs/one/x.md': 'X {{x}}\n', 'team/agent/reviewer.md': AGENT };
+  const now = { 'docs/one/x.md': 'X2 {{x}}\n', 'docs/one/README.md': '# About\n', 'team/agent/reviewer.md': `${AGENT}More.\n` };
+  gh.repos['acme/one'] = { default_branch: 'main', refs: { main: sha2('c8') }, trees: { [sha2('c7')]: before, [sha2('c8')]: now } };
+  const { t, u, h } = setup();
+  const p: Principal = { userId: u.id, username: u.username, isAdmin: false, via: 'key', scopes: ['read', 'write'], groupIds: null };
+  // The rows the pre-jwz6 import made: the folder one item, source path the folder.
+  const old = (kind: 'prompt' | 'agent', path: string, file: string) =>
+    createItemTx(t.ctx, p, {
+      kind,
+      tree: tree({ [file]: before[`${path}/${file}` as keyof typeof before] }),
+      source: { kind: 'github', repo: 'acme/one', ref: 'main', path, commit: sha2('c7') },
+      sourceScope: 'tree',
+      note: 'n',
+      fallbackName: path.split('/').pop(),
+      folderName: path.split('/').pop(),
+    });
+  const rows = [old('prompt', 'docs/one', 'x.md'), old('agent', 'team/agent', 'reviewer.md')];
+  for (const [row, kind, path] of [[rows[0], 'prompt', 'docs/one'], [rows[1], 'agent', 'team/agent']] as const) {
+    const r = await github(t, h, { repo: 'acme/one', path, kind });
+    assert.equal(r.status, 201, r.text);
+    assert.deepEqual(r.json.items.map((i: { id: string; name: string; op: string; source: { path: string } }) => [i.id, i.name, i.op, i.source.path]), [[row.id, row.name, 'version', path]]);
+  }
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 2, 'no duplicates');
+});
+
+test('jwz6: a single-file kind splits only the folder\'s own .md files; nested ones are skipped, never collide', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'nested.zip', { 'nested/a.md': 'A\n', 'nested/b.md': 'B\n', 'nested/one/x.md': 'X1\n', 'nested/two/x.md': 'X2\n' }, { kind: 'prompt' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['prompt:a', 'prompt:b']);
+  assert.deepEqual(r.json.skipped, [
+    { path: 'one/x.md', reason: 'in a subfolder: only the folder\'s own .md files are each a prompt' },
+    { path: 'two/x.md', reason: 'in a subfolder: only the folder\'s own .md files are each a prompt' },
+  ]);
+});
+
+test('jwz6: kind skill, design and package on a folder still make one item holding every file', async () => {
+  gh.repos['acme/whole'] = {
+    default_branch: 'main',
+    refs: { main: sha2('2a') },
+    trees: { [sha2('2a')]: { 'tools/s/SKILL.md': skill('s'), 'tools/s/ref.md': 'r', 'brand/DESIGN.md': '# Brand\n', 'brand/tokens.md': 't', 'docs/a.md': 'a', 'docs/b.md': 'b' } },
+  };
+  const { t, h } = setup();
+  for (const [path, kind, files] of [
+    ['tools/s', 'skill', ['SKILL.md', 'ref.md']],
+    ['brand', 'design', ['DESIGN.md', 'tokens.md']],
+    ['docs', 'package', ['a.md', 'b.md']],
+  ] as const) {
+    const r = await github(t, h, { repo: 'acme/whole', path, kind });
+    assert.equal(r.status, 201, r.text);
+    assert.equal(r.json.items.length, 1, kind);
+    assert.equal(r.json.items[0].kind, kind);
+    assert.deepEqual(r.json.items[0].version.files.map((f: { path: string }) => f.path), files);
+  }
+  const p = await pack(t, h, 'manual.zip', { 'manual/a.md': 'a', 'manual/b.md': 'b' }, { kind: 'package' });
+  assert.equal(p.status, 201, p.text);
+  assert.deepEqual(names(p.json.items), ['package:manual']);
+  assert.deepEqual(p.json.items[0].version.files.map((f: { path: string }) => f.path), ['a.md', 'b.md']);
+});
+
+const NOTES: Files = { 'skills/x/SKILL.md': skill('x'), 'notes/a.md': 'A note.\n', 'notes/b.md': 'B note.\n', 'notes/README.md': '# Notes\n', 'src/x.ts': 'x' };
+
+test('mvfp: an unrecognised folder of md files is offered; folderKinds imports it as prompts or one package, the skill unchanged, README never', async () => {
+  const { t, h } = setup();
+  const zip = zipSync(Object.fromEntries(Object.entries(NOTES).map(([k, v]) => [k, strToU8(v)])));
+  const first = await pack(t, h, 'kit.zip', zip);
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(names(first.json.items), ['skill:x']);
+  assert.deepEqual(first.json.skippedFolders, [{ path: 'notes', count: 2 }], 'README-style docs are never offered');
+  const skillId = first.json.items[0].id;
+
+  const prompts = await pack(t, h, 'kit.zip', zip, { folderKinds: JSON.stringify({ notes: 'prompt' }) });
+  assert.equal(prompts.status, 201, prompts.text);
+  assert.deepEqual(names(prompts.json.items), ['prompt:a', 'prompt:b', 'skill:x']);
+  assert.deepEqual(prompts.json.skippedFolders, []);
+  assert.deepEqual(prompts.json.skipped, []);
+  const x = prompts.json.items.find((i: { kind: string }) => i.kind === 'skill');
+  assert.deepEqual([x.id, x.op], [skillId, 'unchanged'], 'the skill is the same item, not a duplicate');
+  assert.deepEqual(prompts.json.items.filter((i: { kind: string }) => i.kind === 'prompt').map((i: { source: { path: string } }) => i.source.path).sort(), ['notes/a.md', 'notes/b.md']);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 3);
+
+  const t2 = setup();
+  const pkg = await pack(t2.t, t2.h, 'kit.zip', zip, { folderKinds: JSON.stringify({ notes: 'package', ghost: 'prompt' }) });
+  assert.equal(pkg.status, 201, pkg.text);
+  assert.deepEqual(names(pkg.json.items), ['package:notes', 'skill:x']);
+  const notes = pkg.json.items.find((i: { kind: string }) => i.kind === 'package');
+  assert.deepEqual(notes.version.files.map((f: { path: string }) => f.path), ['README.md', 'a.md', 'b.md']);
+  assert.deepEqual(pkg.json.skipped, [{ path: 'ghost', reason: 'folderKinds: no unrecognised files in this folder; ignored' }], 'a folder not in the tree is reported');
+});
+
+test('mvfp: folderKinds through GitHub, a design folder updating from source, and a code repository offered its prompts in the 400', async () => {
+  const files: Files = { ...NOTES, 'brand/look.md': '# Look\n' };
+  gh.repos['acme/notes'] = { default_branch: 'main', refs: { main: sha2('2b') }, trees: { [sha2('2b')]: files, [sha2('2c')]: { ...files, 'brand/look.md': '# Look\nNewer.\n' } } };
+  const { t, h } = setup();
+  const first = await github(t, h, { repo: 'acme/notes' });
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(first.json.skippedFolders, [{ path: 'notes', count: 2 }, { path: 'brand', count: 1 }]);
+  const mapped = await github(t, h, { repo: 'acme/notes', folderKinds: { notes: 'command', brand: 'design' } });
+  assert.equal(mapped.status, 201, mapped.text);
+  assert.deepEqual(names(mapped.json.items), ['command:a', 'command:b', 'design:look', 'skill:x']);
+  const look = mapped.json.items.find((i: { kind: string }) => i.kind === 'design');
+  assert.deepEqual([look.version.entryPath, look.source.path], ['DESIGN.md', 'brand/look.md']);
+  gh.repos['acme/notes'].refs.main = sha2('2c');
+  const up = await t.req('POST', `${API}/items/${look.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.deepEqual([up.json.item.latestSeq, up.json.item.version.entryPath], [2, 'DESIGN.md']);
+
+  gh.repos['acme/code'] = { default_branch: 'main', refs: { main: sha2('2d') }, trees: { [sha2('2d')]: { 'src/x.ts': 'x', 'docs/prompts/p.md': 'P.\n', 'docs/prompts/q.md': 'Q.\n' } } };
+  const none = await github(t, h, { repo: 'acme/code' });
+  assert.equal(none.status, 400, none.text);
+  assert.equal(none.json.error.code, 'nothing_to_import');
+  assert.deepEqual(none.json.error.skippedFolders, [{ path: 'docs/prompts', count: 2 }]);
+  assert.equal(none.json.error.details.length, 2);
+  const now = await github(t, h, { repo: 'acme/code', folderKinds: { 'docs/prompts': 'prompt' } });
+  assert.equal(now.status, 201, now.text);
+  assert.deepEqual(names(now.json.items), ['prompt:p', 'prompt:q']);
+});
+
+test('mvfp: folderKinds with ../, an absolute path, an unknown kind or bad JSON is a 400 before anything is imported or fetched', async () => {
+  gh.repos['acme/esc'] = { default_branch: 'main', refs: { main: sha2('2e') }, trees: { [sha2('2e')]: NOTES } };
+  const { t, h } = setup();
+  for (const bad of [{ '../x': 'prompt' }, { '/etc': 'prompt' }, { 'notes/../..': 'prompt' }, { 'C:/x': 'prompt' }, { notes: 'skill' }, { notes: 'artifact' }]) {
+    const p = await pack(t, h, 'kit.zip', NOTES, { folderKinds: JSON.stringify(bad) });
+    assert.equal(p.status, 400, `${JSON.stringify(bad)}: ${p.text}`);
+    const before = gh.requests.length;
+    const g = await github(t, h, { repo: 'acme/esc', folderKinds: bad });
+    assert.equal(g.status, 400, `${JSON.stringify(bad)}: ${g.text}`);
+    assert.equal(gh.requests.length, before);
+  }
+  assert.equal((await pack(t, h, 'kit.zip', NOTES, { folderKinds: '{not json' })).status, 400);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 0);
 });

@@ -4,10 +4,22 @@ import { ApiError, json, type GroupDetail, type ItemDetail, type ItemSource, typ
 /** What the import did to the item: created it, added a version, or found it already at this content. */
 export type ImportOp = 'create' | 'version' | 'unchanged';
 
+/** A folder of loose .md files detection passed over; '' is the root. */
+export interface SkippedFolder {
+  path: string;
+  count: number;
+}
+
+/** What `folderKinds` maps a folder to: each .md one item of that kind, or the folder one package. */
+export type FolderKind = 'agent' | 'command' | 'prompt' | 'instructions' | 'design' | 'package';
+export const FOLDER_KINDS: FolderKind[] = ['prompt', 'agent', 'command', 'instructions', 'design', 'package'];
+
 export interface ImportResult {
   items: (ItemDetail & { op?: ImportOp })[];
   group: GroupDetail | null;
   skipped: { path: string; reason: string }[];
+  /** Folders to offer a kind for (re-import with folderKinds). */
+  skippedFolders?: SkippedFolder[];
   source: ItemSource | null;
 }
 
@@ -16,6 +28,11 @@ export interface ImportGroupOpts {
   /** Slug of a group to create with every imported item as a member. */
   group?: string;
   groupName?: string;
+  /** Slug of an existing group the user can edit; every imported item joins it. Not with `group`. */
+  intoGroup?: string;
+  /** No detection: the tree is one item, or one item per .md for agent, command, prompt and instructions. */
+  kind?: Kind;
+  folderKinds?: Record<string, FolderKind>;
 }
 
 /** The instance's caps (GET /imports/limits): admin settings, read by any signed-in user. */
@@ -40,7 +57,7 @@ export function refuseOversize(file: File, mb: number): void {
 export function importPack(file: File, opts: ImportGroupOpts = {}) {
   const fd = new FormData();
   fd.set('file', file);
-  for (const [k, v] of Object.entries(opts)) if (v) fd.set(k, v);
+  for (const [k, v] of Object.entries(opts)) if (v) fd.set(k, typeof v === 'string' ? v : JSON.stringify(v));
   return json<ImportResult>('POST', '/items/import/pack', fd);
 }
 
@@ -49,7 +66,6 @@ export interface GithubImport extends ImportGroupOpts {
   repo?: string;
   ref?: string;
   path?: string;
-  kind?: Kind;
   name?: string;
 }
 
@@ -65,7 +81,7 @@ export async function importOrSkipped(p: Promise<ImportResult>): Promise<ImportR
     return await p;
   } catch (e) {
     if (e instanceof ApiError && (e.code === 'nothing_imported' || e.code === 'nothing_to_import') && Array.isArray(e.details) && e.details.length) {
-      return { items: [], group: null, skipped: e.details as ImportResult['skipped'], source: null };
+      return { items: [], group: null, skipped: e.details as ImportResult['skipped'], skippedFolders: e.raw?.skippedFolders as SkippedFolder[] | undefined, source: null };
     }
     throw e;
   }
