@@ -2,6 +2,8 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
 import { ApiError } from '../api.ts';
 import * as admin from '../api-admin.ts';
+import * as tools from '../api-tools.ts';
+import { ToolForm } from '../components/CliTools.tsx';
 import { useUser } from '../auth.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
 import { useToast } from '../components/Toast.tsx';
@@ -39,7 +41,7 @@ function Settings() {
         <div className="page-title">
           <p className="eyebrow">Admin</p>
           <h1>Settings</h1>
-          <p className="muted">Login, imports, storage and OAuth clients. Values set through environment variables are read-only here; unset the variable to manage them.</p>
+          <p className="muted">Login, imports, storage, CLI tools and OAuth clients. Values set through environment variables are read-only here; unset the variable to manage them.</p>
         </div>
       </header>
       <ErrorBox error={error} />
@@ -49,6 +51,7 @@ function Settings() {
           <GithubCard settings={settings} onSaved={setSettings} />
           <ImportsCard settings={settings} onSaved={setSettings} />
           <StorageCard settings={settings} onSwept={setSettings} />
+          <CliToolsCard />
           <OAuthClientsCard />
         </>
       ) : error ? null : (
@@ -356,6 +359,86 @@ function StorageCard({ settings, onSwept }: { settings: admin.AdminSettings; onS
         sweep.
       </p>
       <ErrorBox error={error} />
+    </section>
+  );
+}
+
+/** f9j0: the CLI tools registry, the only source of the install commands group pages show. */
+function CliToolsCard() {
+  const toast = useToast();
+  const [rows, setRows] = useState<tools.CliTool[] | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = () => tools.listRegistry().then((r) => setRows(r.tools), setError);
+  useEffect(() => void load(), []);
+
+  const saved = (t: tools.CliTool, verb: string) => {
+    setEditing(null);
+    setAdding(false);
+    toast(`${verb} ${t.name}.`, 'ok');
+    void load();
+  };
+  const remove = async (name: string) => {
+    if (!confirm(`Remove ${name} from the registry? Group pages stop showing its install commands.`)) return;
+    setBusy(name);
+    try {
+      await tools.deleteTool(name);
+      toast(`Removed ${name}.`, 'ok');
+      void load();
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="card stack" id="cli-tools">
+      <header className="card-head">
+        <h2>CLI tools</h2>
+        {!adding && (
+          <button type="button" className="btn btn-small" onClick={() => setAdding(true)}>
+            Add tool
+          </button>
+        )}
+      </header>
+      <p className="muted">
+        Install commands for the command-line tools skills declare in <code>metadata.requires</code>. Group pages show only these commands, never
+        anything an item supplies, because readers paste them into a terminal. SCP never runs them. Everyone sees them on the{' '}
+        <Link to="/tools">Tools</Link> page.
+      </p>
+      <ErrorBox error={error} />
+      {adding && <ToolForm onSaved={(t) => saved(t, 'Added')} onCancel={() => setAdding(false)} />}
+      {rows === null ? (
+        error ? null : <p className="muted" role="status">Loading…</p>
+      ) : rows.length === 0 ? (
+        <p className="muted">The registry is empty: group pages list required CLIs without install commands until a row is added.</p>
+      ) : (
+        <ul className="stack requires-list">
+          {rows.map((t) => (
+            <li key={t.name} className="stack">
+              <div className="row wrap">
+                <strong>
+                  <code>{t.name}</code>
+                </strong>
+                <span className="muted">{Object.keys(t.install).join(', ') || 'no install commands'}</span>
+                <span className="page-actions">
+                  <button type="button" className="btn btn-small" onClick={() => setEditing(editing === t.name ? null : t.name)}>
+                    {editing === t.name ? 'Close' : 'Edit'}
+                  </button>
+                  <button type="button" className="btn btn-small btn-danger" disabled={busy === t.name} onClick={() => void remove(t.name)}>
+                    Remove
+                  </button>
+                </span>
+              </div>
+              {editing === t.name && <ToolForm tool={t} onSaved={(x) => saved(x, 'Saved')} onCancel={() => setEditing(null)} />}
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }

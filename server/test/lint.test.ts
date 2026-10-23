@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseFrontmatter } from '../src/lib/frontmatter.ts';
-import { lintVersion } from '../src/items/lint.ts';
+import { MAX_REQUIRES, lintVersion, parseRequires } from '../src/items/lint.ts';
+import { migrate, newId, now } from '../src/db.ts';
+import { makeTestCtx } from './helpers.ts';
 import type { Kind } from '../src/types.ts';
 
 const enc = new TextEncoder();
@@ -88,4 +90,63 @@ test('instructions, design and other kinds', () => {
   assert.ok(codes('design', 'd', '## Colors\n## Overview\n').includes('warn:design.section.order'));
   assert.ok(codes('design', 'd', '## Colors\n## Colors\n').includes('warn:design.section.order'));
   assert.deepEqual(codes('prompt', 'p', '---\nx: [\n---\n'), ['warn:frontmatter.invalid']);
+});
+
+// ---------- required CLIs (f9j0) ----------
+
+test('requires: metadata.requires (portable) and top-level requires both report their CLI; lint says which', () => {
+  const portable = '---\nname: rev\ndescription: d\nmetadata:\n  requires: [roborev]\n---\n';
+  assert.deepEqual(codes('skill', 'rev', portable), ['info:requires.found']);
+  assert.deepEqual(parseRequires(parseFrontmatter(portable).data).names, ['roborev']);
+  const top = '---\nname: cb\ndescription: d\nrequires: [context-builder]\n---\n';
+  assert.deepEqual(codes('skill', 'cb', top).sort(), ['info:requires.found', 'info:requires.toplevel', 'info:skill.keys.nonportable']);
+  assert.deepEqual(parseRequires(parseFrontmatter(top).data).names, ['context-builder']);
+  const fm = parseFrontmatter(top);
+  const found = lintVersion('skill', 'cb', [], fm, { path: 'SKILL.md', text: top }).find((l) => l.code === 'requires.found');
+  assert.equal(found?.message, 'requires CLIs: context-builder');
+});
+
+test('requires: one name, both spellings merged and deduplicated, invalid names warned and dropped, capped', () => {
+  const r = parseRequires({ metadata: { requires: ['stax', 'kata', 'Bad Name', 42] }, requires: 'kata' });
+  assert.deepEqual(r.names, ['kata', 'stax']);
+  assert.deepEqual(r.invalid, ['Bad Name', '42']);
+  assert.ok(codes('skill', 'x', '---\nname: x\ndescription: d\nmetadata:\n  requires: ["rm -rf /", ok]\n---\n').includes('warn:requires.invalid'));
+  assert.deepEqual(parseRequires({ metadata: 'nope', requires: { a: 'x' } }).names, [], 'only lists and strings count');
+  const many = Array.from({ length: MAX_REQUIRES + 3 }, (_, i) => `t${String(i).padStart(2, '0')}`);
+  const capped = parseRequires({ metadata: { requires: many } });
+  assert.equal(capped.names.length, MAX_REQUIRES);
+  assert.equal(capped.dropped, 3);
+  assert.ok(codes('skill', 'x', `---\nname: x\ndescription: d\nmetadata:\n  requires: [${many.join(', ')}]\n---\n`).includes('warn:requires.max'));
+  assert.deepEqual(codes('skill', 'x', '---\nname: x\ndescription: d\n---\n'), [], 'nothing required, nothing said');
+});
+
+test('requires: migration 16 backfills older versions with the same rule as parseRequires', () => {
+  const t = makeTestCtx();
+  const u = t.createUser();
+  const cases: Record<string, unknown>[] = [
+    { metadata: { requires: ['roborev', 'kata'] } },
+    { requires: ['context-builder'] },
+    { metadata: { requires: 'stax' }, requires: ['stax', 'graphify'] },
+    { metadata: { requires: ['Bad Name', 'ok.tool_1-x', 7, `${'a'.repeat(65)}`] } },
+    { metadata: 'string', requires: { a: 'x' } },
+    {},
+    // Over the cap, unsorted, split across both spellings: the first MAX_REQUIRES by name are kept.
+    { metadata: { requires: Array.from({ length: MAX_REQUIRES + 3 }, (_, i) => `t${String(MAX_REQUIRES + 2 - i).padStart(2, '0')}`) }, requires: ['a0'] },
+  ];
+  const ids = cases.map((fm, n) => {
+    const itemId = newId();
+    t.db.prepare('INSERT INTO items (id, owner_id, kind, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(itemId, u.id, 'skill', `s${n}`, now(), now());
+    const id = newId();
+    t.db
+      .prepare('INSERT INTO item_versions (id, item_id, seq, entry_path, tree_sha256, frontmatter, total_bytes, created_at) VALUES (?, ?, 1, ?, ?, ?, 0, ?)')
+      .run(id, itemId, 'SKILL.md', 'x', JSON.stringify(fm), now());
+    return id;
+  });
+  // Re-run the migration over versions written before it existed.
+  t.db.exec('DROP TABLE version_requires; DROP TABLE cli_tools; PRAGMA user_version = 15;');
+  migrate(t.db);
+  const stored = (id: string) =>
+    (t.db.prepare('SELECT name FROM version_requires WHERE version_id = ? ORDER BY name').all(id) as { name: string }[]).map((r) => r.name);
+  cases.forEach((fm, n) => assert.deepEqual(stored(ids[n]), parseRequires(fm).names, JSON.stringify(fm)));
+  assert.deepEqual(stored(ids[3]), ['ok.tool_1-x']);
 });

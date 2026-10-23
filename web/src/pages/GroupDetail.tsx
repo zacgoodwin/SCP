@@ -2,6 +2,8 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router';
 import * as api from '../api.ts';
 import * as nested from '../api-groups.ts';
+import { toolAnchor, type GroupWithRequires } from '../api-tools.ts';
+import { PlatformTabs, checkCommand, commandFor, defaultPlatform, platformLabel, type Platform } from '../components/CliTools.tsx';
 import { useAuth, useUser } from '../auth.tsx';
 import { CopyBlock } from '../components/CopyBlock.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
@@ -156,6 +158,7 @@ function GroupView({ slug }: { slug: string }) {
         <MembersSection group={group} conflicts={manifest?.conflicts ?? []} manifest={manifest} target={target} onChange={onChange} />
         {group.canEdit && <AddItemsPanel group={group} onChange={onChange} />}
       </div>
+      <RequiresSection group={group} />
       <IncludesSection group={group} onChange={onChange} />
       <InstructionsSection key={`i:${group.instructions ?? ''}`} group={group} onChange={onChange} />
       <SharingSection group={group} onChange={onChange} />
@@ -684,6 +687,94 @@ function AddItemsPanel({ group, onChange }: { group: api.GroupDetail; onChange: 
 }
 
 /** Included groups (58z1): their members flow into this one; readers see the ones that currently flow. */
+/**
+ * f9j0: the CLIs the group's skills need, with copy-paste install commands from the admin registry
+ * (never from the items). The server cannot see the reader's machine, so this lists everything and
+ * the check one-liner prints what is missing. Nothing renders when no member requires a CLI.
+ */
+function RequiresSection({ group }: { group: api.GroupDetail }) {
+  const requires = (group as GroupWithRequires).requires ?? [];
+  const [platform, setPlatform] = useState<Platform>(defaultPlatform);
+  if (!requires.length) return null;
+  const known = requires.flatMap((r) => {
+    const cmd = r.tool && commandFor(r.tool.install, platform);
+    return cmd ? [cmd] : [];
+  });
+  const bins = requires.map((r) => r.tool?.check ?? r.name);
+  return (
+    <section className="card stack" id="requires" aria-labelledby="requires-h">
+      <header className="card-head">
+        <h2 id="requires-h">Requires</h2>
+      </header>
+      <p className="muted">
+        Command-line tools this group's skills need on your machine. SCP never runs these commands: copy them into a terminal yourself. Install
+        commands come from this instance's tool registry, kept by its admins.
+      </p>
+      <PlatformTabs value={platform} onChange={setPlatform} idPrefix="req" panelId="requires-panel" />
+      <div id="requires-panel" role="tabpanel" aria-labelledby={`req-${platform}`} className="stack">
+        <ul className="stack requires-list">
+          {requires.map((r) => {
+            const cmd = r.tool && commandFor(r.tool.install, platform);
+            return (
+              <li key={r.name} className="stack">
+                <p>
+                  <strong>
+                    {r.tool ? (
+                      <Link to={`/tools#${toolAnchor(r.name)}`} title="Open its card in Tools">
+                        <code>{r.name}</code>
+                      </Link>
+                    ) : (
+                      <code>{r.name}</code>
+                    )}
+                  </strong>{' '}
+                  <span className="muted">
+                    needed by{' '}
+                    {r.items.map((it, i) => (
+                      <span key={it.id}>
+                        {i > 0 && ', '}
+                        <Link to={`/items/${it.id}`}>{it.name}</Link>
+                      </span>
+                    ))}
+                  </span>
+                  {r.tool?.homepage && (
+                    <>
+                      {' · '}
+                      <a href={r.tool.homepage} target="_blank" rel="noreferrer noopener">
+                        homepage
+                      </a>
+                    </>
+                  )}
+                </p>
+                {cmd ? (
+                  <CopyBlock label={`Install ${r.name} (${platformLabel(platform)})`} text={cmd} />
+                ) : r.tool ? (
+                  <p className="muted">No install command recorded for {platformLabel(platform)}.</p>
+                ) : (
+                  <p className="muted">
+                    Not in this instance's tool registry, so SCP has no install command for it.
+                    {r.sources?.map((s) => (
+                      <span key={s}>
+                        {' '}
+                        Source:{' '}
+                        <a href={s} target="_blank" rel="noreferrer noopener">
+                          {s.replace('https://github.com/', '')}
+                        </a>
+                        .
+                      </span>
+                    ))}
+                  </p>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+        {known.length > 0 && <CopyBlock label={`Install all (${platformLabel(platform)}, one command per line)`} text={known.join('\n')} />}
+        <CopyBlock label={`Check what's missing (${platform === 'windows' ? 'PowerShell' : 'shell'})`} text={checkCommand(bins, platform)} />
+      </div>
+    </section>
+  );
+}
+
 function IncludesSection({ group, onChange }: { group: api.GroupDetail; onChange: OnChange }) {
   const toast = useToast();
   const { busy, error, run } = useMutation(onChange);

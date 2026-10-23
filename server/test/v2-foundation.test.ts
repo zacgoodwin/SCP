@@ -33,14 +33,14 @@ test('migration 4 adds the v2 tables and columns, and upgrades a v3 database', (
   assert.ok(cols('items').includes('source_prefix'));
   // Migration 13 (v3 jcfm): frontmatter an import supplied, and whether upstream now ships its own.
   assert.ok(cols('items').includes('supplied_frontmatter') && cols('items').includes('upstream_frontmatter'));
-  assert.equal((t.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
+  assert.equal((t.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
 
   // migrate() is idempotent and a fresh database lands on the same version.
   const fresh = new DatabaseSync(':memory:');
   fresh.exec('PRAGMA foreign_keys = ON');
   migrate(fresh);
   migrate(fresh);
-  assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
+  assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
   assert.throws(() => t.db.prepare('INSERT INTO group_includes (group_id, included_id, added_at) VALUES (?, ?, ?)').run('a', 'a', 'now'), /CHECK/);
 });
 
