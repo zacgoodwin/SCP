@@ -42,7 +42,7 @@ test('migrations are idempotent and tx rolls back', () => {
   const db = new DatabaseSync(':memory:');
   migrate(db);
   migrate(db);
-  assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 13);
+  assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
   assert.throws(() =>
     tx(db, () => {
       db.prepare("INSERT INTO settings (key, value) VALUES ('k', 'v')").run();

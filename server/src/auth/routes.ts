@@ -3,7 +3,7 @@ import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { z } from 'zod';
 import { hashPassword, sha256Hex, verifyPassword } from '../lib/crypto.ts';
 import { HttpError, conflict, forbidden, notFound, parseJson, parseQuery } from '../lib/http.ts';
-import { AUTH_LIMITS, limitIp, rateLimited, take } from '../lib/ratelimit.ts';
+import { limitAnonymous } from '../lib/ratelimit.ts';
 import { isUniqueViolation, now, tx } from '../db.ts';
 import { audit } from '../audit.ts';
 import { sweepBlobs } from '../items/gc.ts';
@@ -55,15 +55,6 @@ const requireSession = (c: Context<AppEnv>, what: string): Principal => {
   return p;
 };
 
-// ---------- anonymous scrypt limiter (buckets in lib/ratelimit.ts, shared with the OIDC routes) ----------
-
-function limitAnonymous(c: Context<AppEnv>, login?: string): void {
-  const ip = limitIp(c);
-  if (login === undefined) return;
-  const name = JSON.stringify(login.trim().toLowerCase()); // quoted: a name cannot forge another key
-  if (!take(c, `login:${ip}:${name}`, AUTH_LIMITS.login) || !take(c, `loginAll:${name}`, AUTH_LIMITS.loginAll)) throw rateLimited();
-}
-
 authRoutes.post('/auth/register', async (c) => {
   if (!c.var.ctx.config.allowRegistration) throw new HttpError(403, 'registration_disabled', 'registration is disabled');
   const body = await parseJson(c, newUserSchema);
@@ -94,17 +85,29 @@ authRoutes.post('/auth/logout', (c) => {
 authRoutes.get('/auth/me', (c) => {
   const p = requireUser(c);
   const u = getUser(c.var.ctx.db, p.userId)!;
-  return c.json({ user: userJson(u), principal: { via: p.via, scopes: p.scopes, groupIds: p.groupIds } });
+  // hasPassword: false for an SSO-only account, whose menu offers "Set a password" (POST /auth/password without current).
+  return c.json({ user: userJson(u), hasPassword: u.password_hash !== OIDC_PASSWORD_HASH, principal: { via: p.via, scopes: p.scopes, groupIds: p.groupIds } });
 });
+
+/** How long after an SSO sign-in an SSO-only account may set its first password without `current`. */
+const SSO_FRESH_MS = 10 * 60_000;
 
 authRoutes.post('/auth/password', async (c) => {
   const p = requireSession(c, 'changing the password');
-  const body = await parseJson(c, z.object({ current: z.string().max(200), next: passwordSchema }));
+  const body = await parseJson(c, z.object({ current: z.string().max(200).optional(), next: passwordSchema }));
   const { db } = c.var.ctx;
   const u = getUser(db, p.userId)!;
-  if (!(await verifyPassword(body.current, u.password_hash))) throw invalidCredentials();
-  const hash = await hashPassword(body.next);
   const keep = sha256Hex(getCookie(c, SESSION_COOKIE) ?? '');
+  if (body.current === undefined) {
+    // Break-glass password for an SSO-only account, which has no current password to prove. The proof
+    // is a session the SSO callback created minutes ago, so an old or stolen cookie cannot set one.
+    if (u.password_hash !== OIDC_PASSWORD_HASH) throw new HttpError(400, 'bad_request', 'the current password is required');
+    const fresh = db
+      .prepare("SELECT 1 FROM sessions WHERE id_hash = ? AND user_id = ? AND auth_method = 'oidc' AND created_at > ?")
+      .get(keep, u.id, new Date(Date.now() - SSO_FRESH_MS).toISOString());
+    if (!fresh) throw new HttpError(400, 'reauth_required', 'sign in with single sign-on again, then set the password within 10 minutes');
+  } else if (!(await verifyPassword(body.current, u.password_hash))) throw invalidCredentials();
+  const hash = await hashPassword(body.next);
   await c.var.ctx.beforePasswordWrite?.();
   tx(db, () => {
     // Compare-and-swap: an admin reset (the account-recovery path) may have landed during the
@@ -114,7 +117,7 @@ authRoutes.post('/auth/password', async (c) => {
     if (!r || !r.changes) throw invalidCredentials();
     db.prepare('DELETE FROM sessions WHERE user_id = ? AND id_hash != ?').run(u.id, keep);
   });
-  audit(c, p, { action: 'user.password', targetType: 'user', targetId: u.id });
+  audit(c, p, { action: 'user.password', targetType: 'user', targetId: u.id, detail: body.current === undefined ? { via: 'oidc-set' } : undefined });
   return c.body(null, 204);
 });
 

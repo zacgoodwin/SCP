@@ -272,6 +272,24 @@ const MIGRATIONS: string[] = [
   // on every source write; upstream_frontmatter is 1 while upstream ships its own instead (imports/pack.ts versionFromSource).
   `ALTER TABLE items ADD COLUMN supplied_frontmatter TEXT;
    ALTER TABLE items ADD COLUMN upstream_frontmatter INTEGER NOT NULL DEFAULT 0;`,
+  // v3 0nhr: how a session signed in ('oidc' from the SSO callback; NULL for a password login and
+  // older rows), so an SSO-only account can set a break-glass password from a fresh SSO session only.
+  `ALTER TABLE sessions ADD COLUMN auth_method TEXT;`,
+  // v3 59b0: a first SSO sign-in whose verified email matches a password account parks the identity
+  // here until that account's password is proven (auth/oidc.ts POST /auth/oidc/link/confirm).
+  // Single use, 5 minutes, 5 password attempts; only the token's sha256 is stored.
+  `CREATE TABLE oidc_pending_links (
+    token_hash TEXT PRIMARY KEY,
+    issuer TEXT NOT NULL,
+    sub TEXT NOT NULL,
+    email TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    next TEXT NOT NULL,
+    failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+   CREATE INDEX oidc_pending_links_expires ON oidc_pending_links(expires_at);`,
 ];
 
 export function openDb(path: string): Db {

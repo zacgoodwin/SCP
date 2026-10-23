@@ -32,6 +32,8 @@ export interface User {
 }
 export interface Me {
   user: User;
+  /** false for an account created by single sign-on: the menu offers "Set a password" (no current one). */
+  hasPassword: boolean;
   principal: { via: 'session' | 'key' | 'oauth'; scopes: Scope[]; groupIds: string[] | null };
 }
 export interface AuthConfig {
@@ -328,7 +330,8 @@ export const login = (login: string, password: string) => json<{ user: User }>('
 export const logout = () => json<void>('POST', '/auth/logout');
 export const register = (email: string, username: string, password: string) =>
   json<{ user: User }>('POST', '/auth/register', { email, username, password });
-export const changePassword = (current: string, next: string) => json<void>('POST', '/auth/password', { current, next });
+/** `current` undefined: an SSO-only account setting its first password (400 reauth_required unless signed in by SSO in the last 10 minutes). */
+export const changePassword = (current: string | undefined, next: string) => json<void>('POST', '/auth/password', { current, next });
 
 // ---------- items (C2) ----------
 
@@ -383,6 +386,11 @@ export const bundleUrl = (slug: string, target: BundleTarget) => `${API}${g(slug
 
 /** Start linking single sign-on to the signed-in account: a POST (CSRF-checked), answering the IdP URL to navigate to. */
 export const oidcLink = (next: string) => json<{ url: string }>('POST', '/auth/oidc/link', { next });
+/** The password account a first SSO sign-in matched by email (/login/link?t=); 400 bad_link_token once expired or used. */
+export const oidcPendingLink = (t: string) => json<{ email: string; username: string }>('GET', `/auth/oidc/link/pending${qs({ t })}`);
+/** Prove that account's password: links the identity and signs in; answers where to go next. */
+export const oidcConfirmLink = (token: string, password: string) =>
+  json<{ user: User; next: string }>('POST', '/auth/oidc/link/confirm', { token, password });
 /** Drop the signed-in account's single sign-on link (409 for an account that has no password). */
 export const oidcUnlink = () => json<void>('POST', '/auth/oidc/unlink', {});
 export const listKeys = () => json<{ keys: ApiKey[] }>('GET', '/keys');

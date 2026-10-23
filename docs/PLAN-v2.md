@@ -531,8 +531,11 @@ GET /api/v1/auth/oidc/callback?code&state -> verifies state (signed cookie scp_o
                                            when token_endpoint_auth_methods_supported is absent; client_secret_post only when the list names it and not basic), validates id_token
                                            (RS256/ES256 via JWKS from discovery, iss, aud, exp, nonce, iat skew 5 min), then: user by (issuer, sub); else by verified email
                                            only when that account has no password (password_hash '!oidc'; links: sets oidc_issuer/oidc_sub). A password account is
-                                           never linked from the callback (403 "sign in with your password and link"): anyone may have registered the address first
-                                           (pre-hijack). Else auto-register when enabled (username from preferred_username|email local part, slugified
+                                           never linked from the callback alone: anyone may have registered the address first (pre-hijack). v3 (59b0): it parks
+                                           the identity in oidc_pending_links (issuer, sub, email, user id, next, sha256 of a random token; 5 min, single use,
+                                           5 attempts), sets the binding cookie scp_oidc_link (HttpOnly, path /api/v1/auth/oidc/link) and 302s to
+                                           /login/link?t=<token>, the SPA confirm screen (see link/confirm below). An account linked to another identity stays a
+                                           403. Else auto-register when enabled (username from preferred_username|email local part, slugified
                                            to usernameSchema, suffixed -2, -3 on clash; password_hash '!oidc' so password login always fails); else 403 page "no account".
                                            Disabled user -> 403. Success: session cookie exactly like /auth/login, 302 to safeNext(next). Failures render a small HTML error page (no stack).
 POST /api/v1/auth/oidc/link {next?}      -> {url}: the same flow for a browser session (401 otherwise), the signed state cookie carrying userId and the session's hash;
@@ -541,6 +544,13 @@ POST /api/v1/auth/oidc/link {next?}      -> {url}: the same flow for a browser s
                                            this provider under a previous issuer URL). A POST, never a GET: a GET rides the Lax session cookie from any page that
                                            navigates there, and csrfForCookies checks posts only. GET /start ignores link=1. Layout's user menu offers it as
                                            "Link <label>" and follows the returned URL.
+GET  /api/v1/auth/oidc/link/pending?t=   -> {email, username} of the parked link's account; 400 bad_link_token when forged, expired, used, out of attempts
+                                           or without the matching scp_oidc_link cookie.
+POST /api/v1/auth/oidc/link/confirm {token, password}
+                                         -> {user, next}: the same token checks, then the login rate limits (keyed on the account's email), one attempt spent
+                                           before the scrypt, verifyLogin against that account (wrong or disabled: 401 invalid_credentials); then in one tx:
+                                           delete the row (single use), link (only if still unlinked, enabled, same hash and email; a (issuer, sub) held
+                                           elsewhere is 403), create the session (auth_method 'oidc'). Audit user.oidc_link {via: "callback-confirm"} and login.
 POST /api/v1/auth/oidc/unlink            -> 204: drops the signed-in account's (issuer, sub); 409 not_linked / no_password (an OIDC-only account would become unreachable).
                                            Audit user.oidc_unlink. Works with OIDC unconfigured (the issuer changed). Admins: PATCH /users/:id {oidcUnlink: true}
                                            (409 for a password-less account unless {password} comes along), and a password reset drops the link too; GET /users
@@ -563,8 +573,11 @@ POST /api/v1/auth/oidc/unlink            -> 204: drops the signed-in account's (
 - `oidcPublicConfig(ctx)` -> `{enabled, label}`; `GET /auth/config` already spreads it as `oidc`.
   Login page: when `config.oidc?.enabled`, a "Continue with <label>" button linking to
   `/api/v1/auth/oidc/start?next=<next>` under the password form.
-- Admin PATCH `/users/:id {password}` on an OIDC-only user is allowed (sets a password); `POST /auth/password`
-  for them requires `current` to match, which it cannot, so they use the admin reset (documented).
+- Admin PATCH `/users/:id {password}` on an OIDC-only user is allowed (sets a password). v3 (0nhr): the
+  user sets a break-glass one themselves with `POST /auth/password {next}` and no `current`, accepted only
+  while the hash is `'!oidc'` and the session is an SSO one (`sessions.auth_method = 'oidc'`, set by the
+  callback) created in the last 10 minutes; else 400 `reauth_required`. Same CAS update and session
+  ending as a normal change; audit `user.password {via: "oidc-set"}`. `/auth/me` gains `hasPassword`.
 - README: an "OIDC" section (return it in the chunk report; D0 already added the env rows).
   docker-compose already passes the variables.
 - Tests: a local `node:http` fake IdP (discovery, jwks with a generated RSA key, token endpoint

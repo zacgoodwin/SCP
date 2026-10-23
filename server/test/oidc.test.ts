@@ -1,7 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
-import { createHash, generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign, type KeyObject } from 'node:crypto';
 import { FETCH_BLOCKED_PORTS, listenLocal, makeTestCtx, type Res, type TestCtx } from './helpers.ts';
 import { OIDC_PASSWORD_HASH, clearOidcCache, endpointProblem, usernameBase, verifyIdToken } from '../src/auth/oidc.ts';
 import { verifyLogin } from '../src/auth/service.ts';
@@ -158,6 +158,27 @@ async function expectErrorPage(r: Res, status: number, text: RegExp) {
   assert.equal(sessionCookie(r), undefined);
 }
 
+/** A callback that parked the identity for password confirmation (59b0): 302 to /login/link?t=, the binding cookie, no session. */
+function pendingOf(r: Res) {
+  assert.equal(r.status, 302, r.text);
+  const loc = new URL(r.headers.get('location')!, 'http://app.test');
+  assert.equal(loc.pathname, '/login/link');
+  const token = loc.searchParams.get('t')!;
+  assert.match(token, /^[A-Za-z0-9_-]{43}$/);
+  const cookie = (r.headers.get('set-cookie') ?? '')
+    .split(/,(?=\s*\w+=)/)
+    .map((c) => c.trim())
+    .find((c) => c.startsWith('scp_oidc_link='))!;
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /Path=\/api\/v1\/auth\/oidc\/link/);
+  assert.match(cookie, /Max-Age=300/);
+  assert.equal(sessionCookie(r), undefined, 'no session before the password is proven');
+  return { token, headers: { Cookie: cookie.split(';')[0], ...xff() } };
+}
+
+const confirmLink = (t: TestCtx, pend: { token: string; headers: Record<string, string> }, password: string) =>
+  t.req('POST', '/api/v1/auth/oidc/link/confirm', { headers: pend.headers, json: { token: pend.token, password } });
+
 // node:sqlite rows have a null prototype; spread them so deepEqual compares plain objects.
 const users = (t: TestCtx) =>
   (t.db.prepare('SELECT username, email, password_hash, oidc_issuer, oidc_sub FROM users ORDER BY created_at, id').all() as any[]).map((r) => ({ ...r }));
@@ -259,9 +280,9 @@ test('a password account is never linked by email from the callback; its owner l
   await expectErrorPage(un.r, 403, /no usable email/);
   assert.equal(users(t)[0].oidc_sub, null);
 
-  // A verified email alone is not ownership of the local account (anyone may have registered it first).
+  // A verified email alone is not ownership of the local account (anyone may have registered it first): it asks for the password.
   const byEmail = await signIn(t, idp, { sub: 'carol-sub', email: 'CAROL@example.com', email_verified: true });
-  await expectErrorPage(byEmail.r, 403, /sign in with your password and link/);
+  pendingOf(byEmail.r);
   assert.equal(users(t)[0].oidc_sub, null);
   assert.equal(users(t).length, 1);
 
@@ -277,7 +298,7 @@ test('a password account is never linked by email from the callback; its owner l
   const q = new URL(navigated.headers.get('location')!).searchParams;
   idp.claims = { nonce: q.get('nonce'), sub: 'attacker-sub', email: 'carol@example.com', email_verified: true };
   const cb = await t.req('GET', `/api/v1/auth/oidc/callback?code=c&state=${q.get('state')}`, { headers: { Cookie: cookieOf(navigated) } });
-  await expectErrorPage(cb, 403, /sign in with your password and link/);
+  pendingOf(cb); // the password confirmation, which the attacker cannot pass
   assert.equal(users(t)[0].oidc_sub, null, 'nothing was linked');
   const { r } = await signIn(t, idp, { sub: 'carol-sub', email: 'other@idp.io', email_verified: true }, { link: t.session(u), next: '/keys' });
   assert.equal(r.status, 302, r.text);
@@ -312,7 +333,10 @@ test('pre-hijack: a self-registered account holding the victim email is not hand
   const reg = await t.req('POST', '/api/v1/auth/register', { json: { email: 'victim@corp.com', username: 'attacker', password: 'attacker-pw-1' } });
   assert.equal(reg.status, 201, reg.text);
   const { r } = await signIn(t, idp, { sub: 'victim-sub', email: 'victim@corp.com', email_verified: true, preferred_username: 'victim' });
-  await expectErrorPage(r, 403, /already exists/);
+  // The victim lands on the confirm screen and does not know the attacker's password: nothing links.
+  const pend = pendingOf(r);
+  const guess = await confirmLink(t, pend, 'victim-guess-1');
+  assert.equal(guess.status, 401, guess.text);
   assert.deepEqual(users(t).map((x) => [x.username, x.oidc_sub]), [['attacker', null]]);
   assert.equal((t.db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'user.oidc_link'").get() as { n: number }).n, 0);
 });
@@ -693,8 +717,9 @@ test('unlink: an admin drops a link with PATCH {oidcUnlink}, a user from the acc
   const twice = await t.req('POST', '/api/v1/auth/oidc/unlink', { headers: t.session(erin), json: {} });
   assert.equal(twice.status, 409);
   assert.equal(twice.json.error.code, 'not_linked');
-  // The identity signing in again finds a password account with that email: never linked from the callback, as documented.
-  await expectErrorPage((await signIn(t, idp, { sub: 'erin-sub', email: erin.email, email_verified: true })).r, 403, /sign in with your password and link/);
+  // The identity signing in again finds a password account with that email: never linked from the callback alone, it asks for the password.
+  pendingOf((await signIn(t, idp, { sub: 'erin-sub', email: erin.email, email_verified: true })).r);
+  assert.equal(users(t).find((u) => u.username === 'erin').oidc_sub, null);
   // An auto-registered account has no password: unlinking it would leave it unreachable.
   assert.equal((await signIn(t, idp, { sub: 'frank-sub', email: 'frank@x.io', email_verified: true })).r.status, 302);
   const frankId = (t.db.prepare('SELECT id FROM users WHERE email = ?').get('frank@x.io') as { id: string }).id;
@@ -730,4 +755,193 @@ test('start and callback share the anonymous per-IP bucket: a replayed state can
   await expectErrorPage(await t.req('GET', `/api/v1/auth/oidc/callback?code=c&state=${q.get('state')}`, { headers: { Cookie: cookieOf(s), ...ip } }), 429, /too many attempts/);
   // Another address is unaffected.
   assert.equal((await t.req('GET', '/api/v1/auth/oidc/start', { headers: { 'X-Forwarded-For': '203.0.113.78' } })).status, 302);
+});
+
+// ---------- v3: break-glass password (0nhr) ----------
+
+/** Sign a new SSO-only account in; its session cookie (with the Origin a browser sends) and its id. */
+async function ssoUser(t: TestCtx, idp: Idp, sub: string) {
+  const { r } = await signIn(t, idp, { sub, email: `${sub}@corp.io`, email_verified: true });
+  assert.equal(r.status, 302, r.text);
+  const id = (t.db.prepare('SELECT id FROM users WHERE oidc_sub = ?').get(sub) as { id: string }).id;
+  return { id, headers: { Cookie: sessionCookie(r)!.split(';')[0], Origin: 'http://app.test' } };
+}
+
+const setPassword = (t: TestCtx, headers: Record<string, string>, next = 'break-glass-1') => t.req('POST', '/api/v1/auth/password', { headers, json: { next } });
+
+test('break-glass: an SSO-only account sets a password without current from a fresh SSO session; both logins then work and other sessions end', async () => {
+  const idp = await startIdp();
+  const t = makeTestCtx(env(idp));
+  const a = await ssoUser(t, idp, 'bg-sub');
+  const other = await ssoUser(t, idp, 'bg-sub'); // a second SSO session of the same account
+  assert.equal(other.id, a.id);
+  assert.equal((await t.req('GET', '/api/v1/auth/me', { headers: a.headers })).json.hasPassword, false);
+  // Before: unlinking an account without a password is refused.
+  assert.equal((await t.req('POST', '/api/v1/auth/oidc/unlink', { headers: a.headers, json: {} })).status, 409);
+
+  const r = await setPassword(t, a.headers);
+  assert.equal(r.status, 204, r.text);
+  const detail = JSON.parse((t.db.prepare("SELECT detail FROM audit WHERE action = 'user.password' AND target_id = ?").get(a.id) as { detail: string }).detail);
+  assert.deepEqual(detail, { via: 'oidc-set' });
+  const me = await t.req('GET', '/api/v1/auth/me', { headers: a.headers });
+  assert.equal(me.status, 200, 'this session survives');
+  assert.equal(me.json.hasPassword, true);
+  assert.equal(me.json.user.oidcLinked, true, 'the SSO link stays');
+  assert.equal((await t.req('GET', '/api/v1/auth/me', { headers: other.headers })).status, 401, 'other sessions are ended');
+  // Password login works, SSO login still works.
+  const pw = await t.req('POST', '/api/v1/auth/login', { json: { login: 'bg-sub@corp.io', password: 'break-glass-1' } });
+  assert.equal(pw.status, 200, pw.text);
+  assert.equal(pw.json.user.id, a.id);
+  assert.equal((await ssoUser(t, idp, 'bg-sub')).id, a.id);
+  // Now it has a password: setting another needs current, and unlinking no longer 409s.
+  const again = await setPassword(t, a.headers, 'another-one-1');
+  assert.equal(again.status, 400, again.text);
+  assert.equal((await t.req('POST', '/api/v1/auth/login', { json: { login: 'bg-sub@corp.io', password: 'another-one-1' } })).status, 401);
+  const un = await t.req('POST', '/api/v1/auth/oidc/unlink', { headers: a.headers, json: {} });
+  assert.equal(un.status, 204, un.text);
+});
+
+test('break-glass: refused from an SSO session older than 10 minutes, a password-login session and an API key', async () => {
+  const idp = await startIdp();
+  const t = makeTestCtx(env(idp));
+  const a = await ssoUser(t, idp, 'stale-sub');
+  const hashOf = () => (t.db.prepare('SELECT password_hash FROM users WHERE id = ?').get(a.id) as { password_hash: string }).password_hash;
+  const age = (min: number) => t.db.prepare('UPDATE sessions SET created_at = ? WHERE user_id = ?').run(new Date(Date.now() - min * 60_000).toISOString(), a.id);
+  age(11);
+  const stale = await setPassword(t, a.headers);
+  assert.equal(stale.status, 400, stale.text);
+  assert.equal(stale.json.error.code, 'reauth_required');
+  assert.equal(hashOf(), OIDC_PASSWORD_HASH);
+  // A session not created by the SSO callback (here inserted directly, as a password login would) does not count, however fresh.
+  const tu = { id: a.id, username: 'stale-sub', email: 'stale-sub@corp.io', password: '', isAdmin: false };
+  assert.equal((await setPassword(t, t.session(tu))).json.error.code, 'reauth_required');
+  const viaKey = await setPassword(t, t.key(tu).headers);
+  assert.equal(viaKey.status, 403, viaKey.text);
+  assert.equal(hashOf(), OIDC_PASSWORD_HASH);
+  // Inside the window it works.
+  age(9);
+  assert.equal((await setPassword(t, a.headers)).status, 204);
+  assert.notEqual(hashOf(), OIDC_PASSWORD_HASH);
+});
+
+// ---------- v3: link to a password account after confirming its password (59b0) ----------
+
+const pendingRows = (t: TestCtx) => (t.db.prepare('SELECT COUNT(*) AS n FROM oidc_pending_links').get() as { n: number }).n;
+
+test('link confirm: a first SSO sign-in matching a password account lands on the confirm screen; the right password links and signs in; the next SSO sign-in goes straight through', async () => {
+  const idp = await startIdp();
+  const t = makeTestCtx(env(idp));
+  const u = t.createUser({ username: 'carol' });
+  const { r } = await signIn(t, idp, { sub: 'carol-sub', email: 'CAROL@example.com', email_verified: true }, { next: '/keys' });
+  const pend = pendingOf(r);
+  assert.equal(users(t)[0].oidc_sub, null);
+  // Only the token's hash is stored.
+  const stored = t.db.prepare('SELECT token_hash, user_id, sub, next FROM oidc_pending_links').get() as Record<string, string>;
+  assert.deepEqual({ ...stored }, { token_hash: createHash('sha256').update(pend.token).digest('hex'), user_id: u.id, sub: 'carol-sub', next: '/keys' });
+  const info = await t.req('GET', `/api/v1/auth/oidc/link/pending?t=${pend.token}`, { headers: pend.headers });
+  assert.equal(info.status, 200, info.text);
+  assert.deepEqual(info.json, { email: 'carol@example.com', username: 'carol' });
+
+  const ok = await confirmLink(t, pend, u.password);
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(ok.json.user.id, u.id);
+  assert.equal(ok.json.user.oidcLinked, true);
+  assert.equal(ok.json.next, '/keys');
+  assert.match(ok.headers.get('set-cookie')!, /scp_oidc_link=;/, 'the binding cookie is cleared');
+  const me = await t.req('GET', '/api/v1/auth/me', { headers: { Cookie: sessionCookie(ok)!.split(';')[0] } });
+  assert.equal(me.json.user.id, u.id);
+  const row = users(t)[0];
+  assert.equal(row.oidc_issuer, idp.issuer);
+  assert.equal(row.oidc_sub, 'carol-sub');
+  const link = t.db.prepare("SELECT detail FROM audit WHERE action = 'user.oidc_link' AND target_id = ?").get(u.id) as { detail: string };
+  assert.deepEqual(JSON.parse(link.detail), { via: 'callback-confirm' });
+  assert.equal(pendingRows(t), 0, 'single use');
+  // Reused: 400, and nothing changes.
+  const reused = await confirmLink(t, pend, u.password);
+  assert.equal(reused.status, 400, reused.text);
+  assert.equal(reused.json.error.code, 'bad_link_token');
+  // The next SSO sign-in finds the identity by (issuer, sub) and signs straight in.
+  const again = await signIn(t, idp, { sub: 'carol-sub', email: 'carol@example.com', email_verified: true });
+  assert.equal(again.r.status, 302, again.r.text);
+  assert.equal(again.r.headers.get('location'), '/items');
+  assert.ok(sessionCookie(again.r));
+  assert.equal(pendingRows(t), 0);
+});
+
+test('link confirm: a wrong password is invalid_credentials and links nothing; 5 failures kill the token', async () => {
+  const idp = await startIdp();
+  const t = makeTestCtx(env(idp));
+  const u = t.createUser({ username: 'dave' });
+  const pend = pendingOf((await signIn(t, idp, { sub: 'dave-sub', email: u.email, email_verified: true })).r);
+  for (let i = 0; i < 5; i++) {
+    const bad = await confirmLink(t, pend, `wrong-${i}`);
+    assert.equal(bad.status, 401, bad.text);
+    assert.deepEqual(bad.json, { error: { code: 'invalid_credentials', message: 'invalid login or password' } });
+    assert.equal(sessionCookie(bad), undefined);
+  }
+  const dead = await confirmLink(t, pend, u.password);
+  assert.equal(dead.status, 400, dead.text);
+  assert.equal(dead.json.error.code, 'bad_link_token');
+  assert.equal(users(t)[0].oidc_sub, null);
+  // Four misses leave the fifth attempt: the right password still links.
+  const pend2 = pendingOf((await signIn(t, idp, { sub: 'dave-sub', email: u.email, email_verified: true })).r);
+  for (let i = 0; i < 4; i++) assert.equal((await confirmLink(t, pend2, `wrong-${i}`)).status, 401);
+  assert.equal((await confirmLink(t, pend2, u.password)).status, 200);
+  assert.equal(users(t)[0].oidc_sub, 'dave-sub');
+});
+
+test('link confirm: an expired, reused, forged or other-browser token is 400 and links nothing', async () => {
+  const idp = await startIdp();
+  const t = makeTestCtx(env(idp));
+  const u = t.createUser({ username: 'erin' });
+  const pend = pendingOf((await signIn(t, idp, { sub: 'erin-sub', email: u.email, email_verified: true })).r);
+  const refused = async (r: Res) => {
+    assert.equal(r.status, 400, r.text);
+    assert.equal(r.json.error.code, 'bad_link_token');
+    assert.equal(users(t)[0].oidc_sub, null);
+  };
+  // Forged: a token the server never issued, with a matching cookie.
+  const forged = randomBytes(32).toString('base64url');
+  await refused(await confirmLink(t, { token: forged, headers: { Cookie: `scp_oidc_link=${forged}`, ...xff() } }, u.password));
+  // The URL token from another browser (no binding cookie, or another one).
+  await refused(await confirmLink(t, { token: pend.token, headers: xff() }, u.password));
+  await refused(await confirmLink(t, { token: pend.token, headers: { Cookie: `scp_oidc_link=${forged}`, ...xff() } }, u.password));
+  await refused(await t.req('GET', `/api/v1/auth/oidc/link/pending?t=${pend.token}`, { headers: xff() }));
+  // Expired.
+  t.db.prepare('UPDATE oidc_pending_links SET expires_at = ?').run(new Date(Date.now() - 1000).toISOString());
+  await refused(await t.req('GET', `/api/v1/auth/oidc/link/pending?t=${pend.token}`, { headers: pend.headers }));
+  await refused(await confirmLink(t, pend, u.password));
+  // An expired row is swept by the next parked sign-in; reuse after a success is refused.
+  const pend2 = pendingOf((await signIn(t, idp, { sub: 'erin-sub', email: u.email, email_verified: true })).r);
+  assert.equal(pendingRows(t), 1);
+  assert.equal((await confirmLink(t, pend2, u.password)).status, 200);
+  const reused = await confirmLink(t, pend2, u.password);
+  assert.equal(reused.status, 400, reused.text);
+  assert.equal(reused.json.error.code, 'bad_link_token');
+});
+
+test('link confirm: an unverified email never reaches it; an account linked to another identity keeps the 403; a disabled account cannot be linked', async () => {
+  const idp = await startIdp();
+  const t = makeTestCtx(env(idp));
+  const frank = t.createUser({ username: 'frank' });
+  await expectErrorPage((await signIn(t, idp, { sub: 'f1', email: frank.email, email_verified: false })).r, 403, /no usable email/);
+  await expectErrorPage((await signIn(t, idp, { sub: 'f1', email: frank.email })).r, 403, /already exists/);
+  assert.equal(pendingRows(t), 0);
+
+  t.db.prepare('UPDATE users SET oidc_issuer = ?, oidc_sub = ? WHERE id = ?').run(idp.issuer, 'frank-old', frank.id);
+  await expectErrorPage((await signIn(t, idp, { sub: 'f2', email: frank.email, email_verified: true })).r, 403, /different identity/);
+  assert.equal(pendingRows(t), 0);
+
+  const gina = t.createUser({ username: 'gina', disabled: true });
+  await expectErrorPage((await signIn(t, idp, { sub: 'g1', email: gina.email, email_verified: true })).r, 403, /disabled/);
+  assert.equal(pendingRows(t), 0);
+  // Disabled between the callback and the confirmation: the password check refuses it.
+  const hank = t.createUser({ username: 'hank' });
+  const pend = pendingOf((await signIn(t, idp, { sub: 'h1', email: hank.email, email_verified: true })).r);
+  t.db.prepare('UPDATE users SET disabled = 1 WHERE id = ?').run(hank.id);
+  const r = await confirmLink(t, pend, hank.password);
+  assert.equal(r.status, 401, r.text);
+  assert.equal(sessionCookie(r), undefined);
+  assert.equal(users(t).find((x) => x.username === 'hank').oidc_sub, null);
+  assert.equal((t.db.prepare("SELECT COUNT(*) AS n FROM audit WHERE action = 'user.oidc_link'").get() as { n: number }).n, 0);
 });
