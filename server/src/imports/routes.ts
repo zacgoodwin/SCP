@@ -9,7 +9,7 @@ import { HttpError, MB, badRequest, limitBody as limit, notFound, parseJson } fr
 import { AUTH_LIMITS, rateLimited, take } from '../lib/ratelimit.ts';
 import { KINDS, type AppEnv, type ItemRow, type ItemSource, type Principal } from '../types.ts';
 import { SHA_REF, badSource, fetchZipball, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
-import { importTree, subtree, underPath, unpack, updateTree, versionFromSource, type ImportOutcome } from './pack.ts';
+import { ARTIFACT_FROM_TREE, importTree, linkSkips, subtree, underPath, unpack, updateTree, versionFromSource, type ImportOutcome } from './pack.ts';
 
 const groupFields = {
   visibility: z.enum(['private', 'public']).optional(),
@@ -87,24 +87,28 @@ importRoutes.post('/items/import/pack', limit(35 * MB), async (c) => {
   if (!fields.success) throw badRequest('invalid fields', fields.error.issues);
   const bytes = new Uint8Array(await file.arrayBuffer());
   const name = baseOf(file.name) || 'pack.zip';
-  const { files, top } = unpack(bytes);
+  const { files, top, links } = unpack(bytes);
   const rootName = top ?? name.replace(/\.(zip|skill)$/i, '');
   const source: ItemSource = { kind: 'zip', repo: name, ref: null, path: null, commit: sha256Hex(bytes) };
   // A stripped wrapper folder (`zip -r my-skill.zip my-skill/`) is one folder, so its SKILL.md is the whole folder's.
-  const out = importTree(c.var.ctx, p, files, { ...fields.data, source, rootName, folderRoot: top !== null, groupName: fields.data.groupName ?? rootName, note: `import zip ${name}` });
+  const out = importTree(c.var.ctx, p, files, { ...fields.data, source, rootName, folderRoot: top !== null, skipped: linkSkips(links), groupName: fields.data.groupName ?? rootName, note: `import zip ${name}` });
   return respond(c, p, out, source);
 });
 
 importRoutes.post('/items/import/github', async (c) => {
   const importer = requireImporter(c);
   const body = await parseJson(c, githubBody);
+  // Refused before GitHub is asked anything: the request can never succeed (importTree keeps the check as the backstop).
+  if (body.kind === 'artifact') throw badRequest(ARTIFACT_FROM_TREE);
   const src = parseGithubSource(body);
   limitGithub(c, importer);
   const ctx = c.var.ctx;
   // `repo` as GitHub spells it, whatever case the user typed: it identifies the items on re-import.
   const { repo, ref, sha } = await resolveCommit(ctx, importer, src.repo, src.ref);
   return withZipballSlot(async () => {
-    const tree = subtree(unpack(await fetchZipball(ctx, repo, sha), underPath(src.path)).files, src.path);
+    const { files, links } = unpack(await fetchZipball(ctx, repo, sha), underPath(src.path));
+    const pathIsFile = files.some((f) => f.path === src.path);
+    const tree = subtree(files, src.path);
     if (!tree.length) throw badSource(`'${src.path}' holds no files in ${repo}@${short(sha)}`);
     // The archive can take up to a minute to arrive; the key may have been revoked meanwhile.
     const p = reauthenticate(c);
@@ -116,6 +120,8 @@ importRoutes.post('/items/import/github', async (c) => {
       layoutDir: src.path ? rootName : undefined,
       // A /tree/<ref>/<path> or /blob/.../SKILL.md import is one folder: its SKILL.md takes the folder, as under skills/ in a whole-repository import.
       folderRoot: !!src.path,
+      pathIsFile,
+      skipped: linkSkips(subtree(links, src.path)),
       visibility: body.visibility,
       kind: body.kind,
       name: body.name,
@@ -160,13 +166,14 @@ importRoutes.post('/items/:id/source/update', async (c) => {
   // The same commit check reports as up to date: re-applying its tree would overwrite a local edit made since.
   if (sha === item.source_commit) throw upToDate();
   return withZipballSlot(async () => {
-    const tree = subtree(unpack(await fetchZipball(ctx, repo, sha), underPath(item.source_path)).files, item.source_path);
+    const { files, links } = unpack(await fetchZipball(ctx, repo, sha), underPath(item.source_path));
+    const tree = subtree(files, item.source_path);
     if (!tree.length) throw badSource(`'${item.source_path}' no longer exists in ${repo}@${short(sha)}`);
     const p = reauthenticate(c);
     const source = { ...itemSource(item)!, commit: sha };
     const r = versionFromSource(ctx, p, item, updateTree(ctx.db, item, tree), source, body.note ?? `import github ${repo}@${short(sha)} ${item.source_path ?? ''}`.trimEnd());
     if (r.op === 'unchanged') throw upToDate();
     audit(c, p, { action: 'item.version', targetType: 'item', targetId: item.id, detail: { kind: item.kind, name: item.name, seq: r.item.latest_seq, via: 'github', commit: sha } });
-    return c.json({ item: itemDetail(ctx.db, p, r.item) });
+    return c.json({ item: itemDetail(ctx.db, p, r.item), skipped: linkSkips(subtree(links, item.source_path)) });
   });
 });

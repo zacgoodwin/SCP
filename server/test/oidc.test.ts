@@ -2,7 +2,7 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { createHash, generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
-import { makeTestCtx, type Res, type TestCtx } from './helpers.ts';
+import { FETCH_BLOCKED_PORTS, listenLocal, makeTestCtx, type Res, type TestCtx } from './helpers.ts';
 import { OIDC_PASSWORD_HASH, clearOidcCache, endpointProblem, usernameBase, verifyIdToken } from '../src/auth/oidc.ts';
 import { verifyLogin } from '../src/auth/service.ts';
 
@@ -80,19 +80,17 @@ async function startIdp(alg: 'RS256' | 'ES256' = 'RS256'): Promise<Idp> {
     }
     json(404, { error: 'nope' });
   });
-  await new Promise<void>((r) => idp.server.listen(0, '127.0.0.1', r));
+  idp.issuer = `http://127.0.0.1:${await listenLocal(idp.server)}`;
   servers.push(idp.server);
-  const { port } = idp.server.address() as { port: number };
-  idp.issuer = `http://127.0.0.1:${port}`;
   return idp;
 }
 
 /** The same IdP answering on a second origin too (Google serves token and JWKS off the issuer's host). */
 async function secondOrigin(idp: Idp): Promise<string> {
   const aux = createServer(idp.server.listeners('request')[0] as Parameters<typeof createServer>[0]);
-  await new Promise<void>((r) => aux.listen(0, '127.0.0.1', r));
+  const port = await listenLocal(aux);
   servers.push(aux);
-  return `http://127.0.0.1:${(aux.address() as { port: number }).port}`;
+  return `http://127.0.0.1:${port}`;
 }
 
 function mint(idp: Idp, claims: Record<string, unknown>): string {
@@ -496,6 +494,14 @@ test('endpointProblem: public https hosts off the issuer are fine (Google), plai
   assert.equal(endpointProblem('http://127.0.0.1:9000', 'http://127.0.0.1:9001/token'), null);
   assert.equal(endpointProblem('http://127.0.0.1:9000', 'https://keys.example/jwks'), null);
   assert.ok(endpointProblem('http://127.0.0.1:9000', 'ftp://127.0.0.1:9000/token'));
+});
+
+// The fake IdPs listen through listenLocal: a raw listen(0) that drew one of these ports turned a
+// random test into a 502 "did not respond" page. This keeps the skip list honest against fetch.
+test('every port listenLocal skips is one fetch refuses', async () => {
+  for (const port of FETCH_BLOCKED_PORTS) {
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/`), (e: Error) => (e.cause as Error)?.message === 'bad port', `${port}`);
+  }
 });
 
 test('discovery: endpoints on a second origin work (Google-shaped IdP); a scheme SCP will not fetch is refused at /start', async () => {

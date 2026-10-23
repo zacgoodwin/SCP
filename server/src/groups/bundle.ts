@@ -34,7 +34,8 @@ const PATHS: Record<Target, Record<Kind, PathFn>> = {
     skill: (n) => `.claude/skills/${n}/`,
     agent: (n) => `.claude/agents/${n}.md`,
     command: (n) => `.claude/commands/${n}.md`,
-    instructions: (_n, _e, user) => (user ? '.claude/CLAUDE.md' : 'AGENTS.md'),
+    // Claude Code loads CLAUDE.md, not AGENTS.md; the stored entry file stays AGENTS.md (entryPathFor).
+    instructions: (_n, _e, user) => (user ? '.claude/CLAUDE.md' : 'CLAUDE.md'),
     design: (n, _e, user) => (user ? `.scp/design/${n}/DESIGN.md` : 'DESIGN.md'),
     prompt: (n) => `.scp/prompts/${n}.md`,
     package: (n) => `.scp/packages/${n}/`,

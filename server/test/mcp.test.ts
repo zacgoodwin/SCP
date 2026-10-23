@@ -1,11 +1,11 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { AddressInfo } from 'node:net';
+import type { Server } from 'node:http';
 import vm from 'node:vm';
-import { serve } from '@hono/node-server';
+import { createAdaptorServer } from '@hono/node-server';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { makeTestCtx, type TestCtx } from './helpers.ts';
+import { listenLocal, makeTestCtx, type TestCtx } from './helpers.ts';
 import { renderVersionHtml } from '../src/artifacts/shares.ts';
 import { createItemTx, getItemRow, resolveVersion } from '../src/items/service.ts';
 import { substitute } from '../src/mcp/server.ts';
@@ -75,9 +75,8 @@ async function fixture() {
   const restricted = t.key(alice, { groupIds: [kitId] });
   const readOnly = t.key(alice, { scopes: ['read'] });
 
-  const server = serve({ fetch: t.app.fetch, port: 0 });
-  await new Promise<void>((res) => (server.listening ? res() : server.once('listening', () => res())));
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const server = createAdaptorServer({ fetch: t.app.fetch }) as Server;
+  const base = `http://127.0.0.1:${await listenLocal(server)}`;
   return { t, alice, full, restricted, readOnly, bobKey, skill, agent, ins, design, prompt, helperAgent, helperPrompt, art, big, outside, kitId, server, base };
 }
 
@@ -253,7 +252,7 @@ test('get_skill: SKILL.md verbatim and the file list', () =>
     assert.equal(byId.structuredContent.name, 'pdf');
     const wrongKind = await call(c, 'get_skill', { id: f.agent.id });
     assert.ok(wrongKind.isError);
-    assert.match(text(wrongKind), /is a agent, not a skill; use get_md/);
+    assert.match(text(wrongKind), /is an agent, not a skill; use get_md/);
   }));
 
 test('get_skill_file: nested text path and binary base64', () =>
@@ -279,7 +278,7 @@ test('get_md: agent, instructions, design', () =>
     assert.equal(a.structuredContent.frontmatter.description, 'Reviews code for bugs.');
     const i = await call(c, 'get_md', { name: 'rules', kind: 'instructions' });
     assert.ok(text(i).includes('# Rules\nBe terse.\n'));
-    assert.equal(i.structuredContent.installPath, 'AGENTS.md');
+    assert.equal(i.structuredContent.installPath, 'CLAUDE.md');
     const d = await call(c, 'get_md', { name: 'brand' });
     assert.ok(text(d).includes('## Overview\nCalm blue.\n'));
     assert.match(text(d), /- tokens\.css \(/);
@@ -418,6 +417,9 @@ test('create_artifact adds to the group; update_artifact versions; pins win unle
     const src = await call(c, 'get_artifact', { id: s.id });
     assert.equal(src.structuredContent.version, 2);
     assert.equal(src.structuredContent.text, '# Report\n\nStill green.');
+    const notArt = await call(c, 'update_artifact', { id: f.agent.id, content: 'x' });
+    assert.ok(notArt.isError);
+    assert.match(text(notArt), /is an agent, not an artifact/);
     return s.id as string;
   });
   // Pin the member at v1: reads default to the pin, an explicit version overrides it.

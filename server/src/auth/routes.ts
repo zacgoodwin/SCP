@@ -105,6 +105,7 @@ authRoutes.post('/auth/password', async (c) => {
   if (!(await verifyPassword(body.current, u.password_hash))) throw invalidCredentials();
   const hash = await hashPassword(body.next);
   const keep = sha256Hex(getCookie(c, SESSION_COOKIE) ?? '');
+  await c.var.ctx.beforePasswordWrite?.();
   tx(db, () => {
     // Compare-and-swap: an admin reset (the account-recovery path) may have landed during the
     // awaits above, replacing the hash and ending this session. Then this change must not win.

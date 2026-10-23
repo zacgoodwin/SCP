@@ -2,7 +2,7 @@ import type { Context } from 'hono';
 import { HttpError, badRequest, notFound } from '../lib/http.ts';
 import { loadReadableItem, readFile, resolveVersion } from '../items/service.ts';
 import { installPath, loadReadableGroup, resolvedMembers, type ResolvedMember } from '../groups/service.ts';
-import { planeOf, type AppEnv, type Ctx, type GroupRow, type ItemRow, type Kind, type Principal, type VersionRow } from '../types.ts';
+import { KINDS, aKind, planeOf, type AppEnv, type Ctx, type GroupRow, type ItemRow, type Kind, type Principal, type VersionRow } from '../types.ts';
 
 /** Who is asking and what they asked for: one group (/mcp/:group) or every readable group (/mcp). */
 export interface McpScope {
@@ -91,7 +91,7 @@ export function resolveTarget(s: McpScope, a: Target, kinds: readonly Kind[], wh
     item = member.item;
   } else throw badRequest(`give 'name' or 'id'`);
   if (!kinds.includes(item.kind)) {
-    throw new HttpError(400, 'wrong_kind', `'${item.name}' is a ${item.kind}, not a ${what}; use ${toolFor(item.kind)}`);
+    throw new HttpError(400, 'wrong_kind', `'${item.name}' is ${aKind(item.kind)}, not ${(KINDS as readonly string[]).includes(what) ? aKind(what as Kind) : `an ${what}` /* item, MD document */}; use ${toolFor(item.kind)}`);
   }
   const version = a.version !== undefined ? resolveVersion(s.ctx.db, item, a.version) : (member?.version ?? resolveVersion(s.ctx.db, item));
   return { item, version, member, group: g };

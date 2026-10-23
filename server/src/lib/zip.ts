@@ -10,6 +10,7 @@ interface CdEntry {
   name: string;
   mode: number;
   isDir: boolean;
+  link: boolean;
   flags: number;
   method: number;
   crc: number;
@@ -26,6 +27,11 @@ export interface ZipLimits {
   fileBytes: number;
   totalBytes: number;
   what: string;
+}
+/** A symlink entry safeUnzip left out: its path and the target it names. */
+export interface ZipLink {
+  path: string;
+  target: string;
 }
 /** One item version (lib/tree.ts LIMITS): the single-file import. */
 export const VERSION_LIMITS: ZipLimits = { ...LIMITS, what: 'a version' };
@@ -59,8 +65,9 @@ function entryName(raw: Uint8Array, flags: number): string {
  * Read the central directory ourselves for modes, entry types, sizes, CRCs and path validation.
  * Runs before anything is inflated. With `keep`, entries it declines are skipped here, before they
  * are validated, counted or sized: a GitHub zipball of a whole repository imports one folder.
+ * With `skipLinks`, a symlink entry is kept as a link (safeUnzip reports it) instead of refusing the archive.
  */
-function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | undefined, limits: ZipLimits): CdEntry[] {
+function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | undefined, limits: ZipLimits, skipLinks: boolean): CdEntry[] {
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   let e = u8.length - 22;
   for (; e >= 0 && dv.getUint32(e, true) !== 0x06054b50; e--) if (u8.length - e > 22 + 0xffff) throw corrupt();
@@ -79,7 +86,10 @@ function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | un
     if (o + 46 + nameLen > u8.length) throw corrupt();
     const next = o + 46 + nameLen + dv.getUint16(o + 30, true) + dv.getUint16(o + 32, true);
     const raw = u8.subarray(o + 46, o + 46 + nameLen);
-    const name = entryName(raw, flags);
+    // Windows PowerShell 5.1 Compress-Archive writes '\' separators (APPNOTE 4.4.17 says '/'). Converted
+    // before every check, so '..\x' and 'C:\x' are still refused and 'a\b' beside 'a/b' is a duplicate;
+    // a literal '\' in a Unix name was refused before, so no zip that imported changes meaning.
+    const name = entryName(raw, flags).replaceAll('\\', '/');
     if (keep && !keep(name)) {
       o = next;
       continue;
@@ -87,9 +97,10 @@ function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | un
     const attr = dv.getUint32(o + 38, true);
     const mode = os === 3 ? attr >>> 16 : 0;
     const type = mode & 0o170000;
-    const isDir = name.endsWith('/') || type === 0o040000 || (attr & 0x10) !== 0;
-    if (type === 0o120000) throw badRequest(`symlinks are not allowed: '${name}'`);
-    if (type && type !== 0o100000 && type !== 0o040000) throw badRequest(`only regular files are allowed: '${name}'`);
+    const link = type === 0o120000;
+    const isDir = !link && (name.endsWith('/') || type === 0o040000 || (attr & 0x10) !== 0);
+    if (link && !skipLinks) throw badRequest(`symlinks are not allowed: '${name}'`);
+    if (type && !link && type !== 0o100000 && type !== 0o040000) throw badRequest(`only regular files are allowed: '${name}'`);
     if (!isDir) normalizePath(name);
     if (seen.has(name)) throw badRequest(`duplicate zip entry '${name}'`);
     seen.add(name);
@@ -97,6 +108,7 @@ function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | un
       name,
       mode: modeOf(mode),
       isDir,
+      link,
       flags,
       method: dv.getUint16(o + 10, true),
       crc: dv.getUint32(o + 16, true),
@@ -114,13 +126,16 @@ function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | un
  * The declared size is enforced while inflating (maxOutputLength) and the output must match it and
  * the CRC, so a lying header can neither burn CPU on a huge stream nor store a truncated file.
  * `keep(name)` picks the entries; the caps (`limits`, one version's by default) then apply to those alone (centralDirectory).
+ * Symlinks refuse the archive unless `links` is given (pack and repository imports): then each one is
+ * left out and pushed there with its target, the entry's stored bytes (capped at 255 characters),
+ * which are only reported, never resolved or followed. Links count against the caps like files.
  */
-export function safeUnzip(bytes: Uint8Array, keep?: (name: string) => boolean, limits: ZipLimits = VERSION_LIMITS): TreeFile[] {
+export function safeUnzip(bytes: Uint8Array, keep?: (name: string) => boolean, limits: ZipLimits = VERSION_LIMITS, links?: ZipLink[]): TreeFile[] {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let files = 0;
   let total = 0;
   const spans: { e: CdEntry; start: number; end: number; o: number }[] = [];
-  for (const e of centralDirectory(bytes, keep, limits)) {
+  for (const e of centralDirectory(bytes, keep, limits, !!links)) {
     if (e.isDir) continue;
     if (++files > limits.files) throw tooLarge(`${limits.what} is limited to ${limits.files} files`);
     if (e.size > limits.fileBytes) throw tooLarge(`'${e.name}' is over ${limits.fileBytes / MB} MB`);
@@ -152,6 +167,10 @@ export function safeUnzip(bytes: Uint8Array, keep?: (name: string) => boolean, l
       }
     } else throw badRequest(`'${e.name}' uses unsupported compression method ${e.method}`);
     if (data.length !== e.size || crc32(data) !== e.crc) throw corrupt(`'${e.name}' fails its size or CRC check`);
+    if (e.link) {
+      links!.push({ path: e.name, target: new TextDecoder().decode(data).slice(0, 255) });
+      continue;
+    }
     // A stored entry is a view into the whole upload, which it would keep alive, so it is copied out; an
     // inflated one is already its own memory and only needs the plain Uint8Array prototype.
     out.push({ path: e.name, bytes: e.method === 0 ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength), mode: e.mode });

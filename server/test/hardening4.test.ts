@@ -56,7 +56,8 @@ test('markdown: unclosed emphasis and strikethrough openers render in bounded ti
   for (const p of ['*a ', '_a ', '~a ', '**a ']) {
     const src = p.repeat(20_000);
     const took = ms(() => renderArtifact('markdown', src, opts));
-    assert.ok(took < 500, `${JSON.stringify(p)}: ${Math.round(took)} ms`);
+    // 3 s, not 500 ms: shared CI runners took 500-650 ms for the linear path, and the quadratic one takes ~24 s.
+    assert.ok(took < 3000, `${JSON.stringify(p)}: ${Math.round(took)} ms`);
   }
   // Behaviour kept: emphasis, strong, strikethrough; intraword underscores stay literal.
   const out = renderArtifact('markdown', '*a* **b** ~~c~~ _d_ x_y_z ***e***', opts);
@@ -173,10 +174,18 @@ test('a self password change that races an admin reset loses (401), and the rese
   const admin = t.createUser({ username: 'root', isAdmin: true });
   const victim = t.createUser({ username: 'victim' });
   // Old: the self change read the hash, awaited two scrypts, then wrote unconditionally, undoing the
-  // reset that landed in between (the admin's one scrypt finishes first).
+  // reset that landed in between. Scrypt order across the threadpool is not guaranteed, so the ctx seam
+  // pins the interleaving: self has read the hash and verified, the reset commits, then self writes.
+  let atWrite!: () => void;
+  let release!: () => void;
+  const paused = new Promise<void>((r) => (atWrite = r));
+  const gate = new Promise<void>((r) => (release = r));
+  t.ctx.beforePasswordWrite = () => (atWrite(), gate);
   const self = t.req('POST', `${API}/auth/password`, { headers: t.session(victim), json: { current: victim.password, next: 'attacker-pass' } });
+  await paused;
   const reset = await t.req('PATCH', `${API}/users/${victim.id}`, { headers: t.session(admin), json: { password: 'admin-chosen' } });
   assert.equal(reset.status, 200, reset.text);
+  release();
   const r = await self;
   assert.equal(r.status, 401, r.text);
   assert.equal((await login(t, '198.51.100.1', 'victim', 'admin-chosen')).status, 200);

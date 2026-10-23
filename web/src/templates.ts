@@ -84,7 +84,8 @@ Do the following for $ARGUMENTS:
 1. ...
 `;
 
-const INSTRUCTIONS = `# AGENTS.md
+// Not "# AGENTS.md": a claude-code bundle installs this file as CLAUDE.md, a codex one as AGENTS.md.
+const INSTRUCTIONS = `# Project instructions
 
 ## Project overview
 

@@ -36,14 +36,42 @@ test('safeUnzip skips directory entries and defaults non-unix modes to 420', () 
 });
 
 test('zip-slip names are rejected with 400', () => {
-  for (const name of ['../x', 'a/../../x', '/abs', 'C:/x', 'a\\b', 'a/./b', 'nul\u0000x']) {
+  for (const name of ['../x', 'a/../../x', '/abs', 'C:/x', 'a/./b', 'nul\u0000x', '..\\evil.md', 'C:\\evil.md', '\\abs.md', 'a\\..\\..\\x']) {
     assert.equal(status(() => safeUnzip(zipSync({ [name]: strToU8('x') }))), 400, name);
   }
 });
 
+test('backslash separators (Windows Compress-Archive) read as /: before keep, the directory check and the duplicate check', () => {
+  const zip = zipSync({ 'stax\\SKILL.md': strToU8('s'), 'stax\\scripts\\run.sh': strToU8('r'), 'stax\\docs\\': new Uint8Array() });
+  assert.deepEqual(safeUnzip(zip).map((f) => f.path).sort(), ['stax/SKILL.md', 'stax/scripts/run.sh']);
+  const seen: string[] = [];
+  safeUnzip(zip, (name) => (seen.push(name), true));
+  assert.deepEqual(seen.sort(), ['stax/SKILL.md', 'stax/docs/', 'stax/scripts/run.sh'], 'keep sees forward slashes');
+  assert.deepEqual(safeUnzip(zip, (name) => name.startsWith('stax/scripts/')).map((f) => f.path), ['stax/scripts/run.sh']);
+  const dup = zipSync({ 'a\\b.md': strToU8('1'), 'a/b.md': strToU8('2') });
+  assert.throws(() => safeUnzip(dup), { status: 400, message: "duplicate zip entry 'a/b.md'" });
+});
+
 test('symlink entries are rejected', () => {
   const zip = zipSync({ link: [strToU8('/etc/passwd'), { os: 3, attrs: (0o120777 << 16) >>> 0 }] });
-  assert.equal(status(() => safeUnzip(zip)), 400);
+  assert.throws(() => safeUnzip(zip), { status: 400, message: "symlinks are not allowed: 'link'" });
+});
+
+test('with a links list, symlinks are left out and reported with their stored target, never followed', () => {
+  const ln = (target: string) => [strToU8(target), { os: 3, attrs: (0o120777 << 16) >>> 0 }] as [Uint8Array, { os: number; attrs: number }];
+  const zip = zipSync({ 'CLAUDE.md': ln('AGENTS.md'), 'AGENTS.md': strToU8('# Rules'), '.agents/skills': ln('../.claude/skills'), up: ln('../../etc/passwd'), abs: ln('/etc/passwd'), long: ln('x'.repeat(300)) });
+  const links: { path: string; target: string }[] = [];
+  const files = safeUnzip(zip, undefined, undefined, links);
+  assert.deepEqual(files.map((f) => f.path), ['AGENTS.md']);
+  assert.deepEqual(links.slice(0, 4), [
+    { path: 'CLAUDE.md', target: 'AGENTS.md' },
+    { path: '.agents/skills', target: '../.claude/skills' },
+    { path: 'up', target: '../../etc/passwd' },
+    { path: 'abs', target: '/etc/passwd' },
+  ]);
+  assert.equal(links[4].target, 'x'.repeat(255), 'target capped for the report');
+  // The link name is still a validated path.
+  assert.equal(status(() => safeUnzip(zipSync({ '../x': ln('y') }), undefined, undefined, [])), 400);
 });
 
 test('zip bomb guard rejects a highly compressible >1 MB file before inflating', () => {

@@ -5,6 +5,20 @@ import { randomBytes } from 'node:crypto';
 
 export type Db = DatabaseSync;
 
+/**
+ * v3 (kgtx): a GitHub import whose `path` named a file stored `<file>/<name of file>` as source_path
+ * ('docs/x.md/x.md'), which no source/update finds. Such a path is cut back to the file. Only the
+ * single-file kinds of a `.md` could be stored that way (a folder import or kind override joins '');
+ * the last two segments must repeat, read with rtrim (the head up to the last '/').
+ */
+export const UNDOUBLE_SOURCE_PATHS = `UPDATE items SET source_path = d.file FROM (
+    SELECT id, substr(head, 1, length(head) - 1) AS file, substr(source_path, length(head) + 1) AS base FROM (
+      SELECT id, source_path, rtrim(source_path, replace(source_path, '/', '')) AS head FROM items
+      WHERE source_kind = 'github' AND kind IN ('agent', 'command', 'instructions', 'prompt', 'design') AND source_path LIKE '%.md/%.md'
+    )
+  ) AS d
+  WHERE items.id = d.id AND (d.file = d.base OR substr(d.file, -length(d.base) - 1) = '/' || d.base);`;
+
 // Append-only. Each entry runs once, in order, tracked by PRAGMA user_version.
 const MIGRATIONS: string[] = [
   `
@@ -246,6 +260,7 @@ const MIGRATIONS: string[] = [
   `CREATE INDEX oauth_clients_sweep ON oauth_clients(created_at) WHERE created_by IS NULL AND consented_at IS NULL;
    CREATE INDEX oauth_codes_client ON oauth_codes(client_id);
    CREATE INDEX oauth_codes_expires ON oauth_codes(expires_at);`,
+  UNDOUBLE_SOURCE_PATHS,
 ];
 
 export function openDb(path: string): Db {

@@ -370,21 +370,21 @@ test('path conflicts across the effective set: 409 on include add, installAs on 
   const c = await addInclude(t, h, 'team', 'base');
   assert.equal(c.status, 409, c.text);
   assert.equal(c.json.error.code, 'path_conflict');
-  assert.match(c.json.error.message, /'house-rules' and 'team-rules' both install to 'AGENTS.md'/);
+  assert.match(c.json.error.message, /'house-rules' and 'team-rules' both install to 'CLAUDE.md'/);
   assert.equal((t.db.prepare('SELECT COUNT(*) AS n FROM group_includes').get() as { n: number }).n, 0, 'rolled back');
-  const put = await t.req('PUT', `${API}/groups/base/members`, { headers: h, json: { members: [{ itemId: b.id, installAs: 'CLAUDE.md' }] } });
+  const put = await t.req('PUT', `${API}/groups/base/members`, { headers: h, json: { members: [{ itemId: b.id, installAs: 'TEAM.md' }] } });
   assert.equal(put.status, 200, put.text);
   const ok = await addInclude(t, h, 'team', 'base');
   assert.equal(ok.status, 201, ok.text);
-  assert.equal(ok.json.group.members.find((m: { item: { name: string } }) => m.item.name === 'team-rules').installPath, 'CLAUDE.md');
+  assert.equal(ok.json.group.members.find((m: { item: { name: string } }) => m.item.name === 'team-rules').installPath, 'TEAM.md');
   // The same clash arriving through the child later shows as a lint on the parent and blocks its bundle.
   const d = await item(t, h, { kind: 'instructions', name: 'more-rules', content: '# D\n' });
-  const viaChild = await addMember(t, h, 'base', { itemId: d.id, installAs: 'CLAUDE.md' });
+  const viaChild = await addMember(t, h, 'base', { itemId: d.id, installAs: 'TEAM.md' });
   assert.equal(viaChild.status, 409, 'base itself refuses the clash with team-rules');
   assert.equal((await t.req('DELETE', `${API}/groups/base/members/${b.id}`, { headers: h })).status, 200);
-  assert.equal((await addMember(t, h, 'base', { itemId: d.id })).status, 201, 'AGENTS.md is free inside base');
+  assert.equal((await addMember(t, h, 'base', { itemId: d.id })).status, 201, 'CLAUDE.md is free inside base');
   const man = await t.req('GET', `${API}/groups/team/manifest`, { headers: h });
-  assert.deepEqual(man.json.conflicts, [{ path: 'AGENTS.md', items: ['house-rules', 'more-rules'] }]);
+  assert.deepEqual(man.json.conflicts, [{ path: 'CLAUDE.md', items: ['house-rules', 'more-rules'] }]);
   assert.equal((await t.req('GET', `${API}/groups/team/bundle.zip`, { headers: h })).status, 409);
   // A direct member add on the parent sees the effective set too.
   const e = await item(t, h, { kind: 'prompt', name: 'e', content: 'e', visibility: 'public' });
