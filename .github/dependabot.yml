@@ -24,3 +24,8 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+    # @types/node describes the runtime, and that is pinned to Node 24 (ci.yml, release.yml, Dockerfile),
+    # so its majors move with a deliberate Node bump, not on their own.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
