@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseFrontmatter } from '../src/lib/frontmatter.ts';
-import { MAX_REQUIRES, lintVersion, parseRequires } from '../src/items/lint.ts';
+import { FRONTMATTER_ERRORS, MAX_REQUIRES, lintVersion, parseRequires } from '../src/items/lint.ts';
 import { migrate, newId, now } from '../src/db.ts';
 import { makeTestCtx } from './helpers.ts';
 import type { Kind } from '../src/types.ts';
@@ -65,6 +65,14 @@ test('skill lint codes', () => {
   assert.ok(hard.includes('warn:skill.path.hardcoded'));
   assert.ok(codes('skill', 'pdf', '﻿---\nname: pdf\ndescription: d\n---\n').includes('error:frontmatter.invalid'), 'BOM');
   assert.ok(codes('skill', 'pdf', '\n---\nname: pdf\ndescription: d\n---\n').includes('error:frontmatter.invalid'), 'blank line');
+});
+
+test('rv5z: an empty skill name is skill.name.empty, a frontmatter error; a malformed one stays skill.name.format, which is not', () => {
+  for (const blank of ['""', "''", '"  "']) assert.deepEqual(codes('skill', 'pdf', `---\nname: ${blank}\ndescription: d\n---\n`), ['error:skill.name.empty'], blank);
+  assert.ok(FRONTMATTER_ERRORS.has('skill.name.empty'));
+  const bad = codes('skill', 'pdf', '---\nname: Bad Name!\ndescription: d\n---\n');
+  assert.ok(bad.includes('error:skill.name.format') && !bad.includes('error:skill.name.empty'));
+  assert.ok(!FRONTMATTER_ERRORS.has('skill.name.format'));
 });
 
 test('agent lint codes', () => {

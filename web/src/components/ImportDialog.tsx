@@ -386,7 +386,7 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
           onChange={(e) => setUrl(e.target.value)}
         />
         <small className="muted">
-          A repo, a <code>/tree/&lt;ref&gt;/&lt;path&gt;</code> folder, or a <code>/blob/…/SKILL.md</code> file (its folder is imported). Or fill in the fields below.
+          A repo, a <code>/tree/&lt;ref&gt;/&lt;path&gt;</code> folder, or a <code>/blob/…/SKILL.md</code> file (its folder is imported; any other <code>/blob/…/x.md</code> with "all as skill" is that one file). Or fill in the fields below.
         </small>
       </label>
       <div className="form-grid">

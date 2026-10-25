@@ -16,7 +16,7 @@ import {
   ARTIFACT_FROM_TREE,
   FOLDER_KINDS,
   editSupplied,
-  fileSkillName,
+  fileRootName,
   importTree,
   linkSkips,
   packLimits,
@@ -225,12 +225,11 @@ importRoutes.post('/items/import/github', async (c) => {
     const p = reauthenticate(c);
     const source: ItemSource = { kind: 'github', repo, ref, path: src.path, commit: sha };
     const repoName = repo.split('/')[1];
-    // mas4: one .md file as a skill is named for the file, or for the repository when the file name is generic (skills.md).
-    const rootName = !src.path ? repoName : pathIsFile && body.kind === 'skill' ? fileSkillName(baseOf(src.path), repoName) : baseOf(src.path);
+    const rootName = !src.path ? repoName : pathIsFile ? fileRootName(src.path, repoName, body.kind === 'skill') : baseOf(src.path);
     const out = importTree(ctx, p, tree, {
       source,
       rootName,
-      layoutDir: src.path ? rootName : undefined,
+      layoutDir: src.path ? baseOf(src.path) : undefined,
       // A /tree/<ref>/<path> or /blob/.../SKILL.md import is one folder: its SKILL.md takes the folder, as under skills/ in a whole-repository import.
       folderRoot: !!src.path,
       pathIsFile,

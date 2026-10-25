@@ -6,7 +6,7 @@ import { addMemberTx, createGroup, getGroupRow, isMember } from '../groups/servi
 import { FRONTMATTER_ERRORS } from '../items/lint.ts';
 import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewItem, readTree, renameFrontmatter, resolveVersion, slugify, suppliedOf, versionSha, type CreateItemInput, type Lint } from '../items/service.ts';
 import { sha256Hex } from '../lib/crypto.ts';
-import { parseFrontmatter, prependFrontmatter } from '../lib/frontmatter.ts';
+import { UNCLOSED, parseFrontmatter, prependFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, MB, badRequest, notFound } from '../lib/http.ts';
 import { isJunkPath, normalizePath } from '../lib/paths.ts';
 import { stripTopFolder, treeSha256, type TreeFile } from '../lib/tree.ts';
@@ -146,10 +146,23 @@ const stem = (file: string) => file.replace(/\.(md|markdown)$/i, '');
 const isMd = (p: string) => /\.md$/i.test(p);
 /** File stems that name a convention, not a product (`skills.md`, `README.md`). */
 const GENERIC_STEMS = new Set(['skill', 'skills', 'agent', 'agents', 'readme', 'index', 'claude', 'instructions']);
-/** mas4: a skill imported from one .md file is named by its stem, or by its repository when the stem is generic (cesarferreira/stax `skills.md` -> stax). */
-export const fileSkillName = (file: string, repoName: string) => (GENERIC_STEMS.has(stem(file).toLowerCase()) ? repoName : stem(file));
 /** A skill's entry in any case; the unit re-homes it to SKILL.md the way mdKind does for a loose file. */
 const isSkillMd = (name: string) => name.toLowerCase() === 'skill.md';
+/**
+ * The name of last resort for a one-file import (a GitHub `path` naming a file): its stem, never the
+ * file name (`helper.md` is `helper`, y15q); a SKILL.md's folder (else the repository at its root); and
+ * for a skill from one other .md (mas4), the repository when the stem is generic (cesarferreira/stax `skills.md` -> stax).
+ */
+export function fileRootName(path: string, repoName: string, skill: boolean): string {
+  const file = baseOf(path);
+  if (isSkillMd(file)) return baseOf(dirOf(path)) || repoName;
+  return skill && GENERIC_STEMS.has(stem(file).toLowerCase()) ? repoName : stem(file);
+}
+/** y15q: fileRootName before v4, the file name (`go.md`, so go-md; SKILL.md, so skill-md), or for a skill the stem or repository (mas4, so a SKILL.md was the repository's). */
+function preV4RootName(path: string, repoName: string, skill: boolean): string {
+  const file = baseOf(path);
+  return !skill ? file : GENERIC_STEMS.has(stem(file).toLowerCase()) ? repoName : stem(file);
+}
 /** A skill unit's files: the root entry, in whatever case the tree spelled it, lives at SKILL.md. */
 const skillTree = (files: TreeFile[]) => files.map((f) => (isSkillMd(f.path) ? { ...f, path: 'SKILL.md' } : f));
 const NOT_AN_ITEM = 'repository documentation, not an item';
@@ -875,17 +888,28 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
   // frontmatter later gives (sourceTree pins it). The oldest wins should an earlier bug have left two.
   const takes = previewItem(input, waive)?.name;
   const bare = u.bare ?? takes;
+  // y15q: the name a one-file unit took before v4 (go-md for commands/go.md, where its name of last resort was
+  // the file name): an item under it is this unit and keeps that name, written with upstream's tree as then.
+  // ponytail: an old name that a clash also prefixed (<repo>-go-md) is not matched, so that one comes back as a new item.
+  const old = opts.pathIsFile && source.path ? preV4RootName(source.path, baseOf(source.repo ?? ''), opts.kind === 'skill') : undefined;
+  const was = (n?: string) => (n === opts.rootName ? old : n);
+  const legacy = old && previewItem({ ...input, fallbackName: was(input.fallbackName), folderName: was(input.folderName) }, waive)?.name;
+  // t1ge: an unclosed fence was named before v4 from a heading anywhere in its text, the YAML's lines
+  // included ('---\n# Project Guide\n...' was project-guide): an item under that name is this unit too.
+  // Upstream's entry: a supplied block (input.tree) goes only where there was none, so never on an unclosed one.
+  const entry = entryOf(u.kind, u.tree);
+  const headed = entry && parseFrontmatter(utf8.decode(entry.bytes)).error === UNCLOSED ? previewItem(input, waive, true)?.name : undefined;
   const own = takes
     ? (ctx.db.prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND source_path IS ? AND source_repo IS NOT NULL ORDER BY created_at, rowid').all(p.userId, u.kind, source.path) as unknown as ItemRow[])
       .find(
         (h) =>
           sameRepo(h.source_repo, source.repo) &&
-          (h.name === takes || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes)) || suppliedOf(h)?.name !== undefined),
+          (h.name === takes || h.name === legacy || h.name === headed || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes)) || suppliedOf(h)?.name !== undefined),
       )
     : undefined;
   if (own) {
     // Found under its prefix: the unit's tree names it takes (or bare), and the item keeps its own name.
-    const tree = own.name === takes ? u.tree : pinName(u.kind, u.tree, own.name);
+    const tree = own.name === takes || own.name === legacy || own.name === headed ? u.tree : pinName(u.kind, u.tree, own.name);
     // How this import carved the unit replaces the last one's: the next source/update follows the manifest as it is now.
     ctx.db.prepare('UPDATE items SET source_scope = ?, source_carve = ? WHERE id = ?').run(input.sourceScope ?? null, u.carve ? JSON.stringify(u.carve) : null, own.id);
     // The same commit (or the same zip) again, or one whose unit tree, with the stored block, is what the

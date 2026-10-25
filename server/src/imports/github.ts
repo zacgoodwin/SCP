@@ -57,10 +57,11 @@ const decode = (s: string) => {
 /**
  * `{url}` or `{repo, ref?, path?}` -> a validated source. URL forms: `https://github.com/{o}/{r}` (also
  * `www.github.com`, `http:` or no scheme at all),
- * `.../tree/{ref}/{path}` and `.../blob/{ref}/{path}/FILE.md` (the file's folder). Owner, repo and ref
- * are restricted to characters that cannot steer the API path (no `..`, `?`, `#`, `@`, `:`).
+ * `.../tree/{ref}/{path}` and `.../blob/{ref}/{path}/FILE.md` (the file's folder; with `kind: skill`
+ * the file itself when it is a .md other than SKILL.md, y15q: one .md as a skill, mas4). Owner, repo and ref are
+ * restricted to characters that cannot steer the API path (no `..`, `?`, `#`, `@`, `:`).
  */
-export function parseGithubSource(input: { url?: string; repo?: string; ref?: string; path?: string }): GithubSource {
+export function parseGithubSource(input: { url?: string; repo?: string; ref?: string; path?: string; kind?: string }): GithubSource {
   let { repo, ref, path } = input;
   if (input.url !== undefined) {
     // The shapes people paste: no scheme, www., http: (only the web URL's path is read, never fetched).
@@ -79,7 +80,9 @@ export function parseGithubSource(input: { url?: string; repo?: string; ref?: st
     if (segs.length > 2) {
       if ((segs[2] !== 'tree' && segs[2] !== 'blob') || segs.length < 4) throw badSource('URL must be a repo, /tree/<ref>/<path> or /blob/<ref>/<path>/<file> URL');
       ref = segs[3];
-      path = (segs[2] === 'blob' ? segs.slice(4, -1) : segs.slice(4)).join('/');
+      const last = segs.at(-1)!;
+      const folderOf = segs[2] === 'blob' && !(input.kind === 'skill' && /\.md$/i.test(last) && !/^skill\.md$/i.test(last));
+      path = (folderOf ? segs.slice(4, -1) : segs.slice(4)).join('/');
     }
   }
   if (!repo) throw badSource('url or repo is required');

@@ -70,7 +70,9 @@ test('password hashing is async (libuv threadpool), not a sync scrypt on the eve
   await h;
 });
 
-test('login and register are rate limited per client IP, keyed on the rightmost forwarded hop', async () => {
+test('login and register are rate limited per client IP, keyed on the rightmost forwarded hop', async (tc) => {
+  // The clock stands still: the bucket refills a token every 2 s, and 21 scrypts took 2.4 s on a slow runner.
+  tc.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const t = makeTestCtx({ SCP_TRUST_PROXY: 'true' });
   const u = t.createUser({ username: 'alice' });
   const login = (xff: string, password = 'wrong-password', who = u.username) =>
@@ -89,7 +91,9 @@ test('login and register are rate limited per client IP, keyed on the rightmost 
   assert.equal((await login('198.51.100.7', u.password)).status, 200);
 });
 
-test('login is rate limited per login name across client IPs', async () => {
+test('login is rate limited per login name across client IPs', async (tc) => {
+  // The clock stands still: the cross-IP bucket refills a token every 6 s, however long 100 scrypts take.
+  tc.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const t = makeTestCtx({ SCP_TRUST_PROXY: 'true' });
   t.createUser({ username: 'bob' });
   const login = (i: number) =>

@@ -17,10 +17,22 @@ export interface Lint {
  * (the folder name for a missing name, the first paragraph for a missing description). Any other
  * error still rejects the unit.
  */
-export const FRONTMATTER_ERRORS = new Set(['frontmatter.invalid', 'skill.description.missing', 'skill.description.len', 'agent.name.missing', 'agent.description.missing']);
+export const FRONTMATTER_ERRORS = new Set(['frontmatter.invalid', 'skill.name.empty', 'skill.description.missing', 'skill.description.len', 'agent.name.missing', 'agent.description.missing']);
 
 const SKILL_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const PORTABLE_KEYS = new Set(['name', 'description', 'license', 'allowed-tools', 'metadata', 'compatibility']);
+/**
+ * The frontmatter keys SCP knows for skills, agents, commands and output styles (docs/research/formats.md),
+ * plus SCP's own. t1ge: past a blank line, an unclosed fence's YAML continues only on one of these (items/service.ts bodyOf).
+ */
+export const FRONTMATTER_KEYS = new Set([
+  ...PORTABLE_KEYS,
+  ...['when_to_use', 'argument-hint', 'arguments', 'disable-model-invocation', 'user-invocable', 'disallowed-tools'],
+  ...['model', 'effort', 'context', 'agent', 'background', 'hooks', 'paths', 'shell'],
+  ...['tools', 'disallowedTools', 'color', 'skills', 'mcpServers', 'permissionMode', 'maxTurns', 'autoCompactWindow'],
+  ...['memory', 'omitClaudeMd', 'isolation', 'initialPrompt', 'experimental', 'keep-coding-instructions', 'force-for-plugin'],
+  ...['version', 'triggers', 'preamble-tier', 'requires', 'title', 'tags', 'globs', 'alwaysApply'],
+]);
 const MODELS = new Set(['sonnet', 'opus', 'haiku', 'fable', 'inherit']);
 const COLORS = new Set(['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'cyan']);
 // DESIGN.md body sections, fixed order; aliases share a slot.
@@ -87,8 +99,11 @@ export function lintVersion(
   }
 
   if (kind === 'skill') {
-    const fmName = str(d.name);
+    // rv5z: `name: ""` is a missing name (a frontmatter error an import may accept), not a malformed one.
+    const blank = str(d.name)?.trim() === '';
+    const fmName = blank ? undefined : str(d.name);
     const eff = fmName ?? name;
+    if (blank) add('error', 'skill.name.empty', 'frontmatter name is empty');
     if (!SKILL_NAME.test(eff) || eff.length > 64) add('error', 'skill.name.format', `skill name '${eff}' must match ^[a-z0-9]+(-[a-z0-9]+)*$ and be at most 64 chars`);
     if (fmName !== undefined && fmName !== name) add('error', 'skill.name.dir', `frontmatter name '${fmName}' must equal the item name '${name}' (its install folder)`);
     if (/anthropic|claude/.test(eff)) add('warn', 'skill.name.reserved', `skill names containing 'anthropic' or 'claude' are reserved on claude.ai and the Skills API`);
