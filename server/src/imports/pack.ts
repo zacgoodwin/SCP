@@ -8,13 +8,14 @@ import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewIt
 import { sha256Hex } from '../lib/crypto.ts';
 import { UNCLOSED, parseFrontmatter, prependFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, MB, badRequest, notFound } from '../lib/http.ts';
-import { isJunkPath, normalizePath } from '../lib/paths.ts';
+import { isJunkPath, normalizePath, pathKey } from '../lib/paths.ts';
 import { stripTopFolder, treeSha256, type TreeFile } from '../lib/tree.ts';
 import { PACK_LIMITS, safeUnzip, type ZipLimits, type ZipLink } from '../lib/zip.ts';
 import { MARKETPLACE_JSON, PLUGIN_JSON, isObject, marketplaceIgnored, parseManifest, pluginMeta, shownValue } from './manifest.ts';
 import { aKind, type Ctx, type GroupRow, type ItemRow, type ItemSource, type Kind, type Principal, type SuppliedFrontmatter } from '../types.ts';
 
 export const ARTIFACT_FROM_TREE = 'an artifact imports from a single file, not from a repository or pack';
+export const PACKAGE_DESCRIPTION = 'description applies to an item kind with one entry file (skill, agent, command, prompt, instructions or design); a package has none';
 
 /** One item-to-be inside an imported tree. */
 export interface Unit {
@@ -94,8 +95,10 @@ export interface ImportOpts {
   folderRoot?: boolean;
   /** `source.path` names a file (a GitHub `path` that is one), so it is every unit's source path, not joined to the unit's. */
   pathIsFile?: boolean;
-  /** Passed over before detection (a pack's symlinks, linkSkips): reported first in `skipped`. */
+  /** Passed over before detection (symlinks linkCopies could not copy, submodules): reported first in `skipped`. */
   skipped?: Skipped[];
+  /** jv9q: the links linkCopies copied into the tree (re-rooted with it): see linkUnits. */
+  copied?: ZipLink[];
   note: string;
   visibility?: 'private' | 'public';
   /**
@@ -196,6 +199,8 @@ const portOf = (dir: string, pluginRoot = false) => (pluginRoot ? dir : dirOf(di
 const unitPort = (u: Unit) => u.port ?? portOf(u.path);
 /** Manifest problems listed per import: a 1 MB manifest can name half a million bad paths, each one a skipped entry. */
 const MAX_MANIFEST_SKIPS = 500;
+/** jv9q: links inside copied link targets listed per import, likewise: L copies of a target holding B links would otherwise be L x B entries. */
+const MAX_HOP_SKIPS = 500;
 
 /**
  * The folders holding a plugin (bppq): each `.claude-plugin/plugin.json`'s, and every same-repository
@@ -282,7 +287,7 @@ function declaredPath(root: string, raw: unknown): { path: string } | { reason: 
  * Unzip an untrusted pack: junk dropped, one wrapper folder stripped (GitHub always adds one) unless it
  * is a layout folder. Pack caps, not a version's: each unit is held to those as it becomes an item.
  * Symlinks (`CLAUDE.md -> AGENTS.md`, `.agents/skills -> ../.claude/skills`) are left out and returned
- * in `links`, re-rooted with the files, for the import to report (linkSkips).
+ * in `links`, re-rooted with the files, for the import to copy or report (linkCopies).
  */
 export function unpack(bytes: Uint8Array, keep?: (name: string) => boolean, limits: ZipLimits = PACK_LIMITS): { files: TreeFile[]; top: string | null; links: ZipLink[] } {
   const links: ZipLink[] = [];
@@ -299,20 +304,178 @@ export function packLimits(ctx: Ctx): ZipLimits {
   return { ...PACK_LIMITS, fileBytes: bytes, totalBytes: bytes };
 }
 
-/** A pack's symlinks as skip reasons. */
-export const linkSkips = (links: ZipLink[]): Skipped[] => links.map((l) => ({ path: l.path, reason: `symlink to '${l.target}', not imported` }));
+const linkSkip = (l: ZipLink, why = ''): Skipped => ({ path: l.path, reason: `symlink to '${l.target}'${why && ` (${why})`}, not imported` });
+const ONE_HOP = 'a symlink: links are followed one hop';
+/** jv9q: a link inside a target reached through another link, listed at `path`, where its copy would sit: a second hop, never followed. */
+export const hopSkip = (l: ZipLink, path: string): Skipped => linkSkip({ path, target: l.target }, ONE_HOP);
+
+/**
+ * Where a link's stored target points, read from the link's own folder; null when it is absolute, climbs
+ * above the root, or was cut for display (`long`: its first 255 characters may name another folder).
+ */
+export function linkTarget(l: ZipLink): string | null {
+  if (l.long || l.target.startsWith('/') || l.target.includes('\\') || /^[A-Za-z]:/.test(l.target)) return null;
+  return relPath(join(dirOf(l.path), l.target));
+}
+
+/** The folders and files above `path`, outermost first, then `path` itself. */
+function* selfAndAbove(path: string) {
+  for (let i = path.indexOf('/'); i >= 0; i = path.indexOf('/', i + 1)) yield path.slice(0, i);
+  yield path;
+}
+
+/**
+ * jv9q: each link whose target is a file or folder of `files` (the whole repository or pack, never
+ * anything outside it) becomes a copy of that target at the link's path, as Claude Code copies a
+ * plugin's links when it installs it (Arize-ai/phoenix: `skills/phoenix-cli -> ../../../../.agents/skills/phoenix-cli`).
+ * One hop: only real files are copied, never other copies, so a link to a link (a cycle included) or
+ * into a linked folder stays a skip, and so does a link to a folder holding it (the tree inside itself).
+ * A target that is missing, absolute or above the root is reported as before and never read; one in
+ * or under an `unfetched` target (the download refused it) is reported with that reason. The
+ * copies together are held to `limits` (their bytes are shared with the target, not duplicated), checked
+ * before a copy is made, so a pack of thousands of links to one big folder costs one lookup per refused link.
+ * `beyond`: the links inside targets the download fetched from outside the folder. The links inside a copied
+ * target, those and the tree's own alike, are listed at its first copy at their copy paths (hopSkip), a
+ * later copy one entry counting them, so the item never silently lacks them; past MAX_HOP_SKIPS the rest
+ * are counted in one entry.
+ */
+export function linkCopies(files: TreeFile[], links: ZipLink[], limits: ZipLimits, unfetched = new Map<string, string>(), beyond: ZipLink[] = []): { files: TreeFile[]; copied: ZipLink[]; skipped: Skipped[] } {
+  if (!links.length) return { files, copied: [], skipped: [] };
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  const byDir = new Map<string, TreeFile[]>();
+  const dirBytes = new Map<string, number>();
+  for (const f of files) {
+    for (const dir of selfAndAbove(dirOf(f.path))) {
+      if (!dir) continue;
+      (byDir.get(dir) ?? byDir.set(dir, []).get(dir)!).push(f);
+      dirBytes.set(dir, (dirBytes.get(dir) ?? 0) + f.bytes.length);
+    }
+  }
+  // The links inside targets, in the tree or fetched, under every folder above them: a copy finds its own in one lookup.
+  const inner = new Map<string, ZipLink[]>();
+  for (const n of [...links, ...beyond]) for (const dir of selfAndAbove(dirOf(n.path))) if (dir) (inner.get(dir) ?? inner.set(dir, []).get(dir)!).push(n);
+  const linkAt = new Set(links.map((l) => l.path));
+  // I3-2: paths as a case-insensitive install disk sees them (pathKey), folders apart, so a copy that folds
+  // onto a file or folder of the tree (readme.md -> README.md beside README.md) is that link's skip, never a
+  // collision that refuses the whole unit later (assertNoCollisions).
+  const takenFiles = new Set<string>();
+  const takenDirs = new Set<string>();
+  const take = (path: string) => {
+    const k = pathKey(path);
+    takenFiles.add(k);
+    for (const d of selfAndAbove(dirOf(k))) if (d) takenDirs.add(d);
+  };
+  const clashes = (path: string) => {
+    const k = pathKey(path);
+    return takenFiles.has(k) || takenDirs.has(k) || [...selfAndAbove(dirOf(k))].some((d) => takenFiles.has(d));
+  };
+  for (const f of files) take(f.path);
+  const out = [...files];
+  const copied: ZipLink[] = [];
+  const skipped: Skipped[] = [];
+  let count = 0;
+  let bytes = 0;
+  // Copy paths checked: a copy that lands checks its own (count caps those), and one refused part way (a
+  // folded clash, a path too long) checks some too. ponytail: past twice the file cap the remaining links are
+  // refused unread, so crafted links that each fail on their target's last file stay linear; no real tree comes near it.
+  let checked = 0;
+  const listedAt = new Set<string>();
+  let hops = 0;
+  let unlisted = 0;
+  let overflowAt = '';
+  for (const l of links) {
+    const t = linkTarget(l);
+    const file = t ? byPath.get(t) : undefined;
+    const src = file ? [file] : t ? (byDir.get(t) ?? []) : [];
+    let why = '';
+    if (t !== null && (t === '' || l.path === t || l.path.startsWith(t + '/'))) why = 'a folder holding it';
+    else if (t !== null && [...selfAndAbove(t)].some((p) => linkAt.has(p))) why = ONE_HOP;
+    else if (!src.length) {
+      const gone = t && [...selfAndAbove(t)].find((p) => unfetched.has(p));
+      skipped.push(linkSkip(l, gone ? unfetched.get(gone) : l.long ? 'its target is longer than 255 characters' : ''));
+      continue;
+    }
+    // Held to the limits before anything is made. Unpacked and fetched trees hold no junk path, and re-rooting
+    // under a link path (never junk either) cannot make one, so a copy is its target file for file.
+    const size = file ? file.bytes.length : (dirBytes.get(t!) ?? 0);
+    if (!why && (count + src.length > limits.files || bytes + size > limits.totalBytes || checked + src.length > 2 * limits.files)) why = `its copy would pass ${limits.what}'s limits`;
+    const made: TreeFile[] = [];
+    if (!why) {
+      checked += src.length;
+      try {
+        for (const f of src) {
+          const path = file ? l.path : `${l.path}/${f.path.slice(t!.length + 1)}`;
+          normalizePath(path);
+          if (clashes(path)) throw badRequest(`'${path}' is in the tree already`);
+          made.push({ ...f, path });
+        }
+      } catch (e) {
+        why = (e as Error).message;
+      }
+    }
+    if (why) {
+      skipped.push(linkSkip(l, why));
+      continue;
+    }
+    for (const f of made) take(f.path);
+    out.push(...made);
+    copied.push(l);
+    count += made.length;
+    bytes += size;
+    const nested = file ? undefined : inner.get(t!);
+    if (!nested) continue;
+    // A target's links are listed at its first copy; each later copy says how many it lacks, in one entry.
+    if (listedAt.has(t!)) {
+      if (hops < MAX_HOP_SKIPS) {
+        hops++;
+        skipped.push({ path: l.path, reason: `${nested.length} symlink${nested.length === 1 ? '' : 's'} inside its target '${l.target}' (${ONE_HOP}), not imported; listed under its first copy` });
+      } else unlisted += nested.length;
+    } else {
+      listedAt.add(t!);
+      const room = Math.min(nested.length, MAX_HOP_SKIPS - hops);
+      for (const n of nested.slice(0, room)) skipped.push(hopSkip(n, l.path + n.path.slice(t!.length)));
+      hops += room;
+      unlisted += nested.length - room;
+    }
+    if (unlisted && !overflowAt) overflowAt = l.path;
+  }
+  if (unlisted) skipped.push({ path: overflowAt, reason: `${unlisted} more symlinks inside copied link targets (${ONE_HOP}), not imported and not listed` });
+  return { files: out, copied, skipped };
+}
+
+/**
+ * jv9q: at most this many targets elsewhere in the repository are fetched for one folder (the download
+ * reports the links to the rest naming the cap, I3-4). ponytail: a whole-repository import holds every
+ * target and copies them all, so a source/update of a folder past the cap keeps fewer copies than its
+ * import made; raise it if real plugins need more.
+ */
+export const MAX_OUTSIDE_TARGETS = 20;
+
+/**
+ * jv9q: the targets a folder's links (repository-relative) name outside the folder, for the download
+ * to fetch as well (outermost only, sorted); none for a whole repository, which holds them already. A
+ * target that is the folder or holds it is left to linkCopies to refuse.
+ */
+export function outsideTargets(links: ZipLink[], path: string | null): string[] {
+  if (path === null) return [];
+  const targets = links.map(linkTarget).filter((t): t is string => !!t && t !== path && !t.startsWith(path + '/') && !path.startsWith(t + '/'));
+  const kept = new Set<string>();
+  for (const t of [...new Set(targets)].sort()) if (![...selfAndAbove(t)].some((p) => kept.has(p))) kept.add(t);
+  return [...kept];
+}
 
 /**
  * safeUnzip predicate for a GitHub zipball: the entries at or under `path` below the one top folder
  * GitHub wraps the repository in, so the rest of a monorepo is never counted, sized or inflated.
+ * `above`: the entries at a folder above `path` too, where a link stands in for the folder (I3-1).
  */
-export function underPath(path: string | null): ((name: string) => boolean) | undefined {
+export function underPath(path: string | null, above = false): ((name: string) => boolean) | undefined {
   if (path === null) return undefined;
   return (name) => {
     const i = name.indexOf('/');
     if (i < 0) return false;
     const rest = name.slice(i + 1);
-    return rest === path || rest.startsWith(path + '/');
+    return rest === path || rest.startsWith(path + '/') || (above && !!rest && path.startsWith(rest + '/'));
   };
 }
 
@@ -770,9 +933,22 @@ export function updateTree(db: Db, item: ItemRow, tree: TreeFile[]): TreeFile[] 
   const whole = skillTree(kept);
   if (item.source_scope === 'tree') return whole;
   // A carved skill with a source path is a plugin root's (detectUnits folderUnit); one at the repository root has none.
-  const root = detectUnits(kept, item.name, { pluginFolder: item.source_scope === 'root' && !!item.source_path }).units.find((u) => u.path === '' && u.kind === 'skill');
+  // nenk: an import that kept the repository's tooling keeps it in the root skill on every update too.
+  const pluginFolder = item.source_scope === 'root' && !!item.source_path;
+  const rootOf = (includeRepoTooling: boolean) => detectUnits(kept, item.name, { pluginFolder, includeRepoTooling }).units.find((u) => u.path === '' && u.kind === 'skill');
+  const root = rootOf(!!item.source_tooling);
   if (!root || root.tree.length === kept.length) return whole;
-  if (item.source_scope === 'root') return root.tree;
+  if (item.source_scope === 'root') {
+    if (item.source_tooling) return root.tree;
+    // source_tooling is 0 on every row from before it was recorded, ones imported with the flag included.
+    // While the latest version holds a file only the tooling detection keeps, it is detected with it, so an
+    // update never drops GEMINI.md or .claude/ unreported; a re-import records the flag either way.
+    const tooled = rootOf(true);
+    const toolingOnly = new Set(tooled?.tree.map((f) => f.path));
+    for (const f of root.tree) toolingOnly.delete(f.path);
+    if (!tooled || !toolingOnly.size) return root.tree;
+    return listFiles(db, resolveVersion(db, item).id).some((f) => toolingOnly.has(f.path)) ? tooled.tree : root.tree;
+  }
   const carved = new Set(whole.map((f) => f.path));
   for (const f of root.tree) carved.delete(f.path);
   const stored = listFiles(db, resolveVersion(db, item).id);
@@ -875,7 +1051,7 @@ function entryOf(kind: Kind, tree: TreeFile[]): TreeFile | undefined {
 }
 
 /** jcfm: tree with `fields` as its entry's frontmatter, or null when upstream's entry has its own (which wins) or there is no entry. */
-function supply(kind: Kind, tree: TreeFile[], fields: SuppliedFrontmatter): TreeFile[] | null {
+export function supply(kind: Kind, tree: TreeFile[], fields: SuppliedFrontmatter): TreeFile[] | null {
   const entry = entryOf(kind, tree);
   const text = entry && prependFrontmatter(utf8.decode(entry.bytes), fields);
   return text ? tree.map((f) => (f === entry ? { ...f, bytes: new TextEncoder().encode(text) } : f)) : null;
@@ -903,6 +1079,7 @@ function unitInput(u: Unit, opts: ImportOpts): CreateItemInput & { source: ItemS
     fallbackName: u.fallbackName,
     folderName: u.folderName,
     suppliedFrontmatter: supplied ? u.supplied : undefined,
+    sourceTooling: opts.includeRepoTooling,
   };
 }
 
@@ -958,8 +1135,14 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
   if (own) {
     // Found under its prefix: the unit's tree names it takes (or bare), and the item keeps its own name.
     const tree = own.name === takes || own.name === legacy || own.name === headed ? u.tree : pinName(u.kind, u.tree, own.name);
-    // How this import carved the unit replaces the last one's: the next source/update follows the manifest as it is now.
-    ctx.db.prepare('UPDATE items SET source_scope = ?, source_carve = ? WHERE id = ?').run(input.sourceScope ?? null, u.carve ? JSON.stringify(u.carve) : null, own.id);
+    // nenk: carved otherwise than last time (the same zip or commit with includeRepoTooling toggled): the stored
+    // tree is not this carving's, so the same commit alone does not make it untouched below.
+    const carve = u.carve?.length ? JSON.stringify(u.carve) : null; // as createItemTx stores it
+    const recarved = !!own.source_tooling !== !!input.sourceTooling || own.source_carve !== carve;
+    // How this import carved the unit replaces the last one's: the next source/update follows the manifest as it is now, with or without the tooling (nenk).
+    ctx.db
+      .prepare('UPDATE items SET source_scope = ?, source_carve = ?, source_tooling = ? WHERE id = ?')
+      .run(input.sourceScope ?? null, carve, input.sourceTooling ? 1 : 0, own.id);
     // The same commit (or the same zip) again, or one whose unit tree, with the stored block, is what the
     // source last wrote: nothing changed upstream here, so a local edit made since stays the latest version.
     // The ref and commit still follow the ones named (a tag, then the branch at the same commit).
@@ -969,7 +1152,7 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
     // toggled): the stored entry still says the old `name:`, and a skill's name is its install folder, so the
     // unit's tree is written under the new name, as a different commit writes it.
     const stored = suppliedOf(own);
-    const untouched = !renamedNow && (own.source_commit === source.commit || (!!own.source_tree_sha256 && versionSha(own, sourceTree(own, tree, stored && suppliedFor(own, stored))) === own.source_tree_sha256));
+    const untouched = !renamedNow && ((!recarved && own.source_commit === source.commit) || (!!own.source_tree_sha256 && versionSha(own, sourceTree(own, tree, stored && suppliedFor(own, stored))) === own.source_tree_sha256));
     if (untouched) {
       ctx.db.prepare('UPDATE items SET source_ref = ?, source_commit = ? WHERE id = ?').run(source.ref, source.commit, own.id);
       const fm = u.supplied && suppliedFor(own, u.supplied);
@@ -1093,6 +1276,37 @@ function prefixClashes(units: Unit[], names: (string | undefined)[], opts: Impor
 }
 
 /**
+ * jv9q: detection's units and reports once the copied links took part. A unit wholly inside a copied
+ * link whose every file another unit of its kind already imports (`CLAUDE.md -> AGENTS.md`,
+ * `.agents/skills -> ../.claude/skills`) is that unit again, so it is dropped. A copied link no
+ * remaining unit holds is reported as before; what detection said about its copies (a loose .md, a
+ * folder to offer) is not, since the link's own entry says it. `unheld`: those links' paths.
+ */
+function linkUnits(units: Unit[], found: Skipped[], folders: SkippedFolder[], copied: ZipLink[]): { units: Unit[]; skipped: Skipped[]; skippedFolders: SkippedFolder[]; unheld: string[] } {
+  if (!copied.length) return { units, skipped: found, skippedFolders: folders, unheld: [] };
+  const at = new Set(copied.map((l) => l.path));
+  const inLink = (p: string) => [...selfAndAbove(p)].some((x) => at.has(x));
+  const copyKinds = new Set(units.filter((u) => inLink(u.path)).map((u) => u.kind));
+  const own = new Set<string>();
+  for (const u of units) if (copyKinds.has(u.kind) && !inLink(u.path)) for (const f of u.tree) own.add(`${u.kind}:${sha256Hex(f.bytes)}`);
+  const kept = units.filter((u) => !inLink(u.path) || !u.tree.every((f) => own.has(`${u.kind}:${sha256Hex(f.bytes)}`)));
+  // A unit holds the link it is, or sits in, or the folder unit around it took the link's copies (a skill's `scripts -> ../shared`).
+  const holds = (u: Unit, l: string) => {
+    if (u.path === l || u.path.startsWith(l + '/')) return true;
+    if (u.path && !l.startsWith(u.path + '/')) return false;
+    const rel = u.path ? l.slice(u.path.length + 1) : l;
+    return u.tree.some((f) => f.path === rel || f.path.startsWith(rel + '/'));
+  };
+  const unheld = copied.filter((l) => !kept.some((u) => holds(u, l.path)));
+  return {
+    units: kept,
+    skipped: [...unheld.map((l) => linkSkip(l)), ...found.filter((s) => !inLink(s.path))],
+    skippedFolders: folders.filter((f) => !inLink(f.path)),
+    unheld: unheld.map((l) => l.path),
+  };
+}
+
+/**
  * Import every unit of a tree, plus the group when asked (created, or `intoGroup` added to), in one transaction. A unit that fails
  * (lint, name taken by an unrelated item, install-path conflict) is rolled back on its own and
  * reported in `skipped`; only the group slug being taken fails the whole import, and, before anything
@@ -1114,14 +1328,22 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
     // A supplied name is the entry's frontmatter name too (5ef6 pinName), as a prefixed one is.
     units = [{ path: '', kind: opts.kind, tree: opts.name === undefined ? unitTree : pinName(opts.kind, unitTree, opts.name, 'name'), name: opts.name, fallbackName: opts.rootName, folderName: opts.rootName }];
   } else {
-    if (opts.kind) units = fileUnits(tree, opts.kind, opts.rootName, skipped);
+    const found: Skipped[] = [];
+    if (opts.kind) units = fileUnits(tree, opts.kind, opts.rootName, found);
     else {
       const { folderKinds, layoutDir, folderRoot, includeRepoTooling } = opts;
       const detected = detectUnits(tree, opts.rootName, { layoutDir, folderRoot, includeRepoTooling, folderKinds });
       units = detected.units;
-      skipped.push(...detected.skipped);
+      found.push(...detected.skipped);
       skippedFolders = detected.skippedFolders;
     }
+    const linked = linkUnits(units, found, skippedFolders, opts.copied ?? []);
+    units = linked.units;
+    // The links inside a copy no unit holds (linkCopies' hop entries) went with it: the link's own entry says it.
+    // ponytail: a later copy of the same target still says its links are listed under this first one.
+    const gone = (s: Skipped) => linked.unheld.some((l) => s.path.startsWith(l + '/'));
+    skipped.splice(0, skipped.length, ...skipped.filter((s) => !gone(s)), ...linked.skipped);
+    skippedFolders = linked.skippedFolders;
     if (opts.name !== undefined) {
       if (units.length !== 1) throw badRequest(`name applies to an import of exactly one item (found ${units.length})`);
       units[0] = { ...units[0], name: opts.name, tree: pinName(units[0].kind, units[0].tree, opts.name, 'name') };
@@ -1140,9 +1362,7 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   // jcfm: one description cannot fit many items.
   if (opts.description !== undefined && units.length !== 1) throw badRequest(`description applies to an import of exactly one item (found ${units.length})`);
   // A package's entry is README.md or else its first .md, which can move between source updates: no one file to supply.
-  if (opts.description !== undefined && units[0].kind === 'package') {
-    throw badRequest('description applies to an item kind with one entry file (skill, agent, command, prompt, instructions or design); a package has none');
-  }
+  if (opts.description !== undefined && units[0].kind === 'package') throw badRequest(PACKAGE_DESCRIPTION);
   const { db } = ctx;
   // A one-file import's unit is the root of its one-file tree (''): it is reported at the file's path.
   const at = (u: Unit) => (opts.pathIsFile && opts.source.path) || u.path;

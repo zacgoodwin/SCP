@@ -22,7 +22,7 @@ in parallel worktrees off `main` and restacked onto the top of lane I before shi
 | | 7k2p | In-import prefixing for agents and commands |
 | | eg9k | Multi-harness ranking also orders plugin roots: a port folder's plugin.json loses to `plugins/x/` |
 | `v4-import-tree` (I3) | jv9q | In-tree symlinks import as copies of their target (one hop, never outside the tree) |
-| | m5wy | The Trees-API fallback honours the folder's `.gitattributes` `export-ignore` |
+| | m5wy | The Trees-API fallback honours the folder's `.gitattributes` `export-ignore`, read as git reads them (quoted patterns, root macros, byte-wise wildmatch) |
 | | nenk | `includeRepoTooling` is stored on the item, re-applied on source update, offered in the Import dialog |
 | | en8v | Import dialog: kind select on the pack tab, Description on the File tab |
 | `v4-exec-kinds` (I4) | mc52 | Hooks, MCP servers and output styles become item kinds (contract below) |

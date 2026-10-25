@@ -102,6 +102,8 @@ export interface ItemRow {
   supplied_frontmatter: string | null;
   /** jcfm: 1 when the last source write found upstream's own frontmatter, so the supplied fields wait as a fallback. */
   upstream_frontmatter: number;
+  /** nenk: 1 when the import kept the repository's own tooling (includeRepoTooling, 4ky8); source updates carve the tree the same way. */
+  source_tooling: number;
   forked_from: string | null;
   created_at: string;
   updated_at: string;

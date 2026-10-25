@@ -136,7 +136,7 @@ API: `GET /admin/settings` reports `clientSecretSet: true`, `tokenSet: true`.
 POST /items/import/pack    multipart file=<.zip> [visibility] [group=<slug>] [groupName] [intoGroup=<slug>] [kind] [folderKinds=<JSON>] [includeRepoTooling=true] [onNameClash] [frontmatterErrors] [description]  -> 201 ImportResult | 409 frontmatter_errors
 POST /items/import/github  {url} | {repo, ref?, path?}  + visibility?, kind?, name?, group?, groupName?, intoGroup?, folderKinds?, includeRepoTooling?, onNameClash?, frontmatterErrors?, description?  -> 201 ImportResult | 409 frontmatter_errors
 POST /items/:id/source/check                                                                     -> {source, upToDate, latestCommit}
-POST /items/:id/source/update  {note?}                                                           -> {item, skipped}  (new version; 409 up_to_date when nothing changed; skipped: the path's symlinks)
+POST /items/:id/source/update  {note?}                                                           -> {item, skipped}  (new version; 409 up_to_date when nothing changed; skipped: the path's symlinks linkCopies could not copy)
 PUT  /items/:id/source/frontmatter  {description}                                                -> {item}  (jcfm; 404 when SCP supplied nothing; 409 frontmatter_edited)
 ImportResult = {items:[ItemDetail], group: GroupDetail | null, skipped:[{path, reason, prefixed?}], skippedFolders:[{path, count}], source: ItemSource | null}
 ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: string|null, commit: string|null}
@@ -164,6 +164,54 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   `skipped` as `symlink to '<target>', not imported` (the target is the entry's stored bytes,
   capped at 255 characters) and the rest of the tree imports, so `CLAUDE.md -> AGENTS.md` no longer
   fails a whole repository. The single-file `POST /items/import` still refuses a zip holding one.
+  v4 jv9q (`pack.ts linkCopies`, `linkUnits`, `outsideTargets`; pack route and `routes.ts download`,
+  so `source/update` too): a link whose target, read from the link's folder (`linkTarget`), is a
+  file or folder of the repository or pack becomes a copy of it at the link's path, as Claude Code
+  copies a plugin's links on install (Arize-ai/phoenix's plugin `skills/phoenix-cli ->
+  ../../../../.agents/skills/phoenix-cli`). For a folder import the targets outside the folder are
+  fetched as well, outermost only and at most 20 (one `unpack` of the zipball each, with a `keep`
+  for that path and what is left of one set of pack caps the targets share, or one `fetchFolder`
+  each on the a4q8 path, where the folder and its targets share one folder's version limits, so the
+  blob calls stay within one folder's (v4 I3-3); links found there are not followed). The links to
+  targets past the 20 are skipped with `(more than 20 link targets outside the folder)` (I3-4): a
+  whole-repository import holds every target and copies them all, so a `source/update` of such a
+  folder keeps fewer copies than its import made, and says which. A target refused on its own (413 over
+  a cap, 400 the a4q8 quota or a bad entry in it) is left out and the folder imports anyway, as it
+  did before links were followed: each link into it is skipped with `(its target is too large to
+  fetch)` or `(its target was not fetched: <why>)`. GitHub failing (429, 502) still fails the import.
+  A `source/update` whose target only the a4q8 quota refused (transient, unlike a cap) is a 429
+  instead, nothing written, when the item's latest version holds files under that link's copy: it
+  would drop them from every group serving latest. A target over a cap is written without its copy
+  and listed in the response's `skipped`, which the item page shows beside the "Updated" notice.
+  One hop: copies are made from real files only, so a link to a link (cycles included) or into a
+  linked folder is skipped (`(a symlink: links are followed one hop)`), and so is a link inside a
+  copied target, in the tree or fetched from outside a folder import's folder, listed at the path its copy would take
+  (`skills/s/refs` for `shared/s/refs` copied through `skills/s -> ../../../shared/s`) under the
+  target's first copy (not for a copy no unit holds, whose own entry says it); a later copy of the same target gets one entry counting them, and past 500
+  such entries the rest are counted in one, so links to a target full of links stay linear. So is one
+  to a folder holding it (`(a folder holding it)`); an absolute, missing or above-the-root target keeps the a51r reason
+  and is never read. A target over 255 characters is stored cut for display (`ZipLink.long`) and never
+  resolved, since its first 255 characters may name another folder: `(its target is longer than 255 characters)`. Copies are path-checked, may not land on a path the tree holds
+  (compared as a case-insensitive disk sees it, `pathKey`, files and folders alike, so
+  `readme.md -> README.md` beside `README.md` is that link's skip, never a collision that refuses
+  the unit; I3-2), and together stay within the pack caps, checked from per-folder totals before a
+  copy is made (the unpacked tree holds no junk path, so a copy is its target file for file); the
+  copy paths checked in all are held to twice the file cap, past which the remaining links are
+  skipped on the limits unread, so links that each fail on their target's last file stay linear. After detection (`linkUnits`), a unit wholly inside a
+  copied link whose every file (by content) another unit of its kind imports is an alias
+  (`CLAUDE.md -> AGENTS.md`, `.agents/skills -> ../.claude/skills`) and is dropped; a copied link
+  no remaining unit holds is reported with the a51r reason, and what detection said about its copies
+  is not. A `path` that is itself a link (a copied skill's own `source_path`) imports and updates as
+  the copy. Its target refused, nothing else is there to hold, so the answer is that refusal with the
+  link's reason (`'<path>' is a symlink to '<target>' (its target is too large to fetch), not imported`:
+  413 over a cap, 400 the quota), never `holds no files` or `no longer exists`; a `source/update` whose
+  target only the quota refused is the 429 above. So does a `path` below a link (I3-1: `plugins/kit/skills/x` copied through
+  `plugins/kit/skills -> ../../skills`, or `skills/x` through `skills -> .claude/skills`): with
+  nothing at or under the path, the link at the folder above it (the zipball keeps the entries at
+  folders above the path; `fetchFolder` returns the link its walk stops at) is followed one hop, to
+  its target joined with the rest of the path, whose files are re-rooted at the path. A link met on
+  the way to that target is not followed, and a link to a folder holding it is not either; a link
+  inside the target is listed at its re-rooted path with the one-hop reason.
   Entry names have `\` read as `/` first (Windows `Compress-Archive`, v3 31bp). Header
   `Authorization: Bearer <token>` when `github.token` is set (env `SCP_GITHUB_TOKEN` first, then the
   setting). `resolveCommit` always reads `GET /repos/{o}/{r}` and refuses `private: true` for a
@@ -182,8 +230,41 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   blobs at once (`ratelimit.ts spend`: the import was admitted by its one `take`, so this never
   refuses and may go into debt, which the user's next GitHub call waits out), and `git/blobs/{sha}`
   (raw, 8 at a time, each checked against its git object id) builds the same repository-relative
-  `TreeFile[]` the zipball gives. Mode 120000 is a link (`symlink to ...` in `skipped`, as a51r), 160000 a submodule
-  (`submodule at <7sha>, not imported`; a zipball leaves it out). No `path`: still 413.
+  `TreeFile[]` the zipball gives. Mode 120000 is a link (copied or reported as above, jv9q), 160000 a submodule
+  (`submodule at <7sha>, not imported`; a zipball leaves it out). No `path`: still 413. A zipball
+  honours `.gitattributes` `export-ignore` and the Data API does not, so (v4 m5wy) every
+  `.gitattributes` the walk and the folder listing show (each folder above the folder, and those in
+  it) is fetched, one call each, and what their `export-ignore` lines leave out of the archive is
+  dropped from the listing before the limits and the blobs: gitignore-style patterns relative to
+  their file's folder (`/x` and `a/b` anchored, a bare name at any depth, `*`/`?`/`[...]` within a
+  segment, POSIX classes such as `[[:digit:]]` inside brackets, `**` across, a trailing `/` folders
+  only), a deeper file over a shallower one and a later line over an earlier one, a folder left out
+  with everything in it; `-export-ignore` and `!export-ignore` lift it. Lines and patterns are read
+  as git's `attr.c` and `wildmatch.c` read them (review m5wy-git-parity, each case checked against
+  `git archive`): bytes, not characters (`?` is one byte of `é`; a line of 2048 bytes or more, its CR
+  and leading blanks counted, is skipped), reading stops at a NUL, a line is split on git's blanks
+  only (a BOM, which git keeps, stays part of the first pattern), a quoted pattern is C-unquoted
+  (`"sp ace.txt"`, `"\303\251.md"`; one git cannot unquote is read bare, quote and all), and a line
+  naming any invalid attribute is dropped. In brackets a `]` first (after `!` or `^`, which negate)
+  is a member and `\` escapes; an unclosed `[`, an unknown POSIX class or a trailing `\` makes the
+  pattern match nothing. `\/` separates folders like `/`. Macros (`[attr]drop export-ignore`) are
+  read from the top-level `.gitattributes` alone, as git reads them (one elsewhere is dropped), and
+  expand in every file in git's order: the deepest file's last line first, a line's last attribute
+  first, the first state an attribute takes kept (so a later `x -drop` keeps `x drop` from expanding).
+  `export-subst` is not applied. So a source
+  update that switches paths does not see a spurious new tree. The patterns are matched without
+  regular expressions (wildmatch: back to the last `*` only, `**` memoised), so no line backtracks
+  exponentially; the matching of one folder is capped at 20 million steps (413 `its .gitattributes
+  export-ignore lines take too long to apply`), a `.gitattributes` over 1 MB is a 413 before it is
+  fetched, and a line of 2048 bytes or more is skipped, as git skips it. Before the first of them is
+  fetched, one under a junk path (`node_modules/`) is dropped (it scopes only dropped files), more
+  than 50 are a 413, and their requests (one per distinct blob) are held to what GitHub says is left
+  of the quota, the same 400 as the blobs', which are then held to what is left after them. The caps
+  are the download's, its folder and its link targets together (`Spent`, review m5wy-attr-rules-oom):
+  more than 50 files, over 1 MB together (counted per file, since each is parsed, though identical ones
+  are one blob), or more than 10,000 `export-ignore` lines (refused as they are parsed, before more
+  rules are held) is a 413, a target's own refusal as for any target; one the walk to a target passes
+  again (the root's) is read, counted and parsed once.
 - Pack layout detection (zip and GitHub alike), in order, each hit becomes one item:
   `.claude-plugin/plugin.json` (plugin: `skills/*/SKILL.md`, `agents/*.md`, `commands/*.md`),
   `.claude/skills/*/SKILL.md`, `.claude/agents/*.md`, `.claude/commands/*.md`, `skills/*/SKILL.md`,
@@ -241,8 +322,15 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   folder`). With a plugin root the root `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` are skipped too (a
   Claude Code plugin ships no instructions); with only a `skills/` folder they import as before,
   since a skills repository's `AGENTS.md` may be the product. `includeRepoTooling: true` (GitHub
-  body; pack form field `includeRepoTooling=true`) restores the old detection. `updateTree` runs the
-  same detection without the flag, so an update never pulls skipped tooling into a root skill.
+  body; pack form field `includeRepoTooling=true`) restores the old detection. The choice is stored
+  on each item (v4 nenk: `items.source_tooling`, migration 17; a re-import records the new choice,
+  as it does the carve, and one that changes either writes the tree that carving gives even at the
+  same commit or zip, never op `unchanged` on the commit alone; a local edit still stays when that
+  tree is the one the source last wrote) and `updateTree` runs the same detection with it, so an update never pulls
+  skipped tooling into a root skill, and one imported with the flag keeps `GEMINI.md` and the loose
+  tooling files. A row from before migration 17 reads 0 whatever its import was given: while its latest
+  version holds a file only the tooling detection keeps, `updateTree` detects with it, so such a root
+  skill keeps its tooling until a re-import records the choice. The Import dialog's zip and GitHub tabs offer it ("Also import the repo's own tooling").
 - Which copy of a skill wins (v3 ypmn): the "any other `*/SKILL.md`" pass takes the outermost skill
   folders only (a nested one stays its parent's file) and orders them inside a non-root plugin root
   or a `.claude` folder first, then under a `skills` folder, then neutral, and last under a folder
@@ -416,7 +504,11 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   swap, so the same upstream file is still no change and a local edit survives it; while upstream
   has its own, only the fallback. A block edited by hand
   since is 409 `frontmatter_edited`, never overwritten. `ItemDetail.suppliedFrontmatter` is
-  `{name?, description}` or null.
+  `{name?, description}` or null. The single-file `POST /items/import` takes the form field
+  `description` too (v4 en8v, `items/import.ts described`): the same block on an entry without one
+  (a `.md`, or a `.zip`'s `SKILL.md`/`DESIGN.md`), a package is a 400 (one detected, not asked for,
+  says the zip has no `SKILL.md` or `DESIGN.md`; the File tab offers no Description for a package), an artifact (no frontmatter)
+  stores it as its item description; nothing is stored, as the item has no source to write again.
 - One file as a skill (v3 mas4): a GitHub `path` naming one `.md` file with `kind: skill` makes
   that file the skill's `SKILL.md` (`importTree`; `updateTree` re-homes it again on every update,
   matched by `source_path` naming that file). The name defaults to the file stem, or the

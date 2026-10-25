@@ -32,6 +32,14 @@ export interface ZipLimits {
 export interface ZipLink {
   path: string;
   target: string;
+  /** The target was over 255 characters and `target` holds the first 255, for display: never resolved (jv9q). */
+  long?: true;
+}
+const LINK_SHOWN = 255;
+/** A link from its stored bytes, the target cut for display past LINK_SHOWN and marked so (`long`). */
+export function zipLink(path: string, bytes: Uint8Array): ZipLink {
+  const target = new TextDecoder().decode(bytes);
+  return target.length > LINK_SHOWN ? { path, target: target.slice(0, LINK_SHOWN), long: true } : { path, target };
 }
 /** One item version (lib/tree.ts LIMITS): the single-file import. */
 export const VERSION_LIMITS: ZipLimits = { ...LIMITS, what: 'a version' };
@@ -128,7 +136,8 @@ function centralDirectory(u8: Uint8Array, keep: ((name: string) => boolean) | un
  * `keep(name)` picks the entries; the caps (`limits`, one version's by default) then apply to those alone (centralDirectory).
  * Symlinks refuse the archive unless `links` is given (pack and repository imports): then each one is
  * left out and pushed there with its target, the entry's stored bytes (capped at 255 characters),
- * which are only reported, never resolved or followed. Links count against the caps like files.
+ * never resolved or followed here (an import copies in-tree targets from its own files: imports/pack.ts
+ * linkCopies). Links count against the caps like files.
  */
 export function safeUnzip(bytes: Uint8Array, keep?: (name: string) => boolean, limits: ZipLimits = VERSION_LIMITS, links?: ZipLink[]): TreeFile[] {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -168,7 +177,7 @@ export function safeUnzip(bytes: Uint8Array, keep?: (name: string) => boolean, l
     } else throw badRequest(`'${e.name}' uses unsupported compression method ${e.method}`);
     if (data.length !== e.size || crc32(data) !== e.crc) throw corrupt(`'${e.name}' fails its size or CRC check`);
     if (e.link) {
-      links!.push({ path: e.name, target: new TextDecoder().decode(data).slice(0, 255) });
+      links!.push(zipLink(e.name, data));
       continue;
     }
     // A stored entry is a view into the whole upload, which it would keep alive, so it is copied out; an

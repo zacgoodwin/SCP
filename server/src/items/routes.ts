@@ -70,6 +70,13 @@ const importFields = z.object({
   kind: z.enum(KINDS).optional(),
   visibility: z.enum(['private', 'public']).optional(),
   name: z.string().optional(),
+  // en8v: as the pack and GitHub imports' (jcfm): capped at lint's description limit; blank is none.
+  description: z
+    .string()
+    .trim()
+    .max(1024)
+    .transform((s) => s || undefined)
+    .optional(),
 });
 const listQuery = z.object({
   q: z.string().max(500).optional(),
@@ -131,7 +138,7 @@ itemRoutes.post('/items/import', fileBody, async (c) => {
   const file = form.file;
   if (!(file instanceof File)) throw badRequest("multipart field 'file' is required");
   const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
-  const fields = importFields.safeParse({ kind: str(form.kind), visibility: str(form.visibility), name: str(form.name) });
+  const fields = importFields.safeParse({ kind: str(form.kind), visibility: str(form.visibility), name: str(form.name), description: str(form.description) });
   if (!fields.success) throw badRequest('invalid fields', fields.error.issues);
   const item = importUpload(ctxOf(c), p, { ...fields.data, filename: file.name, bytes: new Uint8Array(await file.arrayBuffer()) });
   itemAudit(c, 'item.create', item, { via: 'import' });

@@ -8,7 +8,7 @@ import { buildZip } from '../src/lib/zip.ts';
 import { sha256Hex } from '../src/lib/crypto.ts';
 import { HttpError } from '../src/lib/http.ts';
 import { ZIPBALL_SLOTS, parseGithubSource, withZipballSlot } from '../src/imports/github.ts';
-import { ARTIFACT_FROM_TREE, detectUnits, importTree, subtree, unpack } from '../src/imports/pack.ts';
+import { ARTIFACT_FROM_TREE, detectUnits, importTree, linkCopies, subtree, unpack } from '../src/imports/pack.ts';
 import type { GroupRow, Principal } from '../src/types.ts';
 import { UNDOUBLE_SOURCE_PATHS } from '../src/db.ts';
 import { createItemTx } from '../src/items/service.ts';
@@ -51,6 +51,8 @@ interface Repo {
   refs: Record<string, string>;
   trees: Record<string, Files>;
   private?: boolean;
+  /** Paths (and folders) the zipball leaves out, as `git archive` does for `export-ignore`: written out by hand, never derived. */
+  archiveIgnore?: string[];
 }
 
 const sha1 = (...parts: (string | Uint8Array)[]) => parts.reduce((h, p) => h.update(p), createHash('sha1')).digest('hex');
@@ -136,11 +138,13 @@ async function fakeGithub() {
         pump();
         return;
       }
-      const files = repoOf(zip[1])?.repo.trees[zip[2]];
+      const owner = repoOf(zip[1])?.repo;
+      const files = owner?.trees[zip[2]];
       if (!files) return json(404, { message: 'Not Found' });
+      const ignored = (path: string) => (owner!.archiveIgnore ?? []).some((p) => path === p || path.startsWith(p + '/'));
       // Like `git archive`: a symlink is a mode 120000 entry holding its target; a submodule is left out.
       const bytes = buildZip(
-        Object.entries(files).filter(([, text]) => text !== SUBMODULE).map(([path, text]) => ({
+        Object.entries(files).filter(([path, text]) => text !== SUBMODULE && !ignored(path)).map(([path, text]) => ({
           path: `owner-repo-${zip[2].slice(0, 7)}/${path}`,
           bytes: strToU8(text.startsWith(LINK) ? text.slice(LINK.length) : text),
           mode: text.startsWith(LINK) ? 0o120777 : path.endsWith('.sh') ? 493 : 420,
@@ -1149,7 +1153,7 @@ test('31bp: a zip from Windows Compress-Archive (backslash separators, no direct
   assert.match(dup.json.error.message, /duplicate zip entry 'a\/b\.md'/);
 });
 
-test('a51r: a pack with symlinks imports everything else; each link is listed in skipped with its target, never followed', async () => {
+test('a51r: a pack with symlinks imports everything else; each link that aliases an item or escapes is listed in skipped with its target, never followed', async () => {
   const { t, h } = setup();
   const reason = (target: string) => `symlink to '${target}', not imported`;
   const kata = await pack(t, h, 'kata.zip', { 'CLAUDE.md': link('AGENTS.md'), 'AGENTS.md': '# Rules\n', 'skills/pdf/SKILL.md': skill('pdf') });
@@ -1167,10 +1171,12 @@ test('a51r: a pack with symlinks imports everything else; each link is listed in
   assert.equal(esc.status, 201, esc.text);
   assert.deepEqual(filePaths(esc.json.items[0]), ['SKILL.md']);
   assert.deepEqual(esc.json.skipped, [{ path: 'skills/esc/passwd', reason: reason('/etc/passwd') }, { path: 'up', reason: reason('../../etc/passwd') }]);
-  // A wrapper folder is stripped from the links too.
+  // A wrapper folder is stripped from the links too. jv9q: a link to a file of the tree no other item
+  // imports is a copy of it, here inside the one skill the folder is.
   const wrapped = await pack(t, h, 'kit.zip', { 'kit/SKILL.md': skill('kit'), 'kit/CLAUDE.md': link('SKILL.md') });
   assert.equal(wrapped.status, 201, wrapped.text);
-  assert.deepEqual(wrapped.json.skipped, [{ path: 'CLAUDE.md', reason: reason('SKILL.md') }]);
+  assert.deepEqual(wrapped.json.skipped, []);
+  assert.deepEqual(filePaths(wrapped.json.items[0]), ['CLAUDE.md', 'SKILL.md']);
   // Only links (and code): the existing 400, with the links as its details.
   const only = await pack(t, h, 'only.zip', { 'CLAUDE.md': link('AGENTS.md'), 'src/a.ts': 'x' });
   assert.equal(only.status, 400, only.text);
@@ -1180,6 +1186,18 @@ test('a51r: a pack with symlinks imports everything else; each link is listed in
   const single = await importOne(t, h, 'x.zip', zipSync({ 'x/SKILL.md': strToU8(skill('x')), 'x/link': zipEntry(link('SKILL.md')) }));
   assert.equal(single.status, 400, single.text);
   assert.equal(single.json.error.message, "symlinks are not allowed: 'x/link'");
+});
+
+/** Arize-ai/phoenix at its 2026-10-23 shape (a sample): the plugin's skills are links to the repository's .agents/skills. */
+const PHOENIX = (desc: string): Files => ({
+  '.claude-plugin/marketplace.json': JSON.stringify({ name: 'phoenix', plugins: [{ name: 'arize-phoenix', source: './plugins/claude/arize-phoenix' }] }),
+  'plugins/claude/arize-phoenix/.claude-plugin/plugin.json': '{"name":"arize-phoenix"}',
+  'plugins/claude/arize-phoenix/skills/phoenix/SKILL.md': skill('phoenix', desc),
+  'plugins/claude/arize-phoenix/skills/phoenix/bin': link('../../../../../../bin'),
+  'plugins/claude/arize-phoenix/skills/phoenix-cli': link('../../../../.agents/skills/phoenix-cli'),
+  '.agents/skills/phoenix-cli/SKILL.md': skill('phoenix-cli', desc),
+  '.agents/skills/phoenix-cli/ref.md': 'ref',
+  'assets/noise.txt': noise(2),
 });
 
 test('a51r: GitHub repositories of the 2026-10-22 survey shapes import with their links skipped; a link inside a folder import too; source/update reports them', async () => {
@@ -1212,27 +1230,26 @@ test('a51r: GitHub repositories of the 2026-10-22 survey shapes import with thei
   assert.deepEqual(filePaths(ctx.json.items[0]), ['AGENTS.md'], 'stored at the instructions entry path');
   assert.deepEqual(ctx.json.skipped.slice(0, 4), ['.clinerules', '.cursorrules', 'CLAUDE.md', 'README.md'].map((path) => ({ path, reason: "symlink to 'INSTRUCTIONS.md', not imported" })));
   assert.deepEqual(ctx.json.skipped.slice(4).map((s: { path: string }) => s.path), ['.agents/registry/AGENT.md', 'SERVER_SPEC.md', 'packages/context/src/fixtures/retrieval/csharp-signals.md']);
-  // Arize-ai/phoenix: the link sits inside the plugin folder the import names. Reported relative to that folder.
-  const plugin = (desc: string): Files => ({
-    'plugins/claude/arize-phoenix/skills/phoenix/SKILL.md': skill('phoenix', desc),
-    'plugins/claude/arize-phoenix/skills/phoenix/bin': link('../../../../../bin'),
-    'plugins/claude/arize-phoenix/skills/phoenix-cli': link('../../../../cli/skill'),
-    'cli/skill/SKILL.md': skill('phoenix-cli'),
-  });
-  gh.repos['Arize-ai/phoenix'] = { default_branch: 'main', refs: { main: sha2('5a') }, trees: { [sha2('5a')]: plugin('v1'), [sha2('5b')]: plugin('v2') } };
+  // Arize-ai/phoenix (live, 2026-10-23): the plugin folder's skill is a link to .agents/skills/<name> at the
+  // repository root, outside the folder the import names. jv9q: it is copied from there, one hop; a link
+  // climbing out of the repository is still only reported, relative to that folder.
+  gh.repos['Arize-ai/phoenix'] = { default_branch: 'main', refs: { main: sha2('5a') }, trees: { [sha2('5a')]: PHOENIX('v1'), [sha2('5b')]: PHOENIX('v2') } };
   const ph = await github(t, h, { repo: 'Arize-ai/phoenix', path: 'plugins/claude/arize-phoenix' });
   assert.equal(ph.status, 201, ph.text);
-  assert.deepEqual(names(ph.json.items), ['skill:phoenix']);
-  assert.deepEqual(ph.json.skipped, [
-    { path: 'skills/phoenix/bin', reason: "symlink to '../../../../../bin', not imported" },
-    { path: 'skills/phoenix-cli', reason: "symlink to '../../../../cli/skill', not imported" },
-  ]);
+  assert.deepEqual(names(ph.json.items), ['skill:phoenix', 'skill:phoenix-cli']);
+  const cli = ph.json.items.find((i: { name: string }) => i.name === 'phoenix-cli');
+  assert.deepEqual([filePaths(cli), cli.source.path], [['SKILL.md', 'ref.md'], 'plugins/claude/arize-phoenix/skills/phoenix-cli']);
+  assert.deepEqual(ph.json.skipped, [{ path: 'skills/phoenix/bin', reason: "symlink to '../../../../../../bin', not imported" }]);
   gh.repos['Arize-ai/phoenix'].refs.main = sha2('5b');
-  const up = await t.req('POST', `${API}/items/${ph.json.items[0].id}/source/update`, { headers: h });
+  const up = await t.req('POST', `${API}/items/${ph.json.items.find((i: { name: string }) => i.name === 'phoenix').id}/source/update`, { headers: h });
   assert.equal(up.status, 200, up.text);
   assert.equal(up.json.item.description, 'v2');
   // The item's own folder (skills/phoenix): its link, not the sibling's.
-  assert.deepEqual(up.json.skipped, [{ path: 'bin', reason: "symlink to '../../../../../bin', not imported" }]);
+  assert.deepEqual(up.json.skipped, [{ path: 'bin', reason: "symlink to '../../../../../../bin', not imported" }]);
+  // The copied skill's source path is the link itself: its update follows the link again.
+  const upCli = await t.req('POST', `${API}/items/${cli.id}/source/update`, { headers: h });
+  assert.equal(upCli.status, 200, upCli.text);
+  assert.deepEqual([upCli.json.item.description, upCli.json.skipped], ['v2', []]);
 });
 
 test('xksr: GitHub import with kind artifact is refused before GitHub is contacted and costs no rate-limit take', async () => {
@@ -1458,11 +1475,13 @@ test('a4q8: a folder of a repository whose archive is over the cap imports file 
   const trees = (items: { name: string; version: { treeSha256: string } }[]) => Object.fromEntries(items.map((i) => [i.name, i.version.treeSha256]));
   assert.deepEqual(trees(r.json.items), trees(viaZip.json.items));
   assert.deepEqual(r.json.items.map((i: { source: { path: string; commit: string } }) => [i.source.path, i.source.commit]).sort(), [['skills/alpha', sha2('7b')], ['skills/beta', sha2('7b')]]);
-  // The link is reported as the zipball reports it; the submodule (which a zipball leaves out) too.
-  assert.deepEqual(r.json.skipped[0], viaZip.json.skipped[0]);
-  assert.deepEqual(r.json.skipped[0], { path: 'beta/ref', reason: "symlink to '../alpha', not imported" });
-  assert.equal(r.json.skipped[1].path, 'vendor');
-  assert.match(r.json.skipped[1].reason, /^submodule at [0-9a-f]{7}, not imported$/);
+  // The link is a copy of its target (jv9q) in both; the submodule (which a zipball leaves out) is reported.
+  const beta = r.json.items.find((i: { name: string }) => i.name === 'beta');
+  assert.deepEqual(filePaths(beta), ['SKILL.md', 'ref/SKILL.md', 'ref/scripts/run.sh']);
+  assert.deepEqual(viaZip.json.skipped, []);
+  assert.equal(r.json.skipped.length, 1);
+  assert.equal(r.json.skipped[0].path, 'vendor');
+  assert.match(r.json.skipped[0].reason, /^submodule at [0-9a-f]{7}, not imported$/);
 
   // A whole-repository import keeps the 413: there is no folder to fetch file by file.
   from = gh.requests.length;
@@ -3953,4 +3972,809 @@ test('eg9k: an agent of a port plugin root that loses its name is reported as th
   });
   assert.equal(r.status, 201, r.text);
   assert.deepEqual(r.json.skipped, [{ path: 'antigravity/x/agents/r.md', reason: 'another copy of this agent (plugins/x/agents/r.md) was imported; this one is the antigravity port' }]);
+});
+
+// ---------- v4 import tree (I3) ----------
+
+test('en8v: the File route supplies a description as the frontmatter of a file with none (a skill or agent its name too); a file with its own keeps it; a package is a 400', async () => {
+  const { t, h } = setup();
+  const one = (filename: string, body: string | Uint8Array, fields: Record<string, string>) => {
+    const fd = new FormData();
+    fd.set('file', new File([(typeof body === 'string' ? strToU8(body) : body) as Uint8Array<ArrayBuffer>], filename));
+    for (const [k, v] of Object.entries(fields)) fd.set(k, v);
+    return t.req('POST', `${API}/items/import`, { headers: h, body: fd });
+  };
+  const sk = await one('helper.md', '# Helper\n\nHelps.\n', { kind: 'skill', description: 'Helps: with things.' });
+  assert.equal(sk.status, 201, sk.text);
+  assert.deepEqual([sk.json.item.kind, sk.json.item.name, sk.json.item.description], ['skill', 'helper', 'Helps: with things.']);
+  assert.equal(await fileText(t, h, sk.json.item.id, 'SKILL.md'), '---\nname: helper\ndescription: "Helps: with things."\n---\n# Helper\n\nHelps.\n');
+  assert.equal(sk.json.item.suppliedFrontmatter, null, 'no source to re-supply it on');
+  // Without the description the same file fails the skill lint.
+  assert.equal((await one('helper2.md', '# Helper\n\nHelps.\n', { kind: 'skill' })).status, 422);
+  const pr = await one('notes.md', 'Summarize {{x}}\n', { description: 'Summarizes.' });
+  assert.equal(pr.status, 201, pr.text);
+  assert.equal(pr.json.item.kind, 'prompt');
+  assert.equal(await fileText(t, h, pr.json.item.id, 'notes.md'), '---\ndescription: Summarizes.\n---\nSummarize {{x}}\n');
+  const own = await one('reviewer.md', AGENT, { description: 'ignored' });
+  assert.equal(own.status, 201, own.text);
+  assert.equal(await fileText(t, h, own.json.item.id, 'reviewer.md'), AGENT, 'its own frontmatter wins');
+  const zip = await one('kit.zip', zipSync({ 'kit/SKILL.md': strToU8('# Kit\n') }), { description: 'A kit.' });
+  assert.equal(zip.status, 201, zip.text);
+  assert.equal(await fileText(t, h, zip.json.item.id, 'SKILL.md'), '---\nname: kit\ndescription: A kit.\n---\n# Kit\n');
+  const art = await one('page.html', '<p>hi</p>', { description: 'A page.' });
+  assert.equal(art.status, 201, art.text);
+  assert.deepEqual([art.json.item.kind, art.json.item.description], ['artifact', 'A page.']);
+  const blank = await one('blank.md', 'Hello\n', { description: '   ' });
+  assert.equal(await fileText(t, h, blank.json.item.id, 'blank.md'), 'Hello\n', 'blank is no description');
+  const before = itemCount(t);
+  const pkg = await one('manual.zip', zipSync({ 'manual/a.md': strToU8('a') }), { kind: 'package', description: 'A manual.' });
+  assert.equal(pkg.status, 400, pkg.text);
+  assert.match(pkg.json.error.message, /a package has none/);
+  // F2: a zip detected as a package (no SKILL.md or DESIGN.md) says so: the user never chose the kind.
+  const detected = await one('manual.zip', zipSync({ 'manual/a.md': strToU8('a') }), { description: 'A manual.' });
+  assert.equal(detected.status, 400, detected.text);
+  assert.match(detected.json.error.message, /^the zip has no SKILL\.md or DESIGN\.md, so it imports as a package/);
+  assert.equal((await one('long.md', 'x', { description: 'x'.repeat(1025) })).status, 400);
+  assert.equal(itemCount(t), before);
+});
+
+test('nenk: an item imported with includeRepoTooling stores it, so source/update re-carves the same tree; a re-import without it clears it', async () => {
+  const v1: Files = {
+    '.claude-plugin/plugin.json': '{"name":"solo"}',
+    'SKILL.md': skill('solo'),
+    'scripts/a.sh': 'a',
+    'GEMINI.md': '# Gemini notes\n',
+    '.gemini/skills/notes.txt': 'n',
+    'CLAUDE.md': '# Dev rules\n',
+  };
+  const v2: Files = { ...v1, 'SKILL.md': skill('solo', 'v2') };
+  const v3: Files = { ...v1, 'SKILL.md': skill('solo', 'v3') };
+  gh.repos['acme/solo-tooling'] = { default_branch: 'main', refs: { main: sha2('b1') }, trees: { [sha2('b1')]: v1, [sha2('b2')]: v2, [sha2('b3')]: v3 } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo: 'acme/solo-tooling', includeRepoTooling: true });
+  assert.equal(imp.status, 201, imp.text);
+  assert.deepEqual(names(imp.json.items), ['instructions:dev-rules', 'skill:solo']);
+  const solo = imp.json.items.find((i: { name: string }) => i.name === 'solo');
+  const carved = ['.claude-plugin/plugin.json', '.gemini/skills/notes.txt', 'GEMINI.md', 'SKILL.md', 'scripts/a.sh'];
+  assert.deepEqual(filePaths(solo).sort(), carved);
+  const flag = () => (t.db.prepare('SELECT source_tooling AS f FROM items WHERE id = ?').get(solo.id) as { f: number }).f;
+  assert.equal(flag(), 1);
+  gh.repos['acme/solo-tooling'].refs.main = sha2('b2');
+  const up = await t.req('POST', `${API}/items/${solo.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.deepEqual([up.json.item.description, filePaths(up.json.item).sort()], ['v2', carved], 'GEMINI.md and the tooling folder stay');
+  // A re-import without the flag records that, and the next update carves the tooling out as the import would.
+  const again = await github(t, h, { repo: 'acme/solo-tooling' });
+  assert.equal(again.status, 201, again.text);
+  assert.equal(flag(), 0);
+  gh.repos['acme/solo-tooling'].refs.main = sha2('b3');
+  const up3 = await t.req('POST', `${API}/items/${solo.id}/source/update`, { headers: h });
+  assert.equal(up3.status, 200, up3.text);
+  assert.deepEqual(filePaths(up3.json.item).sort(), ['.claude-plugin/plugin.json', 'SKILL.md', 'scripts/a.sh']);
+  // The pack route stores it too.
+  const p = await pack(t, h, 'solo.zip', v1, { includeRepoTooling: 'true', onNameClash: 'prefix' });
+  assert.equal(p.status, 201, p.text);
+  assert.ok(p.json.items.every((i: Out) => (t.db.prepare('SELECT source_tooling AS f FROM items WHERE id = ?').get(i.id) as { f: number }).f === 1));
+});
+
+test('nenk: the same zip re-imported with includeRepoTooling toggled writes the tree that carving gives, not unchanged', async () => {
+  const v1: Files = { '.claude-plugin/plugin.json': '{"name":"solo"}', 'SKILL.md': skill('solo'), 'GEMINI.md': '# Gemini notes\n', '.gemini/skills/notes.txt': 'n' };
+  const byName = (items: Out[], name: string) => items.find((i) => i.name === name) as Out & { version: { files: { path: string }[] } };
+  const { t, h } = setup();
+  const first = await pack(t, h, 'solo.zip', v1);
+  assert.equal(first.status, 201, first.text);
+  const solo = byName(first.json.items, 'solo');
+  assert.deepEqual(filePaths(solo).sort(), ['.claude-plugin/plugin.json', 'SKILL.md']);
+  assert.ok(first.json.skipped.some((s: { path: string }) => s.path === 'GEMINI.md'), first.text);
+  const on = await pack(t, h, 'solo.zip', v1, { includeRepoTooling: 'true' });
+  assert.equal(on.status, 201, on.text);
+  const withTooling = byName(on.json.items, 'solo');
+  assert.deepEqual([withTooling.id, withTooling.op], [solo.id, 'version']);
+  assert.deepEqual(filePaths(withTooling).sort(), ['.claude-plugin/plugin.json', '.gemini/skills/notes.txt', 'GEMINI.md', 'SKILL.md']);
+  // And back.
+  const off = await pack(t, h, 'solo.zip', v1);
+  assert.deepEqual([byName(off.json.items, 'solo').op, filePaths(byName(off.json.items, 'solo')).sort()], ['version', ['.claude-plugin/plugin.json', 'SKILL.md']]);
+  // The same carving again is unchanged.
+  assert.equal(byName((await pack(t, h, 'solo.zip', v1)).json.items, 'solo').op, 'unchanged');
+});
+
+test('m5wy: a folder fetched file by file leaves out what the .gitattributes above and inside it export-ignore, so it holds the tree the zipball does', async () => {
+  const files: Files = {
+    // Not ignored: text=auto sets another attribute.
+    '.gitattributes': '* text=auto\n/plugins/kit/evals export-ignore\n*.psd export-ignore\n.gitattributes export-ignore\n',
+    // Listed before its parent's, as in git's tree order ('-' sorts before '.'): the deeper file still wins.
+    'plugins/kit/-x/.gitattributes': 'keep.md -export-ignore\n',
+    'plugins/kit/-x/keep.md': '# kept\n',
+    'plugins/kit/-x/drop.md': '# dropped\n',
+    // Deeper files win over shallower ones, later lines over earlier; a trailing '/' matches folders only.
+    'plugins/kit/.gitattributes': '# kit\ntests/ export-ignore\ndocs/**/draft.md export-ignore\nkeep.psd -export-ignore\nnotes.md/ export-ignore\n-x/** export-ignore\n',
+    'plugins/kit/skills/a/SKILL.md': skill('a'),
+    'plugins/kit/skills/a/scripts/run.sh': 'echo a\n',
+    'plugins/kit/skills/a/art.psd': 'psd',
+    'plugins/kit/skills/a/keep.psd': 'kept',
+    'plugins/kit/skills/a/tests/t.sh': 'test',
+    'plugins/kit/skills/a/tests.md': 'not the folder',
+    'plugins/kit/skills/a/notes.md': 'a file, not a folder',
+    'plugins/kit/evals/e.md': '# eval\n',
+    'plugins/kit/docs/draft.md': '# draft\n',
+    'plugins/kit/docs/x/draft.md': '# draft\n',
+    'plugins/kit/docs/x/final.md': '# final\n',
+    'assets/noise.txt': noise(2),
+  };
+  // What `git archive` leaves out of this commit, by the rules above.
+  const archiveIgnore = [
+    '.gitattributes',
+    'plugins/kit/.gitattributes',
+    'plugins/kit/-x/.gitattributes',
+    'plugins/kit/-x/drop.md',
+    'plugins/kit/evals',
+    'plugins/kit/skills/a/art.psd',
+    'plugins/kit/skills/a/tests',
+    'plugins/kit/docs/draft.md',
+    'plugins/kit/docs/x/draft.md',
+  ];
+  gh.repos['acme/attrs'] = { default_branch: 'main', refs: { main: sha2('b4') }, trees: { [sha2('b4')]: files }, archiveIgnore };
+  const ref = setup();
+  const viaZip = await github(ref.t, ref.h, { repo: 'acme/attrs', path: 'plugins/kit' });
+  assert.equal(viaZip.status, 201, viaZip.text);
+  assert.deepEqual(filePaths(viaZip.json.items[0]), ['SKILL.md', 'keep.psd', 'notes.md', 'scripts/run.sh', 'tests.md']);
+
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  const from = gh.requests.length;
+  const r = await github(t, h, { repo: 'acme/attrs', path: 'plugins/kit' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(filePaths(r.json.items[0]), filePaths(viaZip.json.items[0]));
+  assert.equal(r.json.items[0].version.treeSha256, viaZip.json.items[0].version.treeSha256);
+  assert.deepEqual(r.json.skipped, viaZip.json.skipped, 'the loose -x/keep.md and docs/x/final.md alone are passed over, as in the zipball');
+  assert.deepEqual(r.json.skipped.map((s: { path: string }) => s.path).sort(), ['-x/keep.md', 'docs/x/final.md']);
+  assert.equal(gitCalls(from, 'trees'), 3);
+  assert.equal(gitCalls(from, 'blobs'), 3 + 7, 'the three .gitattributes once each, then the seven kept files; nothing ignored is fetched');
+});
+
+test('m5wy: a .gitattributes cannot stall the server: patterns match without exponential backtracking, the work is capped, and an oversize file is refused unfetched', async () => {
+  const name = 'a'.repeat(40);
+  const repo = (attrs: string, file = name): Repo => ({
+    default_branch: 'main',
+    refs: { main: sha2('c7') },
+    trees: { [sha2('c7')]: { '.gitattributes': attrs, 'plugins/kit/skills/s/SKILL.md': skill('s'), [`plugins/kit/skills/s/${file}`]: 'x', 'assets/noise.txt': noise(2) } },
+  });
+  // Each import from its own account: a folder fetched file by file spends that user's GitHub bucket.
+  const fallback = async (r: Repo) => {
+    gh.repos['acme/redos'] = r;
+    const { t, h } = setup();
+    await setLimits(t, { maxArchiveMb: 1 });
+    return github(t, h, { repo: 'acme/redos', path: 'plugins/kit' });
+  };
+  // Compiled to [^/]*a[^/]*a...b, this one line took minutes against the 40-character name.
+  const started = performance.now();
+  const r = await fallback(repo('*a*a*a*a*a*a*a*a*a*a*b export-ignore\n'));
+  assert.equal(r.status, 201, r.text);
+  assert.ok(performance.now() - started < 1500, `took ${Math.round(performance.now() - started)} ms`);
+  assert.deepEqual(filePaths(r.json.items[0]), ['SKILL.md', name]);
+  // Polynomial is still the repository's to size: 3000 lines that each walk a 200-character name 100 x 100 times are refused, not run.
+  const many = await fallback(repo(`*${'a'.repeat(100)}b export-ignore\n`.repeat(3000), 'a'.repeat(200)));
+  assert.equal(many.status, 413, many.text);
+  assert.match(many.json.error.message, /'plugins\/kit' is too large to fetch file by file: its \.gitattributes export-ignore lines take too long to apply/);
+  // A .gitattributes over 1 MB is refused before its download.
+  const from = gh.requests.length;
+  const big = await fallback(repo(noise(1.2)));
+  assert.equal(big.status, 413, big.text);
+  assert.match(big.json.error.message, /'\.gitattributes' is over 1 MB/);
+  assert.equal(gitCalls(from, 'blobs'), 0);
+});
+
+test('m5wy: the .gitattributes of a folder fetched file by file are capped and held to the quota before any is fetched; ones under a junk path are not fetched', async () => {
+  const attrs = (dir: string, n: number): Files => Object.fromEntries(Array.from({ length: n }, (_, i) => [`plugins/kit/${dir}/p${i}/.gitattributes`, `x${i} export-ignore\n`]));
+  const fallback = async (files: Files, remaining: number | null = null) => {
+    gh.repos['acme/attr-cap'] = { default_branch: 'main', refs: { main: sha2('c8') }, trees: { [sha2('c8')]: { 'plugins/kit/skills/s/SKILL.md': skill('s'), 'assets/noise.txt': noise(2), ...files } } };
+    const { t, h } = setup();
+    await setLimits(t, { maxArchiveMb: 1 });
+    gh.quota.remaining = remaining;
+    try {
+      return await github(t, h, { repo: 'acme/attr-cap', path: 'plugins/kit' });
+    } finally {
+      gh.quota.remaining = null;
+    }
+  };
+  let from = gh.requests.length;
+  const many = await fallback(attrs('vendor', 51));
+  assert.equal(many.status, 413, many.text);
+  assert.match(many.json.error.message, /more than 50 \.gitattributes files/);
+  assert.equal(gitCalls(from, 'blobs'), 0);
+  // Three distinct ones need three requests, and two are left: refused before the first.
+  from = gh.requests.length;
+  const short = await fallback(attrs('vendor', 3), 2);
+  assert.equal(short.status, 400, short.text);
+  assert.match(short.json.error.message, /needs 3 GitHub requests, more than the 2 anonymous ones left/);
+  assert.equal(gitCalls(from, 'blobs'), 0);
+  // Under node_modules they scope only dropped files: neither counted nor fetched.
+  from = gh.requests.length;
+  const junk = await fallback(attrs('node_modules', 60), 1);
+  assert.equal(junk.status, 201, junk.text);
+  assert.equal(gitCalls(from, 'blobs'), 1, 'SKILL.md alone');
+});
+
+test('jv9q: the phoenix plugin folder imports its linked skill through the Git Data API too, fetching the target and nothing else; a whole-repository import copies it where its tooling copy is skipped', async () => {
+  gh.repos['Arize-ai/phoenix-big'] = { default_branch: 'main', refs: { main: sha2('b5') }, trees: { [sha2('b5')]: PHOENIX('v1') } };
+  const path = 'plugins/claude/arize-phoenix';
+  const ref = setup();
+  const viaZip = await github(ref.t, ref.h, { repo: 'Arize-ai/phoenix-big', path });
+  assert.equal(viaZip.status, 201, viaZip.text);
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  const from = gh.requests.length;
+  const r = await github(t, h, { repo: 'Arize-ai/phoenix-big', path });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:phoenix', 'skill:phoenix-cli']);
+  const trees = (items: { name: string; version: { treeSha256: string } }[]) => Object.fromEntries(items.map((i) => [i.name, i.version.treeSha256]));
+  assert.deepEqual(trees(r.json.items), trees(viaZip.json.items));
+  assert.deepEqual(r.json.skipped, viaZip.json.skipped);
+  // The folder (3 listings down, 1 recursive) and the one target (.agents/skills/phoenix-cli: 3 + 1); the
+  // bin link, which climbs out of the repository, asks for nothing. Blobs: plugin.json, SKILL.md, the two
+  // links, then the target's two files.
+  assert.equal(gitCalls(from, 'trees'), 8);
+  assert.equal(gitCalls(from, 'blobs'), 6);
+
+  const t2 = setup();
+  const whole = await github(t2.t, t2.h, { repo: 'Arize-ai/phoenix-big' });
+  assert.equal(whole.status, 201, whole.text);
+  assert.deepEqual(names(whole.json.items), ['skill:phoenix', 'skill:phoenix-cli']);
+  assert.equal(whole.json.items.find((i: { name: string }) => i.name === 'phoenix-cli').source.path, `${path}/skills/phoenix-cli`);
+  assert.deepEqual(whole.json.skipped.map((s: { path: string }) => s.path), [`${path}/skills/phoenix/bin`, '.agents/skills']);
+});
+
+test('jv9q: links in a pack: a file or folder target is copied one hop; a folder holding the link, a cycle, a chain and an escape are skipped and never read; an alias of an imported item is not imported twice', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'links.zip', {
+    'skills/a/SKILL.md': skill('a'),
+    'skills/a/scripts': link('../../shared/scripts'),
+    'shared/scripts/run.sh': 'echo shared\n',
+    'skills/b/SKILL.md': skill('b'),
+    'skills/b/up': link('..'),
+    'skills/b/loop1': link('loop2'),
+    'skills/b/loop2': link('loop1'),
+    'skills/b/chain': link('../a/scripts'),
+    'skills/b/esc': link('../../../outside'),
+    'skills/b/abs': link('/etc/passwd'),
+    'skills/c': link('a'),
+  });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:a', 'skill:b']);
+  const a = r.json.items.find((i: { name: string }) => i.name === 'a');
+  assert.deepEqual(filePaths(a), ['SKILL.md', 'scripts/run.sh']);
+  assert.equal(await fileText(t, h, a.id, 'scripts/run.sh'), 'echo shared\n');
+  assert.deepEqual(filePaths(r.json.items.find((i: { name: string }) => i.name === 'b')), ['SKILL.md']);
+  const why = (target: string, reason?: string) => `symlink to '${target}'${reason ? ` (${reason})` : ''}, not imported`;
+  const hop = 'a symlink: links are followed one hop';
+  assert.deepEqual(r.json.skipped, [
+    { path: 'skills/b/up', reason: why('..', 'a folder holding it') },
+    { path: 'skills/b/loop1', reason: why('loop2', hop) },
+    { path: 'skills/b/loop2', reason: why('loop1', hop) },
+    { path: 'skills/b/chain', reason: why('../a/scripts', hop) },
+    { path: 'skills/b/esc', reason: why('../../../outside') },
+    { path: 'skills/b/abs', reason: why('/etc/passwd') },
+    // A copy of skills/a, which imports already: reported, not a second item or a name clash.
+    { path: 'skills/c', reason: why('a') },
+  ]);
+  // The copies are held to the limits they are given.
+  const small = linkCopies(tree({ 'a/x.md': 'x', 'a/y.md': 'y' }), [{ path: 'b', target: 'a' }], { files: 1, fileBytes: 10, totalBytes: 10, what: 'a pack' });
+  assert.deepEqual([small.files.length, small.copied, small.skipped], [2, [], [{ path: 'b', reason: why('a', "its copy would pass a pack's limits") }]]);
+
+  // I3-2: a copy that folds onto a file or folder of the tree as a case-insensitive disk sees it (case, NFC/NFD)
+  // is that link's skip; the skill itself imports.
+  const fold = await pack(t, h, 'fold.zip', {
+    'skills/f/SKILL.md': skill('f'),
+    'skills/f/README.md': '# Read me\n',
+    'skills/f/readme.md': link('README.md'),
+    'skills/f/docs/a.md': 'a\n',
+    'skills/f/Docs': link('docs'),
+    'skills/g/SKILL.md': skill('g'),
+  });
+  assert.equal(fold.status, 201, fold.text);
+  assert.deepEqual(names(fold.json.items), ['skill:f', 'skill:g']);
+  assert.deepEqual(filePaths(fold.json.items.find((i: { name: string }) => i.name === 'f')), ['README.md', 'SKILL.md', 'docs/a.md']);
+  assert.deepEqual(fold.json.skipped, [
+    { path: 'skills/f/readme.md', reason: why('README.md', "'skills/f/readme.md' is in the tree already") },
+    { path: 'skills/f/Docs', reason: why('docs', "'skills/f/Docs/a.md' is in the tree already") },
+  ]);
+  const PACK = { files: 100, fileBytes: 1000, totalBytes: 1000, what: 'a pack' };
+  const nfc = 'café.md';
+  const nfd = 'café.md';
+  const accents = linkCopies(tree({ [nfc]: 'x' }), [{ path: nfd, target: nfc }], PACK);
+  assert.deepEqual([accents.files.length, accents.skipped], [1, [{ path: nfd, reason: why(nfc, `'${nfd}' is in the tree already`) }]]);
+  // A file below a copied file's path, or the reverse, is a file that is also a folder.
+  assert.equal(linkCopies(tree({ 'a/b': 'x', 'A/b/c': 'y' }), [{ path: 'l', target: 'a/b' }], PACK).copied.length, 1, 'l is free');
+  assert.deepEqual(linkCopies(tree({ 'x/y': 'x', 't': 'y' }), [{ path: 'X', target: 't' }], PACK).skipped, [{ path: 'X', reason: why('t', "'X' is in the tree already") }]);
+  assert.deepEqual(linkCopies(tree({ 'x': 'x', 't/y': 'y' }), [{ path: 'X', target: 't' }], PACK).skipped, [{ path: 'X', reason: why('t', "'X/y' is in the tree already") }]);
+});
+
+test('jv9q: a link target outside the folder that cannot be fetched (over a cap, or more GitHub requests than are left) is reported at its link; the folder imports either way', async () => {
+  const why = (target: string, reason: string) => `symlink to '${target}' (${reason}), not imported`;
+  const tooLarge = 'its target is too large to fetch';
+  // Each import below is the one skill a.
+  const skillFiles = (items: { kind: string; name: string; version: { files: { path: string }[] } }[]) => {
+    assert.deepEqual(names(items), ['skill:a']);
+    return filePaths(items[0]);
+  };
+  // a4q8: 'docs' is over the version limits from its listing, 'many' needs 12 blob calls, 'ref' is one file.
+  gh.repos['acme/far-links'] = {
+    default_branch: 'main',
+    refs: { main: sha2('b6') },
+    trees: {
+      [sha2('b6')]: {
+        'plugins/p/skills/a/SKILL.md': skill('a'),
+        'plugins/p/skills/a/docs': link('../../../../docs'),
+        'plugins/p/skills/a/many': link('../../../../many'),
+        'plugins/p/skills/a/ref': link('../../../../ref'),
+        ...Object.fromEntries(Array.from({ length: 1001 }, (_, i) => [`docs/f${i}.md`, `# ${i}\n`])),
+        ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`many/m${i}.txt`, `${i}\n`])),
+        'ref/r.md': '# r\n',
+        'assets/noise.txt': noise(2),
+      },
+    },
+  };
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  const r = await github(t, h, { repo: 'acme/far-links', path: 'plugins/p' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(skillFiles(r.json.items), ['SKILL.md', ...Array.from({ length: 12 }, (_, i) => `many/m${i}.txt`).sort(), 'ref/r.md']);
+  assert.deepEqual(r.json.skipped, [{ path: 'skills/a/docs', reason: why('../../../../docs', tooLarge) }]);
+
+  const q = setup();
+  await setLimits(q.t, { maxArchiveMb: 1 });
+  gh.quota.remaining = 10;
+  try {
+    const r2 = await github(q.t, q.h, { repo: 'acme/far-links', path: 'plugins/p' });
+    assert.equal(r2.status, 201, r2.text);
+    assert.deepEqual(skillFiles(r2.json.items), ['SKILL.md', 'ref/r.md']);
+    assert.deepEqual(r2.json.skipped, [
+      { path: 'skills/a/docs', reason: why('../../../../docs', tooLarge) },
+      { path: 'skills/a/many', reason: why('../../../../many', "its target was not fetched: 'many' needs 12 GitHub requests, more than the 10 anonymous ones left this hour; set a github.token to import it") },
+    ]);
+  } finally {
+    gh.quota.remaining = null;
+  }
+
+  // The zipball: 'assets' holds a file over the 1 MB pack cap; 'x' and 'y' fit it alone, not together,
+  // since the targets share one pack's caps (so twenty of them never inflate more than one pack).
+  gh.repos['acme/far-zip'] = {
+    default_branch: 'main',
+    refs: { main: sha2('b7') },
+    trees: {
+      [sha2('b7')]: {
+        'plugins/p/skills/a/SKILL.md': skill('a'),
+        'plugins/p/skills/a/big': link('../../../../assets'),
+        'plugins/p/skills/a/x': link('../../../../x'),
+        'plugins/p/skills/a/y': link('../../../../y'),
+        'assets/noise.txt': noise(2),
+        'x/x.txt': noise(0.6),
+        'y/y.txt': noise(0.6),
+      },
+    },
+  };
+  const z = setup();
+  await setLimits(z.t, { maxPackMb: 1 });
+  const r3 = await github(z.t, z.h, { repo: 'acme/far-zip', path: 'plugins/p' });
+  assert.equal(r3.status, 201, r3.text);
+  assert.deepEqual(skillFiles(r3.json.items), ['SKILL.md', 'x/x.txt']);
+  assert.deepEqual(r3.json.skipped, [
+    { path: 'skills/a/big', reason: why('../../../../assets', tooLarge) },
+    { path: 'skills/a/y', reason: why('../../../../y', tooLarge) },
+  ]);
+});
+
+test('I3-3: on the Git Data API fallback the link targets share the folder\'s caps: the blob calls stay within one folder\'s, and the targets past them are reported at their links', async () => {
+  const why = (target: string) => `symlink to '${target}' (its target is too large to fetch), not imported`;
+  const files: Files = { 'plugins/p/skills/a/SKILL.md': skill('a'), 'assets/noise.txt': noise(2) };
+  for (let t = 0; t < 4; t++) {
+    files[`plugins/p/skills/a/t${t}`] = link(`../../../../t${t}`);
+    for (let i = 0; i < 300; i++) files[`t${t}/f${i}.txt`] = `${t}.${i}\n`;
+  }
+  gh.repos['acme/far-many'] = { default_branch: 'main', refs: { main: sha2('a5') }, trees: { [sha2('a5')]: files } };
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  const from = gh.requests.length;
+  const r = await github(t, h, { repo: 'acme/far-many', path: 'plugins/p' });
+  assert.equal(r.status, 201, r.text);
+  // The folder's 5 blobs (SKILL.md, 4 links) and 3 targets of 300 fit 1000; the fourth target does not.
+  assert.equal(gitCalls(from, 'blobs'), 905);
+  assert.deepEqual(r.json.skipped, [{ path: 'skills/a/t3', reason: why('../../../../t3') }]);
+  assert.equal(filePaths(r.json.items[0]).length, 901);
+});
+
+test('I3-1: source/update of an item copied through a link at a folder above its path follows that link one hop, through the zipball and the Git Data API', async () => {
+  const KIT = (desc: string): Files => ({
+    'plugins/kit/.claude-plugin/plugin.json': '{"name":"kit"}',
+    'plugins/kit/skills': link('../../skills'),
+    'skills/x/SKILL.md': skill('x', desc),
+    'skills/x/run.sh': `echo ${desc}\n`,
+    'skills/y/SKILL.md': skill('y'),
+    'assets/noise.txt': noise(2),
+  });
+  // The repository's own skills/ is a link to its tooling copy: a whole-repository import names the item skills/x.
+  const DOTS = (desc: string): Files => ({
+    '.claude-plugin/plugin.json': '{"name":"dots"}',
+    '.claude/skills/x/SKILL.md': skill('x', desc),
+    '.claude/skills/x/run.sh': `echo ${desc}\n`,
+    skills: link('.claude/skills'),
+    'assets/noise.txt': noise(2),
+  });
+  const cases: [string, (d: string) => Files, string | undefined, string, boolean][] = [
+    ['acme/kit-zip', KIT, 'plugins/kit', 'plugins/kit/skills/x', false],
+    ['acme/kit-api', KIT, 'plugins/kit', 'plugins/kit/skills/x', true],
+    ['acme/dots-zip', DOTS, undefined, 'skills/x', false],
+    ['acme/dots-api', DOTS, undefined, 'skills/x', true],
+  ];
+  const [v1, v2] = [sha2('a6'), sha2('a7')];
+  for (const [repo, shape, path, at, api] of cases) {
+    gh.repos[repo] = { default_branch: 'main', refs: { main: v1 }, trees: { [v1]: shape('v1'), [v2]: shape('v2') } };
+    const { t, h } = setup();
+    const r = await github(t, h, { repo, ...(path && { path }) });
+    assert.equal(r.status, 201, `${repo}: ${r.text}`);
+    const x = r.json.items.find((i: { name: string }) => i.name === 'x');
+    assert.equal(x.source.path, at, repo);
+    assert.deepEqual(filePaths(x), ['SKILL.md', 'run.sh'], repo);
+    // The update then goes file by file (the import's own calls would leave the user's GitHub bucket empty).
+    if (api) await setLimits(t, { maxArchiveMb: 1 });
+    gh.repos[repo].refs.main = v2;
+    const from = gh.requests.length;
+    const up = await t.req('POST', `${API}/items/${x.id}/source/update`, { headers: h });
+    assert.equal(up.status, 200, `${repo}: ${up.text}`);
+    assert.equal(gitCalls(from, 'trees') > 0, api, repo);
+    assert.equal(up.json.item.description, 'v2', repo);
+    assert.deepEqual(up.json.skipped, [], repo);
+    assert.equal(await fileText(t, h, x.id, 'run.sh'), 'echo v2\n', repo);
+  }
+  // A link at a folder above the path to a folder holding it is not followed: the item is gone.
+  gh.repos['acme/kit-loop'] = { default_branch: 'main', refs: { main: v1 }, trees: { [v1]: KIT('v1'), [v2]: { ...KIT('v2'), 'plugins/kit/skills': link('..') } } };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/kit-loop', path: 'plugins/kit' });
+  const x = r.json.items.find((i: { name: string }) => i.name === 'x');
+  gh.repos['acme/kit-loop'].refs.main = v2;
+  const up = await t.req('POST', `${API}/items/${x.id}/source/update`, { headers: h });
+  assert.equal(up.status, 400, up.text);
+  assert.match(up.json.error.message, /'plugins\/kit\/skills\/x' no longer exists/);
+});
+
+test('jv9q: a link inside a target fetched from outside the folder is listed at its copy path, never silently dropped, through the zipball and the Git Data API, the I3-1 hop included', async () => {
+  const shared: Files = { 'shared/s/SKILL.md': skill('s'), 'shared/s/refs': link('../refs'), 'shared/refs/a.md': '# a\n', 'assets/noise.txt': noise(2) };
+  const oneHop = (path: string) => ({ path, reason: "symlink to '../refs' (a symlink: links are followed one hop), not imported" });
+  const cases: [Files, string, string][] = [
+    // The folder's own link copies shared/s; shared/s/refs is a second hop.
+    [{ 'plugins/p/.claude-plugin/plugin.json': '{"name":"p"}', 'plugins/p/skills/s': link('../../../shared/s'), ...shared }, 'plugins/p', 'skills/s/refs'],
+    // I3-1: the path sits behind a link at a folder above it; a link in that target is the second hop.
+    [{ 'plugins/p/.claude-plugin/plugin.json': '{"name":"p"}', 'plugins/p/skills': link('../../shared'), ...shared }, 'plugins/p/skills/s', 'refs'],
+  ];
+  for (const [files, path, at] of cases) {
+    for (const api of [false, true]) {
+      gh.repos['acme/nested'] = { default_branch: 'main', refs: { main: sha2('c8') }, trees: { [sha2('c8')]: files } };
+      const { t, h } = setup();
+      if (api) await setLimits(t, { maxArchiveMb: 1 });
+      const r = await github(t, h, { repo: 'acme/nested', path });
+      assert.equal(r.status, 201, `${path} api=${api}: ${r.text}`);
+      assert.deepEqual(filePaths(r.json.items.find((i: { name: string }) => i.name === 's')), ['SKILL.md'], `${path} api=${api}`);
+      assert.deepEqual(r.json.skipped, [oneHop(at)], `${path} api=${api}`);
+    }
+  }
+});
+
+test('jv9q: a link inside an in-tree target is listed at its copy path too, never silently dropped', async () => {
+  const files: Files = {
+    'skills/a/SKILL.md': skill('a'),
+    'skills/a/refs': link('../b/refs'),
+    'skills/b/SKILL.md': skill('b'),
+    'skills/b/refs/doc.md': '# doc\n',
+    'skills/b/refs/img': link('../../../assets/img'),
+    'assets/img/x.txt': 'x',
+  };
+  const { t, h } = setup();
+  const r = await pack(t, h, 'intree.zip', files);
+  assert.equal(r.status, 201, r.text);
+  const paths = (name: string) => filePaths(r.json.items.find((i: Out) => i.name === name));
+  assert.deepEqual(paths('a'), ['SKILL.md', 'refs/doc.md']);
+  assert.deepEqual(paths('b'), ['SKILL.md', 'refs/doc.md', 'refs/img/x.txt']);
+  assert.deepEqual(r.json.skipped, [{ path: 'skills/a/refs/img', reason: "symlink to '../../../assets/img' (a symlink: links are followed one hop), not imported" }]);
+});
+
+test('I3-4: a source/update of a folder whose links name more targets outside it than are fetched says so at each link left out', async () => {
+  const files = (desc: string): Files => {
+    const f: Files = { 'skills/a/SKILL.md': skill('a', desc) };
+    for (let i = 0; i < 22; i++) {
+      const n = String(i).padStart(2, '0');
+      f[`skills/a/l${n}`] = link(`../../t${n}.txt`);
+      f[`t${n}.txt`] = `${n}\n`;
+    }
+    return f;
+  };
+  const [v1, v2] = [sha2('a8'), sha2('a9')];
+  gh.repos['acme/many-links'] = { default_branch: 'main', refs: { main: v1 }, trees: { [v1]: files('v1'), [v2]: files('v2') } };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/many-links' });
+  assert.equal(r.status, 201, r.text);
+  assert.equal(filePaths(r.json.items[0]).length, 23, 'a whole repository holds every target');
+  gh.repos['acme/many-links'].refs.main = v2;
+  const up = await t.req('POST', `${API}/items/${r.json.items[0].id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.version.files.length, 21);
+  const cap = (n: string) => ({ path: `l${n}`, reason: `symlink to '../../t${n}.txt' (more than 20 link targets outside the folder), not imported` });
+  assert.deepEqual(up.json.skipped, [cap('20'), cap('21')]);
+});
+
+test('jv9q: linkCopies holds each link to the limits before it copies anything, and lists the links inside a target once, not once per copy', () => {
+  const LIMITS = { files: 20_000, fileBytes: 64 * 1024 * 1024, totalBytes: 64 * 1024 * 1024, what: 'a pack' };
+  const file = (path: string) => ({ path, bytes: strToU8('x'), mode: 420 });
+  // 10,000 files under shared/ and 2,000 links to it: two copies fit the file cap; the rest are refused without being made.
+  const shared = Array.from({ length: 10_000 }, (_, i) => file(`shared/f${i}.md`));
+  const links = Array.from({ length: 2_000 }, (_, i) => ({ path: `l${i}`, target: 'shared' }));
+  let start = performance.now();
+  const capped = linkCopies(shared, links, LIMITS);
+  const cappedMs = performance.now() - start;
+  assert.deepEqual([capped.copied.length, capped.files.length, capped.skipped.length], [2, 30_000, 1_998]);
+  assert.equal(capped.skipped[0].reason, "symlink to 'shared' (its copy would pass a pack's limits), not imported");
+  assert.ok(cappedMs < 1500, `${Math.round(cappedMs)} ms`);
+  // Links that each fail on their target's last file (one already under the link path) stop at the work ceiling.
+  const late = links.slice(0, 500);
+  start = performance.now();
+  const refused = linkCopies([...shared, ...late.map((l) => file(`${l.path}/f9999.md`))], late, LIMITS);
+  const lateMs = performance.now() - start;
+  assert.equal(refused.copied.length, 0);
+  assert.equal(refused.skipped[0].reason, "symlink to 'shared' ('l0/f9999.md' is in the tree already), not imported");
+  assert.equal(refused.skipped.at(-1)!.reason, "symlink to 'shared' (its copy would pass a pack's limits), not imported");
+  assert.ok(lateMs < 1500, `${Math.round(lateMs)} ms`);
+
+  // 300 links to one fetched target holding 300 links: the first copy lists them, later copies count them, at most 500 entries and one for the rest.
+  const nested = Array.from({ length: 300 }, (_, i) => ({ path: `T/n${i}`, target: '../elsewhere' }));
+  const copies = Array.from({ length: 300 }, (_, i) => ({ path: `p/l${i}`, target: '../T' }));
+  const hop = linkCopies([file('T/real.md')], copies, LIMITS, new Map(), nested);
+  assert.equal(hop.copied.length, 300);
+  assert.equal(hop.skipped.length, 501);
+  assert.deepEqual(hop.skipped[0], { path: 'p/l0/n0', reason: "symlink to '../elsewhere' (a symlink: links are followed one hop), not imported" });
+  assert.deepEqual(hop.skipped[300], { path: 'p/l1', reason: "300 symlinks inside its target '../T' (a symlink: links are followed one hop), not imported; listed under its first copy" });
+  assert.deepEqual(hop.skipped.at(-1), { path: 'p/l201', reason: '29700 more symlinks inside copied link targets (a symlink: links are followed one hop), not imported and not listed' });
+});
+
+test('jv9q: source/update refuses (429) rather than drop a link copy the item holds when only the GitHub quota kept its target out; once the quota allows it, it updates with the copy', async () => {
+  const LINKED = (desc: string): Files => ({
+    'a/SKILL.md': skill('a', desc),
+    'a/many': link('../many'),
+    ...Object.fromEntries(Array.from({ length: 3 }, (_, i) => [`many/m${i}.txt`, `${i}\n`])),
+    'assets/noise.txt': noise(2),
+  });
+  gh.repos['acme/link-quota'] = { default_branch: 'main', refs: { main: sha2('d1') }, trees: { [sha2('d1')]: LINKED('v1'), [sha2('d2')]: LINKED('v2') } };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/link-quota', path: 'a' });
+  assert.equal(r.status, 201, r.text);
+  const item = r.json.items[0];
+  assert.deepEqual(filePaths(item), ['SKILL.md', 'many/m0.txt', 'many/m1.txt', 'many/m2.txt']);
+  // The repository is now over the archive cap (the Git Data API fallback), and 2 calls are left: the folder's 2 blobs fit, the target's 3 do not.
+  await setLimits(t, { maxArchiveMb: 1 });
+  gh.repos['acme/link-quota'].refs.main = sha2('d2');
+  gh.quota.remaining = 2;
+  try {
+    const short = await t.req('POST', `${API}/items/${item.id}/source/update`, { headers: h });
+    assert.equal(short.status, 429, short.text);
+    assert.match(short.json.error.message, /the target of the link 'many' needs more GitHub requests than are left this hour/);
+  } finally {
+    gh.quota.remaining = null;
+  }
+  const kept = await t.req('GET', `${API}/items/${item.id}`, { headers: h });
+  assert.equal(kept.json.item.latestSeq, 1, 'nothing written');
+  const up = await t.req('POST', `${API}/items/${item.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.latestSeq, 2);
+  assert.deepEqual(filePaths(up.json.item), ['SKILL.md', 'many/m0.txt', 'many/m1.txt', 'many/m2.txt']);
+  assert.deepEqual(up.json.skipped, []);
+});
+
+test('m5wy: export-ignore lines are read as git reads them: a BOM stays part of the first pattern, and a POSIX class in brackets matches its characters', async () => {
+  const files: Files = {
+    'plugins/kit/.gitattributes': '\uFEFFdocs export-ignore\n[[:digit:]]* export-ignore\n[![:alpha:]]z.md export-ignore\n[[:nope:]]* export-ignore\n',
+    'plugins/kit/skills/a/SKILL.md': skill('a'),
+    'plugins/kit/skills/a/docs/y.md': '# y\n',
+    'plugins/kit/skills/a/1x/run.sh': 'echo 1\n',
+    'plugins/kit/skills/a/x1/run.sh': 'echo x\n',
+    'plugins/kit/skills/a/9z.md': '# 9z\n',
+    'plugins/kit/skills/a/az.md': '# az\n',
+    'assets/noise.txt': noise(2),
+  };
+  // What git 2.55's `git archive` leaves out: not docs/ (the BOM-led line names '\uFEFFdocs'), and nothing for an unknown class.
+  const archiveIgnore = ['plugins/kit/skills/a/1x', 'plugins/kit/skills/a/9z.md'];
+  gh.repos['acme/attrs-posix'] = { default_branch: 'main', refs: { main: sha2('b9') }, trees: { [sha2('b9')]: files }, archiveIgnore };
+  const ref = setup();
+  const viaZip = await github(ref.t, ref.h, { repo: 'acme/attrs-posix', path: 'plugins/kit/skills/a' });
+  assert.equal(viaZip.status, 201, viaZip.text);
+  assert.deepEqual(filePaths(viaZip.json.items[0]), ['SKILL.md', 'az.md', 'docs/y.md', 'x1/run.sh']);
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  const r = await github(t, h, { repo: 'acme/attrs-posix', path: 'plugins/kit/skills/a' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(filePaths(r.json.items[0]), filePaths(viaZip.json.items[0]));
+  assert.equal(r.json.items[0].version.treeSha256, viaZip.json.items[0].version.treeSha256);
+});
+
+/** A skill at plugins/kit/skills/s holding `names` (each 'x'), its own .gitattributes `attrs` and the root's `rootAttrs`. */
+const attrKit = (rootAttrs: string, attrs: string, names: string[], extra: Files = {}): Files => ({
+  '.gitattributes': rootAttrs,
+  'plugins/kit/skills/s/.gitattributes': attrs,
+  'plugins/kit/skills/s/SKILL.md': skill('s'),
+  ...Object.fromEntries(names.map((n) => [`plugins/kit/skills/s/${n}`, 'x'])),
+  ...Object.fromEntries(Object.entries(extra).map(([n, text]) => [`plugins/kit/skills/s/${n}`, text])),
+});
+
+/**
+ * m5wy-git-parity: `files` imported through the zipball, which leaves out `archiveIgnore` (paths in the
+ * skill), and file by file: both give one tree. Each `archiveIgnore` is what git 2.55's `git archive`
+ * left out of that very tree, run by hand once: never derived from SCP's parser.
+ */
+async function attrParity(repo: string, commit: string, files: Files, archiveIgnore: string[]) {
+  gh.repos[repo] = { default_branch: 'main', refs: { main: commit }, trees: { [commit]: { ...files, 'assets/noise.txt': noise(2) } }, archiveIgnore: archiveIgnore.map((p) => `plugins/kit/skills/s/${p}`) };
+  const ref = setup();
+  const viaZip = await github(ref.t, ref.h, { repo, path: 'plugins/kit/skills/s' });
+  assert.equal(viaZip.status, 201, viaZip.text);
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  const r = await github(t, h, { repo, path: 'plugins/kit/skills/s' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(filePaths(r.json.items[0]), filePaths(viaZip.json.items[0]));
+  assert.equal(r.json.items[0].version.treeSha256, viaZip.json.items[0].version.treeSha256);
+}
+
+test('m5wy-git-parity: a quoted pattern is C-unquoted as git does, its attributes start at the closing quote, and one git cannot unquote is read bare', async () => {
+  const attrs =
+    '.gitattributes export-ignore\n"sp ace.txt" export-ignore\n"\\303\\251.md" export-ignore\n"qa"export-ignore\n"qx"y export-ignore\n"!neg" export-ignore\n"qd/" export-ignore\n"*.t x" export-ignore\n"glob [ab]" export-ignore\n"zz\\000cd" export-ignore\n"unterminated export-ignore\n"oct\\8" export-ignore\n';
+  const names = ['sp ace.txt', 'sp', 'ace.txt', 'é.md', 'qa', 'qx', 'y', '!neg', 'neg', 'qd/f', 'k.t x', 'glob a', 'glob c', 'zz', 'zzcd', 'unterminated', 'oct8'];
+  // git: a negative pattern is refused, a NUL ends the pattern, `"unterminated` and `"oct\8"` match only names that start with '"'.
+  await attrParity('acme/attrs-quoted', sha2('f1'), attrKit('', attrs, names), ['.gitattributes', 'sp ace.txt', 'é.md', 'qa', 'qx', 'qd/f', 'k.t x', 'glob a', 'zz']);
+});
+
+test('m5wy-git-parity: brackets, escapes and stars are read as git\'s wildmatch reads them, byte by byte, and a pattern it gives up on matches nothing', async () => {
+  const attrs =
+    '.gitattributes export-ignore\nf/[!]a] export-ignore\ng/[]a] export-ignore\nh/[^x]y export-ignore\ni/[\\]] export-ignore\nk/[z-ax] export-ignore\nm/[[:x] export-ignore\nn/[[:digit:]-z] export-ignore\no/[a-c-e] export-ignore\nt/[[:] export-ignore\nfoo[ export-ignore\np/[abc export-ignore\nq/[[:digit:] export-ignore\nv/[!] export-ignore\nx[/a]y export-ignore\n?.mb export-ignore\n[é][é]y export-ignore\n[é]x export-ignore\ns3/*** export-ignore\nes\\/f export-ignore\n**\\/deep export-ignore\n\\/lead export-ignore\nfb\\/ export-ignore\n';
+  const names = ['f/b', 'f/]', 'f/a', 'g/]', 'g/a', 'g/b', 'h/ay', 'h/^y', 'h/xy', 'i/]', 'i/a', 'k/x', 'k/z', 'k/m', 'm/x', 'm/[', 'm/y', 'n/5', 'n/-', 'n/z', 'n/y', 'o/a', 'o/c', 'o/-', 'o/e', 'o/d', 't/[', 't/]', 'foo[', 'p/[abc', 'p/a', 'q/1', 'q/[', 'v/]', 'v/a', 'xay', 'é.mb', 'a.mb', 'éy', 'ëy', 'éx', 's3/x/y', 's3/z', 'es/f', 'w/deep', 'deep', 'lead', 'fb/x'];
+  // git keeps foo[, p/, q/ and v/ (an unclosed bracket), é.mb and éx ('?' and '[é]' are one byte), deep (`**\/` needs a folder), lead and fb/.
+  const archiveIgnore = ['.gitattributes', 'f/b', 'g/]', 'g/a', 'h/ay', 'h/^y', 'i/]', 'k/x', 'k/z', 'm/x', 'm/[', 'n/5', 'n/-', 'n/z', 'o/a', 'o/c', 'o/-', 'o/e', 't/[', 'xay', 'a.mb', 'éy', 's3/x/y', 's3/z', 'es/f', 'w/deep'];
+  await attrParity('acme/attrs-wildmatch', sha2('f2'), attrKit('', attrs, names), archiveIgnore);
+});
+
+test('m5wy-git-parity: a line of 2048 bytes or more is skipped as git skips it (its CR counted), a NUL ends the file, and an invalid attribute name drops its line', async () => {
+  const pad = (line: string, bytes: number) => ' '.repeat(bytes - line.length) + line;
+  const attrs = `.gitattributes export-ignore\n${pad('l2047 export-ignore', 2047)}\n${pad('l2048 export-ignore', 2048)}\n${pad('crlf2046 export-ignore', 2046)}\r\n${pad('crlf2047 export-ignore', 2047)}\r\nmb1 export-ignore v=${'é'.repeat(1010)}\nmb2 export-ignore v=${'é'.repeat(1020)}\ne1 export-ignore b@d\ne2 export-ignore builtin_x\ne3 export-ignore a.b_c-9\nn1 export-ignore\n\u0000n2 export-ignore\n`;
+  // mb2 is 1039 characters but 2059 bytes.
+  await attrParity('acme/attrs-lines', sha2('f3'), attrKit('', attrs, ['l2047', 'l2048', 'crlf2046', 'crlf2047', 'mb1', 'mb2', 'e1', 'e2', 'e3', 'n1', 'n2']), ['.gitattributes', 'l2047', 'crlf2046', 'mb1', 'e3', 'n1']);
+});
+
+test('m5wy-git-parity: macros the root .gitattributes defines expand as git expands them, in any file, by the order git fills attributes in', async () => {
+  const root =
+    '[attr]drop export-ignore\nd1 drop\nd2 drop -export-ignore\nd3 -export-ignore drop\nd4 drop\nd4 -drop\nd5 late\n[attr]late export-ignore\n[attr]outer inner\n[attr]inner export-ignore\nd6 outer\nd7 -drop\nd8 drop=1\n[attr]re export-ignore\n[attr]re -export-ignore\nd9 re\n[attr]binary export-ignore\n*.bin binary\n[attr]blocker -drop\nd10 drop\nd10 blocker\n[attr]bad@ export-ignore\nd11 bad@\n"[attr]qm x" export-ignore\nq1 qm\n';
+  const names = ['d1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8', 'd9', 'd10', 'd11', 'q1', 'f.bin', 'sub/x', 'sub/y', 'at/a', 'at/t', 'at/b', 'at/[attr]'];
+  // A macro defined below the root is dropped (sub/x), one from the root applies there (sub/y); '[attr]' alone is a pattern.
+  const extra = { 'sub/.gitattributes': '[attr]drop2 export-ignore\nx drop2\ny drop\n', 'at/.gitattributes': '[attr] export-ignore\n' };
+  const archiveIgnore = ['.gitattributes', 'd1', 'd3', 'd5', 'd6', 'q1', 'f.bin', 'sub/y', 'at/a', 'at/t', 'sub/.gitattributes', 'at/.gitattributes'];
+  await attrParity('acme/attrs-macros', sha2('f4'), attrKit(root, '.gitattributes export-ignore\n', names, extra), archiveIgnore);
+});
+
+test('m5wy-attr-rules-oom: the .gitattributes one download parses are capped together, by bytes per file read and by export-ignore lines, so identical padded copies cannot exhaust the heap', async () => {
+  const fallback = async (files: Files) => {
+    gh.repos['acme/attr-pad'] = { default_branch: 'main', refs: { main: sha2('e1') }, trees: { [sha2('e1')]: { 'plugins/kit/skills/s/SKILL.md': skill('s'), 'assets/noise.txt': noise(2), ...files } } };
+    const { t, h } = setup();
+    await setLimits(t, { maxArchiveMb: 1 });
+    return github(t, h, { repo: 'acme/attr-pad', path: 'plugins/kit' });
+  };
+  // 50 copies of one 40 KB file are one blob, but each is parsed: 2 MB of lines together, refused before any fetch.
+  const pad = 'a export-ignore\n'.repeat(2500);
+  let from = gh.requests.length;
+  const started = performance.now();
+  const copies = await fallback(Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`plugins/kit/p${i}/.gitattributes`, pad])));
+  assert.equal(copies.status, 413, copies.text);
+  assert.match(copies.json.error.message, /its \.gitattributes files are over 1 MB together/);
+  assert.equal(gitCalls(from, 'blobs'), 0);
+  assert.ok(performance.now() - started < 1500, `took ${Math.round(performance.now() - started)} ms`);
+  // One file under 1 MB with more lines than the rule cap is refused as it is parsed.
+  from = gh.requests.length;
+  const lines = await fallback({ 'plugins/kit/.gitattributes': 'a export-ignore\n'.repeat(10_001) });
+  assert.equal(lines.status, 413, lines.text);
+  assert.match(lines.json.error.message, /more than 10000 \.gitattributes export-ignore lines/);
+  assert.equal(gitCalls(from, 'blobs'), 1, 'the .gitattributes alone');
+  // At the cap it imports.
+  assert.equal((await fallback({ 'plugins/kit/.gitattributes': 'a export-ignore\n'.repeat(10_000) })).status, 201);
+});
+
+test('m5wy-attr-rules-oom: the .gitattributes file cap binds a folder and its link targets together: a target past it is reported at its link', async () => {
+  const why = (target: string) => `symlink to '${target}' (its target is too large to fetch), not imported`;
+  const files: Files = { 'plugins/p/skills/a/SKILL.md': skill('a'), 'assets/noise.txt': noise(2) };
+  for (let t = 0; t < 4; t++) {
+    files[`plugins/p/skills/a/t${t}`] = link(`../../../../t${t}`);
+    files[`t${t}/f.txt`] = `${t}\n`;
+    for (let i = 0; i < 15; i++) files[`t${t}/d${i}/.gitattributes`] = `x${t}.${i} export-ignore\n`;
+  }
+  gh.repos['acme/attr-targets'] = { default_branch: 'main', refs: { main: sha2('e2') }, trees: { [sha2('e2')]: files } };
+  const { t, h } = setup();
+  await setLimits(t, { maxArchiveMb: 1 });
+  const r = await github(t, h, { repo: 'acme/attr-targets', path: 'plugins/p' });
+  assert.equal(r.status, 201, r.text);
+  // 15 per target: three fit the 50, the fourth would make 60.
+  assert.deepEqual(r.json.skipped, [{ path: 'skills/a/t3', reason: why('../../../../t3') }]);
+  assert.ok(!filePaths(r.json.items[0]).some((p) => p.startsWith('t3/')));
+});
+
+test('jv9q-truncated-target-resolved: a link whose target is over 255 characters is reported, never resolved from its first 255', async () => {
+  // The whole target names shared/a/b; its first 255 characters name shared/a.
+  const long = '../../shared/a' + '/.'.repeat(130) + '/b';
+  assert.ok(long.length > 255 && long.length < 300);
+  const { t, h } = setup();
+  const r = await pack(t, h, 'long.zip', { 'skills/s/SKILL.md': skill('s'), 'skills/s/ref': link(long), 'shared/a/b/doc.md': '# doc\n', 'shared/a/other.md': '# other\n' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(filePaths(r.json.items.find((i: Out) => i.name === 's')), ['SKILL.md']);
+  assert.deepEqual(
+    r.json.skipped.find((s: { path: string }) => s.path === 'skills/s/ref'),
+    { path: 'skills/s/ref', reason: `symlink to '${long.slice(0, 255)}' (its target is longer than 255 characters), not imported` },
+  );
+});
+
+test('I3-link-path-refusal-masked: an item whose path is a link answers its target\'s refusal: 429 on a source/update the quota held back, the link\'s reason on an import', async () => {
+  const LINKED = (desc: string, n = 3): Files => ({
+    'skills/x': link('../shared/x'),
+    'shared/x/SKILL.md': skill('x', desc),
+    ...Object.fromEntries(Array.from({ length: n }, (_, i) => [`shared/x/m${i}.txt`, `${i}\n`])),
+    'assets/noise.txt': noise(2),
+  });
+  gh.repos['acme/link-path'] = { default_branch: 'main', refs: { main: sha2('e3') }, trees: { [sha2('e3')]: LINKED('v1'), [sha2('e4')]: LINKED('v2') } };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/link-path', path: 'skills/x' });
+  assert.equal(r.status, 201, r.text);
+  const item = r.json.items[0];
+  assert.deepEqual([item.source.path, filePaths(item)], ['skills/x', ['SKILL.md', 'm0.txt', 'm1.txt', 'm2.txt']]);
+  // File by file with 2 calls left: the link's blob fits, the target's four do not.
+  await setLimits(t, { maxArchiveMb: 1 });
+  gh.repos['acme/link-path'].refs.main = sha2('e4');
+  gh.quota.remaining = 2;
+  try {
+    const short = await t.req('POST', `${API}/items/${item.id}/source/update`, { headers: h });
+    assert.equal(short.status, 429, short.text);
+    assert.match(short.json.error.message, /the target of the link 'skills\/x' needs more GitHub requests than are left this hour/);
+  } finally {
+    gh.quota.remaining = null;
+  }
+  const up = await t.req('POST', `${API}/items/${item.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.description, 'v2');
+  // A fresh import whose target is over the version limits names the link and why, not "holds no files".
+  gh.repos['acme/link-path-big'] = { default_branch: 'main', refs: { main: sha2('e5') }, trees: { [sha2('e5')]: LINKED('v1', 1001) } };
+  const other = setup();
+  await setLimits(other.t, { maxArchiveMb: 1 });
+  const big = await github(other.t, other.h, { repo: 'acme/link-path-big', path: 'skills/x' });
+  assert.equal(big.status, 413, big.text);
+  assert.equal(big.json.error.message, "'skills/x' is a symlink to '../shared/x' (its target is too large to fetch), not imported");
+});
+
+test('db-nenk-legacy-tooling-unbackfilled: a root skill imported with includeRepoTooling before the flag was recorded keeps its tooling files on source/update', async () => {
+  const files = (desc: string): Files => ({
+    '.claude-plugin/plugin.json': '{"name":"solo"}',
+    'SKILL.md': skill('solo', desc),
+    'GEMINI.md': '# Gemini notes\n',
+    '.gemini/skills/notes.txt': 'n',
+  });
+  gh.repos['acme/solo-legacy'] = { default_branch: 'main', refs: { main: sha2('e6') }, trees: { [sha2('e6')]: files('v1'), [sha2('e7')]: files('v2'), [sha2('e8')]: files('v3') } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo: 'acme/solo-legacy', includeRepoTooling: true });
+  assert.equal(imp.status, 201, imp.text);
+  const solo = imp.json.items.find((i: Out) => i.name === 'solo');
+  const tooled = ['.claude-plugin/plugin.json', '.gemini/skills/notes.txt', 'GEMINI.md', 'SKILL.md'];
+  assert.deepEqual(filePaths(solo).sort(), tooled);
+  // A row from before migration 17 reads 0 whatever the import was given.
+  t.db.prepare('UPDATE items SET source_tooling = 0 WHERE id = ?').run(solo.id);
+  gh.repos['acme/solo-legacy'].refs.main = sha2('e7');
+  const up = await t.req('POST', `${API}/items/${solo.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.deepEqual([up.json.item.description, filePaths(up.json.item).sort()], ['v2', tooled]);
+  // A latest version holding none of them (an import without the flag) is carved as before.
+  const plain = setup();
+  const imp2 = await github(plain.t, plain.h, { repo: 'acme/solo-legacy' });
+  const solo2 = imp2.json.items.find((i: Out) => i.name === 'solo');
+  assert.deepEqual(filePaths(solo2).sort(), ['.claude-plugin/plugin.json', 'SKILL.md']);
+  gh.repos['acme/solo-legacy'].refs.main = sha2('e8');
+  const up2 = await plain.t.req('POST', `${API}/items/${solo2.id}/source/update`, { headers: plain.h });
+  assert.equal(up2.status, 200, up2.text);
+  assert.deepEqual(filePaths(up2.json.item).sort(), ['.claude-plugin/plugin.json', 'SKILL.md']);
 });

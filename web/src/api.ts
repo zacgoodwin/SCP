@@ -337,11 +337,13 @@ export const changePassword = (current: string | undefined, next: string) => jso
 
 export const listItems = (q: ItemQuery = {}) => json<{ items: ItemSummary[]; total: number }>('GET', `/items${qs(q)}`);
 export const createItem = (body: ItemCreate) => json<{ item: ItemDetail }>('POST', '/items', body);
-export function importItem(file: File, opts: { kind?: Kind; visibility?: Visibility } = {}) {
+/** description (en8v): frontmatter SCP writes when the file has none, as on the pack and GitHub imports. */
+export function importItem(file: File, opts: { kind?: Kind; visibility?: Visibility; description?: string } = {}) {
   const fd = new FormData();
   fd.set('file', file);
   if (opts.kind) fd.set('kind', opts.kind);
   if (opts.visibility) fd.set('visibility', opts.visibility);
+  if (opts.description) fd.set('description', opts.description);
   return json<{ item: ItemDetail }>('POST', '/items/import', fd);
 }
 export const getItem = (id: string) => json<{ item: ItemDetail }>('GET', `/items/${id}`);

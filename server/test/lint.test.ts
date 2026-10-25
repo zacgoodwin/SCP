@@ -150,8 +150,8 @@ test('requires: migration 16 backfills older versions with the same rule as pars
       .run(id, itemId, 'SKILL.md', 'x', JSON.stringify(fm), now());
     return id;
   });
-  // Re-run the migration over versions written before it existed.
-  t.db.exec('DROP TABLE version_requires; DROP TABLE cli_tools; PRAGMA user_version = 15;');
+  // Re-run the migration over versions written before it existed (and undo the ones after it, which re-run too).
+  t.db.exec('DROP TABLE version_requires; DROP TABLE cli_tools; ALTER TABLE items DROP COLUMN source_tooling; PRAGMA user_version = 15;');
   migrate(t.db);
   const stored = (id: string) =>
     (t.db.prepare('SELECT name FROM version_requires WHERE version_id = ? ORDER BY name').all(id) as { name: string }[]).map((r) => r.name);
