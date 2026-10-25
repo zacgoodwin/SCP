@@ -405,7 +405,8 @@ test('PATCH /users/:id changes username and email, 409 on a clash, 400 when inva
 
 // ---------- CLI tools registry (f9j0) ----------
 
-test('cli-tools registry: 401 anonymous, 404 for non-admins and restricted admin keys, write scope for writes', async () => {
+// c5j3: 403 like every other admin route (requireAdmin), not the 404 v3 shipped.
+test('cli-tools registry: 401 anonymous, 403 for non-admins and restricted admin keys, write scope for writes', async () => {
   const { t, admin, ah, uh } = setup();
   const restricted = t.key(admin, { groupIds: [insertGroup(t, admin)] }).headers;
   const readOnly = t.key(admin, { scopes: ['read'] }).headers;
@@ -418,8 +419,8 @@ test('cli-tools registry: 401 anonymous, 404 for non-admins and restricted admin
   ];
   for (const [method, path, json] of calls) {
     assert.equal((await t.req(method, `${API}${path}`, { json })).status, 401, `${method} ${path} anon`);
-    assert.equal((await t.req(method, `${API}${path}`, { headers: uh, json })).status, 404, `${method} ${path} user`);
-    assert.equal((await t.req(method, `${API}${path}`, { headers: restricted, json })).status, 404, `${method} ${path} restricted key`);
+    assert.equal((await t.req(method, `${API}${path}`, { headers: uh, json })).status, 403, `${method} ${path} user`);
+    assert.equal((await t.req(method, `${API}${path}`, { headers: restricted, json })).status, 403, `${method} ${path} restricted key`);
   }
   assert.equal((await t.req('GET', `${API}/admin/cli-tools`, { headers: readOnly })).status, 200);
   assert.equal((await t.req('POST', `${API}/admin/cli-tools`, { headers: readOnly, json: { name: 'roborev' } })).status, 403);

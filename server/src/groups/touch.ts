@@ -10,13 +10,13 @@ const MAX_TOUCH_ROWS = 1000;
 /**
  * Bump updated_at on the anchored groups and every group that includes them (structural walk, stale
  * edges too): what those groups serve changed, so their updated_at, and with it the marketplace plugin
- * version (bundle.ts pluginVersion) and the plugin.zip cache key, must move. `anchor` selects the
+ * version (bundle.ts pluginVersion) and the plugin.zip cache key, must move. `anchorSql` selects the
  * starting ids as a column named id. Its own module: items/service.ts calls it too and cannot import
  * groups/service.ts (cycle).
  */
-function touchFrom(db: Db, anchor: string, params: SQLInputValue[]): void {
+function touchFrom(db: Db, anchorSql: string, params: SQLInputValue[]): void {
   db.prepare(
-    `WITH RECURSIVE up(id, depth) AS (SELECT id, 0 FROM (${anchor}) UNION SELECT gi.group_id, up.depth + 1 FROM up JOIN group_includes gi ON gi.included_id = up.id WHERE up.depth < 64 LIMIT ${MAX_TOUCH_ROWS})
+    `WITH RECURSIVE up(id, depth) AS (SELECT id, 0 FROM (${anchorSql}) UNION SELECT gi.group_id, up.depth + 1 FROM up JOIN group_includes gi ON gi.included_id = up.id WHERE up.depth < 64 LIMIT ${MAX_TOUCH_ROWS})
      UPDATE scp_groups SET updated_at = ? WHERE id IN (SELECT id FROM up)`,
   ).run(...params, now());
 }

@@ -434,6 +434,8 @@ oidcRoutes.get('/auth/oidc/start', async (c) => {
   try {
     const { next } = parseQuery(c, z.object({ next: nextSchema }));
     limitIp(c);
+    // The target is the IdP's authorization URL (cfg); `next` only reaches the signed state, through safeNext.
+    // nosemgrep: scp.open-redirect.request-input-in-redirect
     return c.redirect(await beginSignIn(c, cfg, next), 302);
   } catch (e) {
     return errorPage(c, e);

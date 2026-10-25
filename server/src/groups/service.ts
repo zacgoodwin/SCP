@@ -977,10 +977,10 @@ const newlyServed = (before: ReadonlySet<string>, after: ReadonlySet<string>) =>
  * next reorder or add; reads truncate at depth 4 anyway (effectiveGroups, access.ts upCte).
  */
 function assertIncludeDepth(db: Db, group: GroupRow): void {
-  const longest = (step: string, ...params: SQLInputValue[]) =>
+  const longest = (stepSql: string, ...params: SQLInputValue[]) =>
     (
       db
-        .prepare(`WITH RECURSIVE chain(id, depth) AS (SELECT ?, 0 UNION SELECT ${step} WHERE chain.depth < 64) SELECT MAX(depth) AS n FROM chain`)
+        .prepare(`WITH RECURSIVE chain(id, depth) AS (SELECT ?, 0 UNION SELECT ${stepSql} WHERE chain.depth < 64) SELECT MAX(depth) AS n FROM chain`)
         .get(group.id, ...params) as { n: number }
     ).n;
   const above = longest('gi.group_id, chain.depth + 1 FROM chain JOIN group_includes gi ON gi.included_id = chain.id JOIN scp_groups g ON g.id = gi.group_id AND g.owner_id = ?', group.owner_id);
