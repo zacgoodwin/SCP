@@ -24,20 +24,148 @@ rules:
           - pattern: $C.req.valid(...)
           - pattern: $C.req.url
           - pattern: $C.req.path
+    # The services build WHERE clauses by push()ing into an array they join(): taint follows the value
+    # into the array (join() of a tainted array is tainted already). The same in the two rules below
+    # (OpenGrep resolves no YAML aliases).
+    pattern-propagators:
+      - pattern: $TO.push(..., $FROM, ...)
+        from: $FROM
+        to: $TO
+      - pattern: $TO.unshift(..., $FROM, ...)
+        from: $FROM
+        to: $TO
     pattern-sanitizers:
       - pattern-either:
           - pattern: Number(...)
           - pattern: parseInt(...)
     pattern-sinks:
       - patterns:
+          # prepare() on any handle (`db`, `conn`, a local `d`). exec() only on one named like `db`,
+          # `ctx.db`, `c.var.ctx.db`: keeps RegExp#exec out of the sink (metavariable-regex is anchored
+          # at the start).
           - pattern-either:
-              - pattern: $DB.prepare($SQL, ...)
-              - pattern: $DB.exec($SQL, ...)
-          # `db`, `ctx.db`, `c.var.ctx.db`: keeps RegExp#exec out of the sink. (metavariable-regex is
-          # anchored at the start.)
+              - pattern: $X.prepare($SQL, ...)
+              - patterns:
+                  - pattern: $DB.exec($SQL, ...)
+                  - metavariable-regex:
+                      metavariable: $DB
+                      regex: (.*\.)?db$
+          - focus-metavariable: $SQL
+
+  # OpenGrep 1.x taint stays inside one function (interfile analysis is alpha in v2), so a helper
+  # `load(db, s)` that interpolates `s`, called with c.req.param() from a route in another file, passes
+  # the rule above. This one needs no call graph: every function parameter is a source, whoever the
+  # caller is. A parameter that carries SQL text by design is named `sql` or `...Sql` (ownStats `n`,
+  # assertIncludeDepth `longest`, touchFrom); the access.ts fragments (`{sql, params}`) are
+  # code-owned, so `.sql` is a sanitizer; insertRow's `table` is `keyof typeof INSERT_COLUMNS`.
+  - id: scp.sql-injection.parameter-in-sql
+    mode: taint
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Parameter `$P` reaches the SQL text of prepare()/exec(), and any caller can pass request input. Bind it as a `?` parameter, or pass an access.ts-style `{sql, params}` fragment.
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: function $FN(..., $P, ...) { ... }
+              - pattern-inside: function (..., $P, ...) { ... }
+              - pattern-inside: (..., $P, ...) => $BODY
+              - pattern-inside: |
+                  class $CLASS { ... $METHOD(..., $P, ...) { ... } ... }
+          - focus-metavariable: $P
           - metavariable-regex:
-              metavariable: $DB
-              regex: (.*\.)?db$
+              metavariable: $P
+              regex: ^(?!(sql|\w+Sql)$)
+    pattern-propagators:
+      - pattern: $TO.push(..., $FROM, ...)
+        from: $FROM
+        to: $TO
+      - pattern: $TO.unshift(..., $FROM, ...)
+        from: $FROM
+        to: $TO
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: $F.sql
+          - pattern: Number(...)
+          - pattern: parseInt(...)
+    pattern-sinks:
+      - patterns:
+          # As in request-input-in-sql: prepare() on any handle, exec() on a `db` only.
+          - pattern-either:
+              - pattern: $X.prepare($SQL, ...)
+              - patterns:
+                  - pattern: $DB.exec($SQL, ...)
+                  - metavariable-regex:
+                      metavariable: $DB
+                      regex: (.*\.)?db$
+          - pattern-not-inside: |
+              function insertRow(...) { ... }
+          - focus-metavariable: $SQL
+      # The SQL-text helpers above take their text in a `sql`/`...Sql` parameter, which is no source, so
+      # the text a caller hands them is the sink: settings.ts count(db, sql) and touch.ts touchFrom(db,
+      # anchorSql, params) by name (a new module-level helper of that shape joins the list), and a local
+      # arrow that prepares (service.ts ownStats `n`, assertIncludeDepth `longest`) by its definition.
+      - patterns:
+          - pattern-either:
+              - patterns:
+                  - pattern-either:
+                      - pattern: count($DB, $SQL)
+                      - pattern: touchFrom($DB, $SQL, ...)
+                  - metavariable-regex:
+                      metavariable: $DB
+                      regex: (.*\.)?db$
+              - patterns:
+                  - pattern-inside: |
+                      const $H = ($S, ...) => $BODY;
+                      ...
+                  # Its first parameter is in the text it prepares (not a `db` it prepares on).
+                  - metavariable-pattern:
+                      metavariable: $BODY
+                      pattern: $X.prepare(<... $S ...>, ...)
+                  - pattern: $H($SQL, ...)
+          - focus-metavariable: $SQL
+
+  # The fragment half: `.sql` is a sanitizer at the prepare()/exec() sink above, so a helper that puts a
+  # parameter into the `sql` of a `{sql, params}` literal (`kindSql(kind)` returning `{ sql: \`i.kind =
+  # '${kind}'\` }`) passed. The literal's `sql` is a sink of its own. access.ts is the one module that
+  # builds fragments from its parameters, table aliases it is always called with in code.
+  - id: scp.sql-injection.parameter-in-sql-fragment
+    mode: taint
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Parameter `$P` reaches the `sql` text of a `{sql, params}` fragment, which a prepare()/exec() runs, and any caller can pass request input. Put the value in `params` behind a `?`.
+    paths:
+      exclude: [server/src/access.ts]
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: function $FN(..., $P, ...) { ... }
+              - pattern-inside: function (..., $P, ...) { ... }
+              - pattern-inside: (..., $P, ...) => $BODY
+              - pattern-inside: |
+                  class $CLASS { ... $METHOD(..., $P, ...) { ... } ... }
+          - focus-metavariable: $P
+          - metavariable-regex:
+              metavariable: $P
+              regex: ^(?!(sql|\w+Sql)$)
+    pattern-propagators:
+      - pattern: $TO.push(..., $FROM, ...)
+        from: $FROM
+        to: $TO
+      - pattern: $TO.unshift(..., $FROM, ...)
+        from: $FROM
+        to: $TO
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: $F.sql
+          - pattern: Number(...)
+          - pattern: parseInt(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: '{..., sql: $SQL, ...}'
+              # A fragment's text written after it is built.
+              - pattern: $F.sql = $SQL
+              - pattern: $F['sql'] = $SQL
           - focus-metavariable: $SQL
 
   - id: scp.open-redirect.request-input-in-redirect
@@ -52,37 +180,84 @@ rules:
           - pattern: $C.req.queries(...)
           - pattern: $C.req.header(...)
           - pattern: $C.req.json()
+          - pattern: $C.req.text()
           - pattern: $C.req.parseBody(...)
           - pattern: $C.req.formData()
+          - pattern: $C.req.valid(...)
+          - pattern: $C.req.url
+          - pattern: $C.req.path
+          # The underlying Request: c.req.raw.url, c.req.raw.headers.
+          - pattern: $C.req.raw
+          # The standard input path: lib/http.ts reads c.req.query() / c.req.json() inside these helpers,
+          # another function, which taint does not follow.
+          - pattern: parseQuery($C, ...)
+          - pattern: parseJson($C, ...)
+    # A query string (`?...` or empty) appended after a fixed origin and path cannot move the target.
+    pattern-sanitizers:
+      - pattern: new URL(...).search
     pattern-sinks:
       - patterns:
           - pattern: $C.redirect($URL, ...)
           - focus-metavariable: $URL
 
+  # The cross-function half, built like scp.sql-injection.parameter-in-sql: a helper `goTo(c, to)`
+  # that redirects to `to` fails whoever calls it. The Hono context is exempt (every Context parameter
+  # in server/src is named `c`): request input read off it, directly or through parseQuery/parseJson,
+  # is the rule above's job, and taint from `c` would flag every `c.var.ctx.config` URL.
+  - id: scp.open-redirect.parameter-in-redirect
+    mode: taint
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: Parameter `$P` chooses the redirect target, and any caller can pass request input. Redirect to a fixed or allow-listed URL.
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: function $FN(..., $P, ...) { ... }
+              - pattern-inside: function (..., $P, ...) { ... }
+              - pattern-inside: (..., $P, ...) => $BODY
+              - pattern-inside: |
+                  class $CLASS { ... $METHOD(..., $P, ...) { ... } ... }
+          - focus-metavariable: $P
+          - metavariable-regex:
+              metavariable: $P
+              regex: ^(?!c$)
+    pattern-sanitizers:
+      - pattern: new URL(...).search
+    pattern-sinks:
+      - patterns:
+          - pattern: $C.redirect($URL, ...)
+          - focus-metavariable: $URL
+
+  # server/src never imports child_process, so the binding is flagged, not the call: a call can go
+  # through any later rename (`promisify(exec)`, `const run = execSync`, `let { exec } = cp`, `cp['exec']`),
+  # and every one of them starts at a binding. The whole module is flagged wherever it is bound (a
+  # namespace or default import, a re-export of it all, a require or any call taking the module name such
+  # as a createRequire result, a dynamic import(), process.getBuiltinModule()): the module object can
+  # travel anywhere before use. Of the named forms, only exec/execSync are: `import { execFile }` is fine.
   - id: scp.command-injection.shell
     languages: [typescript, javascript]
     severity: ERROR
-    message: This runs a shell. Use execFile/spawn with an argument array and no `shell` option.
+    message: This takes child_process exec/execSync, or the whole module, which runs a shell however it is called later. Import execFile/spawn by name and call them with an argument array and no `shell` option.
     pattern-either:
       - pattern: |
           $F(..., {..., shell: true, ...})
       - patterns:
           - pattern-either:
-              - patterns:
-                  - pattern-inside: |
-                      import { ..., $F, ... } from '$MOD';
-                      ...
-                  - pattern: $F(...)
-              - patterns:
-                  - pattern-either:
-                      - pattern-inside: |
-                          import * as $CP from '$MOD';
-                          ...
-                      - pattern-inside: |
-                          import $CP from '$MOD';
-                          ...
-                  - pattern: $CP.$F(...)
-              - pattern: require('$MOD').$F(...)
+              - pattern: import('$MOD')
+              - pattern: $R('$MOD')
+              - pattern: import * as $CP from '$MOD';
+              - pattern: import $CP from '$MOD';
+              - pattern: export * from '$MOD';
+              - pattern: export * as $CP from '$MOD';
+          - metavariable-regex:
+              metavariable: $MOD
+              regex: ^(node:)?child_process$
+      - patterns:
+          - pattern-either:
+              - pattern: import { ..., $F, ... } from '$MOD';
+              - pattern: import { ..., $F as $ALIAS, ... } from '$MOD';
+              - pattern: export { ..., $F, ... } from '$MOD';
+              - pattern: export { ..., $F as $ALIAS, ... } from '$MOD';
           - metavariable-regex:
               metavariable: $MOD
               regex: ^(node:)?child_process$

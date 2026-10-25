@@ -237,7 +237,7 @@ test('install commands on /tools come only from the registry; a skill\'s metadat
   assert.equal((await t.req('GET', `${API}/tools/unlisted`, { headers: h.carol })).status, 404);
 });
 
-test('non-admins get 404 on the registry routes; an admin edit shows on /tools and is audited', async () => {
+test('non-admins get 403 on the registry routes; an admin edit shows on /tools and is audited', async () => {
   const { t, ah, h } = setup();
   await addTool(t, ah, { name: 'kata' });
   for (const [method, path, json] of [
@@ -246,7 +246,7 @@ test('non-admins get 404 on the registry routes; an admin edit shows on /tools a
     ['PUT', '/admin/cli-tools/kata', { install: { any: EVIL } }],
     ['DELETE', '/admin/cli-tools/kata', {}],
   ] as const) {
-    assert.equal((await t.req(method, `${API}${path}`, { headers: h.carol, json })).status, 404, `${method} ${path}`);
+    assert.equal((await t.req(method, `${API}${path}`, { headers: h.carol, json })).status, 403, `${method} ${path}`);
   }
   const put = await t.req('PUT', `${API}/admin/cli-tools/kata`, { headers: ah, json: { homepage: 'https://kata.dev', install: { linux: 'curl -fsSL https://kata.dev/install.sh | sh' } } });
   assert.equal(put.status, 200, put.text);

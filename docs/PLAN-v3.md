@@ -51,9 +51,10 @@ onto the top of lane I before shipping. Deferred tickets (`deferred` label) are 
   frontmatter. The registry starts empty (no seeded rows); seeding stays a human decision.
 - dnxq part 2 (serving hooks / MCP servers / output styles as items) is not built. Until a human
   decides, SCP reports those components in `skipped` and never stores or serves them.
-- dhje / 00tr: their criteria say non-admins get 404 on the settings route. The route keeps 403,
-  like every admin route (PLAN-v2 D4 and `admin.test.ts` settle 403; an admin route's existence is no
-  secret, unlike a resource). Kata c5j3 decides whether all admin routes move to 404 together.
+- dhje / 00tr: their criteria said non-admins get 404 on the settings route; read them as 403. The
+  route keeps 403, like every admin route (PLAN-v2 D4 and `admin.test.ts` settle 403; an admin route's
+  existence is no secret, unlike a resource). Kata c5j3 (PLAN-v4) kept 403 for every admin route and
+  moved the CLI tools registry routes, which this batch shipped answering 404, to `requireAdmin` too.
 - Migrations stay append-only (`db.ts` `MIGRATIONS`); parallel lanes each append theirs and the
   restack orders them. No deployed database has run a v3 migration before the batch merges.
 
@@ -98,8 +99,9 @@ candidates that fail it; past the budget a group whose panel lists the tool may 
 whose panel does not. The MCP resource `scp://tools`
 (`application/json`) returns the same `{tools}` for the connection's principal, on every endpoint.
 
-Anyone but a full admin (a non-admin, a
-group-restricted admin key) gets 404 on the admin routes. Every change is audited as
+The registry routes take `requireAdmin` like every admin route: anonymous gets 401, and anyone else
+but a full admin (a non-admin, a group-restricted admin key) gets 403. (Shipped as 404 in v3; Kata
+c5j3, PLAN-v4, moved them to 403.) Every change is audited as
 `cli_tool.create|update|delete` (target `cli_tool`, detail: the homepage, check and commands).
 
 `GET /api/v1/groups/:slug` gains `requires: [{name, items: [{id, name}], tool: {homepage, check,
