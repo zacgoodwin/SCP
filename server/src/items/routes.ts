@@ -7,6 +7,7 @@ import { canReadGroup } from '../access.ts';
 import { MB, badRequest, limitBody as limit, notFound, parseJson, parseQuery } from '../lib/http.ts';
 import { LIMITS, tooLarge } from '../lib/tree.ts';
 import { buildZip } from '../lib/zip.ts';
+import { overrideKind } from '../imports/routes.ts';
 import { importUpload } from './import.ts';
 import {
   addVersion,
@@ -67,7 +68,7 @@ const createBody = z.object({
 });
 const versionBody = z.object({ files: filesIn.optional(), content: z.string().optional(), note: z.string().max(1000).optional() });
 const importFields = z.object({
-  kind: z.enum(KINDS).optional(),
+  kind: overrideKind.optional(),
   visibility: z.enum(['private', 'public']).optional(),
   name: z.string().optional(),
   // en8v: as the pack and GitHub imports' (jcfm): capped at lint's description limit; blank is none.

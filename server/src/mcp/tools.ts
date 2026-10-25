@@ -19,11 +19,11 @@ import {
   slugify,
 } from '../items/service.ts';
 import { addMemberTx, listReadableGroups } from '../groups/service.ts';
-import { INSTALL_SCOPES, TARGETS, buildManifest } from '../groups/bundle.ts';
+import { EXECUTABLE_WARNING, INSTALL_SCOPES, TARGETS, buildManifest, executableOf, type ExecutableFlag } from '../groups/bundle.ts';
 import { asText, catalogEntry, catalogText, clip, entryText, memberEntry, memberInstallPath, resolveTarget, type McpScope } from './scope.ts';
 import { VIEWER_URI } from './viewer.ts';
 import { PLATFORMS, requiresOf, type RequiredCli } from '../tools/service.ts';
-import { FORMATS, KINDS, MD_KINDS, aKind, type GroupRow, type ItemRow, type Kind } from '../types.ts';
+import { FORMATS, KINDS, MD_KINDS, aKind, isExecutable, type GroupRow, type ItemRow, type Kind } from '../types.ts';
 
 /**
  * Max characters of a body per call; longer bodies page with `offset`. Claude Code refuses tool
@@ -95,6 +95,13 @@ function requiresText(reqs: RequiredCli[]): string {
     return `- ${r.name} (${by}): ${cmds.length ? cmds.join('; ') : 'no install command recorded'}.${r.tool.homepage ? ` Homepage: ${r.tool.homepage}.` : ''} Check: \`command -v ${r.tool.check}\``;
   });
   return `## Required CLIs (${reqs.length})\n\nThese skills need command-line tools on the user's machine. Show the user these commands to run themselves; do not run them on your own.\n\n${lines.join('\n')}`;
+}
+
+/** mc52: the warning get_group and get_bundle carry when the group's plugin would run code, naming the members that do. */
+function executableWarning(e: ExecutableFlag): string {
+  const items = e.items ?? [];
+  const named = items.slice(0, 20).map((i) => `${i.kind} ${i.name}`).join(', ') + (items.length > 20 ? `, and ${items.length - 20} more` : '');
+  return `Warning: ${EXECUTABLE_WARNING} Executable members: ${named}.`;
 }
 
 const fmtBytes = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
@@ -203,11 +210,14 @@ export function registerTools(server: McpServer, s: McpScope): void {
       const pg = listPage(s.membersOf(g), from, 'entries');
       const entries = pg.rows.map(memberEntry);
       const how = 'Load a skill with get_skill, an MD with get_md, an artifact with get_artifact or render_artifact. Install everything with get_bundle.';
-      // Description, instructions and required CLIs on the first page only; later pages are catalog.
+      // Description, instructions, required CLIs and the executable flag on the first page only; later pages are catalog.
       const first = from === 0;
       const requires = first ? requiresOf(db, s.membersOf(g)) : [];
+      const executable = first ? executableOf(s.membersOf(g)) : null;
+      const warning = executable ? executableWarning(executable) : '';
       const text = [
         `# ${g.name} (group '${g.slug}')`,
+        warning,
         first ? g.description.trim() : '',
         first && g.instructions.trim() ? `## Instructions\n\n${g.instructions.trim()}` : '',
         requiresText(requires),
@@ -220,13 +230,14 @@ export function registerTools(server: McpServer, s: McpScope): void {
         group: {
           slug: g.slug,
           name: g.name,
-          ...(first ? { description: g.description, instructions: g.instructions, requires } : {}),
+          ...(first ? { description: g.description, instructions: g.instructions, requires, executable } : {}),
           mcp: `${config.publicUrl}/mcp/${g.slug}`,
         },
+        ...(warning && { warning }),
         items: entries,
         total: pg.total,
         next: pg.next,
-        message: `Group '${g.slug}': ${pg.total} catalog entries, ${entries.length} in \`items\`${first ? '; description, instructions and required CLIs in `group`' : ''}.${pg.note} ${how}${requires.length ? ` These skills need ${requires.length} CLI(s) installed (\`group.requires\`): show the user the install commands to run themselves; do not run them on your own.` : ''}`,
+        message: `${warning && `${warning} `}Group '${g.slug}': ${pg.total} catalog entries, ${entries.length} in \`items\`${first ? '; description, instructions and required CLIs in `group`' : ''}.${pg.note} ${how}${requires.length ? ` These skills need ${requires.length} CLI(s) installed (\`group.requires\`): show the user the install commands to run themselves; do not run them on your own.` : ''}`,
       });
     },
   );
@@ -393,11 +404,11 @@ export function registerTools(server: McpServer, s: McpScope): void {
     {
       title: 'Get MD document',
       description:
-        'Load an MD document verbatim: agent definition, slash command, instructions (AGENTS.md), prompt, DESIGN.md, or a package (entry file plus file list). Includes frontmatter and install path.',
+        'Load an MD document verbatim: agent definition, slash command, instructions (AGENTS.md), prompt, DESIGN.md, output style, or a package, hook or MCP server (entry file plus file list). Includes frontmatter and install path.',
       inputSchema: {
         name: name.optional(),
         id: id.optional(),
-        kind: z.enum(MD_KINDS).optional().describe('agent, command, instructions, prompt, design or package; only needed when names collide'),
+        kind: z.enum(MD_KINDS).optional().describe('agent, command, instructions, prompt, design, package, hook, mcp-server or output-style; only needed when names collide'),
         group: group.optional().describe(groupDesc),
         version: version.optional(),
         offset: offset.optional(),
@@ -410,7 +421,7 @@ export function registerTools(server: McpServer, s: McpScope): void {
       const install = memberInstallPath(item, v, member?.installAs);
       // Up to 64 KB of YAML; the entry text (which holds it verbatim) is enough when it is that large.
       const frontmatter = v.frontmatter.length <= PAGE ? (JSON.parse(v.frontmatter) as Record<string, unknown>) : null;
-      const files = item.kind === 'package' || item.kind === 'design' ? listFiles(db, v.id) : [];
+      const files = item.kind === 'package' || item.kind === 'design' || isExecutable(item.kind) ? listFiles(db, v.id) : [];
       const head = [`# ${item.title || item.name}`, `${item.kind} ${item.name} v${v.seq} (latest v${item.latest_seq}), id ${item.id}`, `Install path (Claude Code, project): ${install}`];
       const fetch = files.length > 1 ? `Fetch a file with get_skill_file {"id": "${item.id}", "path": "<path>", "version": ${v.seq}}.` : '';
       const lines = [...head, '', `--- ${v.entry_path}${pg.offset ? ` from offset ${pg.offset}` : ''} ---`, pg.chunk + pg.note, `--- end ${v.entry_path} ---`];
@@ -588,7 +599,9 @@ export function registerTools(server: McpServer, s: McpScope): void {
           ]
         : [`${summary} Run from ${where}, with SCP_KEY set to your SCP API key:`, '', 'bash:', bash, '', 'PowerShell:', powershell];
       const requires = requiresOf(db, s.membersOf(g));
+      const warning = m.executable ? executableWarning(m.executable) : '';
       const text = [
+        ...(warning ? [warning, `In bundle.zip the hooks and MCP servers are inert copies under ${target === 'generic' ? 'hooks/ and mcp-servers/' : '.scp/'}: Claude Code runs hooks only from settings.json or a plugin, and \${CLAUDE_PLUGIN_ROOT} is unset outside one.`, ''] : []),
         ...commands,
         ...(requires.length ? ['', requiresText(requires)] : []),
         '',
@@ -600,7 +613,7 @@ export function registerTools(server: McpServer, s: McpScope): void {
           ? ['', `Warning: install path conflicts (the download will fail until fixed): ${conflicts.map((x) => `${x.path} <- ${x.items.join(', ')}`).join('; ')}${m.conflicts.length > conflicts.length ? `; and ${m.conflicts.length - conflicts.length} more` : ''}`]
           : []),
       ].join('\n');
-      return ok(text, { group: g.slug, url, target, scope, items: m.items.length, ...(viaOauth ? {} : { bash, powershell }), conflicts, conflictCount: m.conflicts.length, requires });
+      return ok(text, { group: g.slug, url, target, scope, items: m.items.length, ...(viaOauth ? {} : { bash, powershell }), conflicts, conflictCount: m.conflicts.length, requires, executable: m.executable, ...(warning && { warning }) });
     },
   );
 

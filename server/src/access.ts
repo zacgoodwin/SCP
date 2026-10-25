@@ -1,6 +1,6 @@
 import type { SQLInputValue } from 'node:sqlite';
 import type { Db } from './db.ts';
-import type { GroupRow, ItemRow, Principal } from './types.ts';
+import { EXECUTABLE_KINDS, type GroupRow, type ItemRow, type Principal } from './types.ts';
 
 export interface SqlFrag {
   sql: string;
@@ -66,20 +66,24 @@ export const includeVouchSql = (parent: string, child: string) =>
  */
 export const MAX_UP_ROWS = 1000;
 
+const EXEC_KINDS_SQL = EXECUTABLE_KINDS.map((k) => `'${k}'`).join(', ');
+
 /**
- * Recursive CTE up_r(group_id, depth): the groups serving one item. Anchored on the item's own
+ * Recursive CTE up_r(group_id, depth, exec_r): the groups serving one item. Anchored on the item's own
  * group_members rows (gm_r, with the group as g_c; `anchor` picks the rows, `join` may bring the
  * item row in as `i`), each anchor group publishing the item (publishedSql), then walked upward
  * through group_includes while each parent's owner vouches for the child (includeVouchSql), at most
  * MAX_INCLUDE_DEPTH hops and MAX_UP_ROWS rows: the same walk as groups/service.ts effectiveGroups,
- * upward. Never anchored on "every readable group": public groups are attacker-sized.
+ * upward. A hook or MCP server (exec_r, by kind: groups/service.ts withheldExec) climbs only to a
+ * parent of the child's owner: another owner's include withholds it, so an include never serves it
+ * here either. Never anchored on "every readable group": public groups are attacker-sized.
  */
 const upCte = (i: string, anchor: string, join = '') =>
-  `WITH RECURSIVE up_r(group_id, depth) AS (` +
-  `SELECT gm_r.group_id, 0 FROM group_members gm_r JOIN scp_groups g_c ON g_c.id = gm_r.group_id${join} WHERE ${anchor} AND ${publishedSql(i, 'g_c')}` +
-  ` UNION SELECT gi_r.group_id, up_r.depth + 1 FROM up_r JOIN group_includes gi_r ON gi_r.included_id = up_r.group_id` +
+  `WITH RECURSIVE up_r(group_id, depth, exec_r) AS (` +
+  `SELECT gm_r.group_id, 0, ${i}.kind IN (${EXEC_KINDS_SQL}) FROM group_members gm_r JOIN scp_groups g_c ON g_c.id = gm_r.group_id${join} WHERE ${anchor} AND ${publishedSql(i, 'g_c')}` +
+  ` UNION SELECT gi_r.group_id, up_r.depth + 1, up_r.exec_r FROM up_r JOIN group_includes gi_r ON gi_r.included_id = up_r.group_id` +
   ` JOIN scp_groups par_r ON par_r.id = gi_r.group_id JOIN scp_groups chi_r ON chi_r.id = up_r.group_id` +
-  ` WHERE up_r.depth < ${MAX_INCLUDE_DEPTH} AND ${includeVouchSql('par_r', 'chi_r')} LIMIT ${MAX_UP_ROWS})`;
+  ` WHERE up_r.depth < ${MAX_INCLUDE_DEPTH} AND ${includeVouchSql('par_r', 'chi_r')} AND (up_r.exec_r = 0 OR par_r.owner_id = chi_r.owner_id) LIMIT ${MAX_UP_ROWS})`;
 
 /** WHERE fragment: item alias `i` is served by a group p can read, as a direct member or through includes. */
 export function servedBySql(p: Principal, i = 'i'): SqlFrag {

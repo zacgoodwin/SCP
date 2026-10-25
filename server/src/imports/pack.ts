@@ -3,19 +3,22 @@ import { requireScope } from '../auth/middleware.ts';
 import { tx, type Db } from '../db.ts';
 import { canEditGroup } from '../access.ts';
 import { addMemberTx, createGroup, getGroupRow, isMember } from '../groups/service.ts';
-import { FRONTMATTER_ERRORS } from '../items/lint.ts';
-import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewItem, readTree, refreshFts, renameFrontmatter, resolveVersion, slugify, suppliedOf, versionSha, type CreateItemInput, type Lint } from '../items/service.ts';
+import { FRONTMATTER_ERRORS, componentOf, entryJson, pluginRootRefs } from '../items/lint.ts';
+import { SINGLE_FILE, addVersion, createItemTx, entryPathFor, getItemRow, listFiles, previewItem, readTree, refreshFts, renameFrontmatter, resolveVersion, slugify, suppliedOf, versionSha, type CreateItemInput, type Lint } from '../items/service.ts';
 import { sha256Hex } from '../lib/crypto.ts';
 import { UNCLOSED, parseFrontmatter, prependFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, MB, badRequest, notFound } from '../lib/http.ts';
-import { isJunkPath, normalizePath, pathKey } from '../lib/paths.ts';
+import { isJunkPath, normalizePath, pathKey, relPath } from '../lib/paths.ts';
 import { stripTopFolder, treeSha256, type TreeFile } from '../lib/tree.ts';
 import { PACK_LIMITS, safeUnzip, type ZipLimits, type ZipLink } from '../lib/zip.ts';
 import { MARKETPLACE_JSON, PLUGIN_JSON, isObject, marketplaceIgnored, parseManifest, pluginMeta, shownValue } from './manifest.ts';
-import { aKind, type Ctx, type GroupRow, type ItemRow, type ItemSource, type Kind, type Principal, type SuppliedFrontmatter } from '../types.ts';
+import { aKind, isExecutable, type Ctx, type ExecutableKind, type GroupRow, type ItemRow, type ItemSource, type Kind, type Principal, type SuppliedFrontmatter } from '../types.ts';
 
 export const ARTIFACT_FROM_TREE = 'an artifact imports from a single file, not from a repository or pack';
-export const PACKAGE_DESCRIPTION = 'description applies to an item kind with one entry file (skill, agent, command, prompt, instructions or design); a package has none';
+export const PACKAGE_DESCRIPTION =
+  "description applies to an item kind with one entry file (skill, agent, command, prompt, instructions or design); a package has none, and a hook's or MCP server's entry is JSON, which takes no frontmatter";
+/** jcfm: whether a description can become the kind's entry frontmatter (supply); else a description is a 400 (PACKAGE_DESCRIPTION), never silently dropped. */
+const takesDescription = (kind: Kind) => kind !== 'package' && !isExecutable(kind);
 
 /** One item-to-be inside an imported tree. */
 export interface Unit {
@@ -42,7 +45,14 @@ export interface Unit {
   supplied?: SuppliedFrontmatter;
   /** naming-8: the tool a unit at a plugin root is a port for (`antigravity/` as the plugin), set by detectUnits; else unitPort reads its path. */
   port?: string;
+  /** mc52: a hook's or MCP server's entry file in the tree, where the import reports it; its `path` is the plugin root, which a source update re-detects (execTree). */
+  entry?: string;
+  /** mc52: the plugin root's hook and MCP server entries made up to this one, its own last, plugin-relative: ItemRow.source_entries. */
+  entries?: ExecEntry[];
 }
+
+/** mc52: [kind, plugin-relative path] of a hook's or MCP server's upstream entry file. */
+export type ExecEntry = [ExecutableKind, string];
 
 export interface Skipped {
   path: string;
@@ -175,11 +185,17 @@ function preV4RootName(path: string, repoName: string, skill: boolean): string {
 /** A skill unit's files: the root entry, in whatever case the tree spelled it, lives at SKILL.md. */
 const skillTree = (files: TreeFile[]) => files.map((f) => (isSkillMd(f.path) ? { ...f, path: 'SKILL.md' } : f));
 const NOT_AN_ITEM = 'repository documentation, not an item';
-/** Plugin components SCP neither stores nor serves (dnxq; docs/PLAN-v3.md: report-only until a human decides). Hooks and MCP servers run commands on every installing machine. */
-const PLUGIN_COMPONENTS = ['hooks/', '.mcp.json', 'output-styles/', 'settings.json', '.lsp.json', 'monitors/'];
+/**
+ * Plugin components SCP neither stores nor serves (dnxq, snqk; docs/PLAN-v4.md mc52): reported once each when no
+ * unit took their files. Hooks, `.mcp.json` and output styles are units (mc52), so what is left of those is files
+ * no unit claimed (a `hooks/` with no hooks.json). `bin/` is put on the PATH while a plugin is enabled.
+ */
+const PLUGIN_COMPONENTS = ['hooks/', '.mcp.json', 'output-styles/', 'settings.json', '.lsp.json', 'monitors/', 'themes/', 'workflows/', 'bin/'];
+/** mc52: [kind, manifest field, default file] of the executable components, in the order a plugin's units are made. */
+const EXEC_FILES: [ExecutableKind, string, string][] = [['hook', 'hooks', 'hooks/hooks.json'], ['mcp-server', 'mcpServers', '.mcp.json']];
 const join = (root: string, p: string) => (root ? `${root}/${p}` : p);
-/** Manifest component fields (4ky8): [field, kind, named by file], as FILE_DIRS. */
-const DECLARED: [string, Kind, boolean][] = [['skills', 'skill', false], ['agents', 'agent', false], ['commands', 'command', true]];
+/** Manifest component fields (4ky8; mc52 outputStyles): [field, kind, named by file], as FILE_DIRS. */
+const DECLARED: [string, Kind, boolean][] = [['skills', 'skill', false], ['agents', 'agent', false], ['commands', 'command', true], ['outputStyles', 'output-style', true]];
 /**
  * A repository's contributor tooling (4ky8 part 2): skipped when the repository says where its product
  * lives. The folders go on a plugin or a top-level skills/ folder; the root instruction files only on a
@@ -242,17 +258,6 @@ function pluginRoots(tree: TreeFile[], skipped: { push: (s: Skipped) => void }):
   }
   const depth = (p: string) => (p ? p.split('/').length : 0);
   return { roots: [...roots].sort((a, b) => depth(b) - depth(a) || a.localeCompare(b)), manifests };
-}
-
-/** A `./`-style relative path with `.` and `..` resolved, or null when it climbs above where it starts. */
-function relPath(p: string): string | null {
-  const segs: string[] = [];
-  for (const s of p.split('/')) {
-    if (s === '..') {
-      if (segs.pop() === undefined) return null;
-    } else if (s && s !== '.') segs.push(s);
-  }
-  return segs.join('/');
 }
 
 /** A plugin's manifest object: `from` is the file it came from, `root` the folder its paths are relative to. */
@@ -542,12 +547,17 @@ function fileUnits(tree: TreeFile[], kind: Kind, rootName: string, skipped: Skip
  * `folderRoot` says the tree is one folder, not a repository root: a SKILL.md in it makes the whole
  * folder one skill (as the same folder is under skills/ in a whole-repository import), with no carving
  * of CLAUDE.md or agents/*.md into items of their own. `pluginFolder` says the tree is a plugin root
- * whose SKILL.md a whole-repository import made one skill (updateTree): only the plugin passes carve.
+ * (updateTree: one whose SKILL.md a whole-repository import made one skill, or mc52 one a hook or MCP
+ * server came from): only the plugin passes carve. `entries` (mc52 execTree) are the root's hook and MCP
+ * server entries as an import made them, re-made first and in that order: one a marketplace entry
+ * declared is in no manifest of the plugin folder alone. `exec: false` (updateTree, for a root skill
+ * imported before mc52) makes no hook, MCP server or output-style units: their files stay in the root
+ * skill, as they did then.
  */
 export function detectUnits(
   tree: TreeFile[],
   rootName: string,
-  opts: { layoutDir?: string; folderRoot?: boolean; includeRepoTooling?: boolean; pluginFolder?: boolean; folderKinds?: Record<string, FolderKind> } = {},
+  opts: { layoutDir?: string; folderRoot?: boolean; includeRepoTooling?: boolean; pluginFolder?: boolean; folderKinds?: Record<string, FolderKind>; entries?: ExecEntry[]; exec?: boolean } = {},
 ): { units: Unit[]; skipped: Skipped[]; skippedFolders: SkippedFolder[] } {
   const units: Unit[] = [];
   const skipped: Skipped[] = [];
@@ -591,7 +601,7 @@ export function detectUnits(
     if (REPO_DOCS.test(file)) {
       claimed.set(f.path, f.path);
       skipped.push({ path: f.path, reason: NOT_AN_ITEM });
-    } else fileUnit(f, kind, { name: byFile ? slugify(stem(file)) || undefined : undefined, prefixes: kind === 'agent' || kind === 'command' ? prefixesOf(f.path) : undefined });
+    } else fileUnit(f, kind, { name: byFile ? slugify(stem(file)) || undefined : undefined, prefixes: kind === 'agent' || kind === 'command' || kind === 'output-style' ? prefixesOf(f.path) : undefined });
   };
 
   // Manifest problems are listed up to MAX_MANIFEST_SKIPS; the rest are counted in one entry.
@@ -600,6 +610,11 @@ export function detectUnits(
   const manifestSkips = { push: (s: Skipped) => (listed++ < MAX_MANIFEST_SKIPS ? skipped.push(s) : unlisted++) };
   const { roots: plugins, manifests } = pluginRoots(tree, manifestSkips);
   const pluginSet = new Set(plugins);
+  // A plugin root's own item updates from that root alone (updateTree), which is a plugin root whether or not its manifest is in it (a marketplace source).
+  if (opts.pluginFolder && !pluginSet.has('')) {
+    plugins.push('');
+    pluginSet.add('');
+  }
   /** The deepest plugin root strictly above `path` ('' when none or only the repository root's), and the path relative to it. */
   const rootOf = (path: string): [string, string] => {
     for (let i = path.lastIndexOf('/'); i > 0; i = path.lastIndexOf('/', i - 1)) {
@@ -637,7 +652,7 @@ export function detectUnits(
   for (const m of manifests) {
     for (const [key, kind, byFile] of DECLARED) {
       const v = m.data[key];
-      if (v === undefined || v === null) continue;
+      if (v === undefined || v === null || (kind === 'output-style' && opts.exec === false)) continue;
       if (typeof v !== 'string' && !Array.isArray(v)) {
         manifestSkips.push({ path: m.from, reason: `${m.label}'${key}' is not a path or a list of paths` });
         continue;
@@ -710,6 +725,84 @@ export function detectUnits(
       }
     }
   }
+  // mc52 (docs/PLAN-v4.md): each plugin root's hooks and MCP servers, then its output styles, deepest root first.
+  const execUnits = (r: string) => {
+    const at = (p: string) => join(r, p);
+    byPath ??= new Map(tree.map((f) => [f.path, f]));
+    const own = manifests.filter((m) => m.root === r);
+    // The default file first, then each `.json` the manifest names, in order; inline forms and bundles are reported (snqk).
+    const entries: { kind: ExecutableKind; f: TreeFile }[] = [];
+    const added = new Set<string>();
+    const add = (kind: ExecutableKind, f: TreeFile | undefined) => {
+      if (!f || claimed.has(f.path) || added.has(f.path)) return;
+      added.add(f.path);
+      entries.push({ kind, f });
+    };
+    // A source update (the plugin folder alone, root '') re-makes its import's entries first, so each takes what it took then.
+    if (!r) for (const [kind, p] of opts.entries ?? []) add(kind, byPath.get(p));
+    for (const [kind, key, file] of [...EXEC_FILES, [null, 'lspServers', ''] as const]) {
+      if (kind) add(kind, byPath.get(at(file)));
+      for (const m of own) {
+        const v = m.data[key];
+        for (const raw of v === undefined || v === null ? [] : Array.isArray(v) ? v : [v]) {
+          const shown = `${key} path '${shownValue(raw, 200)}'`;
+          if (isObject(raw)) manifestSkips.push({ path: m.from, reason: `${m.label}inline '${key}' in the manifest is not supported by SCP; it was not imported` });
+          else if (!kind) continue;
+          else if (kind === 'mcp-server' && typeof raw === 'string' && /^https?:|\.(mcpb|dxt)$/i.test(raw)) {
+            manifestSkips.push({ path: m.from, reason: `${m.label}MCP bundle '${raw.slice(0, 200)}' is not supported by SCP; it was not imported` });
+          } else {
+            const d = declaredPath(r, raw);
+            const f = 'path' in d && /\.json$/i.test(d.path) ? byPath.get(d.path) : undefined;
+            if (f) add(kind, f);
+            else manifestSkips.push({ path: m.from, reason: `${m.label}${shown} ${'reason' in d ? d.reason : 'names no .json file; not imported'}` });
+          }
+        }
+      }
+    }
+    for (const { f } of entries) claimed.set(f.path, f.path);
+    // Named after the plugin (its manifest's name, else its folder), so each import of it finds them again.
+    const named = own.find((m) => typeof m.data.name === 'string' && slugify(m.data.name));
+    const plugin = named ? (named.data.name as string) : baseOf(r) || rootName;
+    const count = { hook: 0, 'mcp-server': 0 };
+    // Folders already taken whole: a later unit's reference into one finds nothing left, so it is not walked again.
+    const swept = new Set<string>();
+    const rels = entries.map(({ kind, f }): ExecEntry => [kind, r ? f.path.slice(r.length + 1) : f.path]);
+    for (const [i, { kind, f }] of entries.entries()) {
+      const suffix = (kind === 'hook' ? '-hooks' : '-mcp') + (count[kind]++ ? `-${count[kind]}` : '');
+      const name = (slugify(plugin, 64 - suffix.length) || 'plugin') + suffix;
+      // The entry, plus what its references need, at their paths under the plugin root.
+      const taken: TreeFile[] = [];
+      const take = (g: TreeFile) => {
+        if (claimed.has(g.path) || rootOf(g.path)[0] !== r) return;
+        claimed.set(g.path, g.path);
+        taken.push({ ...g, path: r ? g.path.slice(r.length + 1) : g.path });
+      };
+      const sweep = (dir: string) => {
+        if (!swept.has(dir)) for (const g of byDir.get(at(dir)) ?? []) take(g);
+        swept.add(dir);
+      };
+      if (kind === 'hook') sweep('hooks');
+      for (const p of pluginRootRefs(entryJson(utf8.decode(f.bytes)))) {
+        // Never another component's files (lint exec.path.reserved), in any case.
+        const rel = relPath(p);
+        if (!rel || componentOf(rel)) continue;
+        const first = rel.split('/')[0];
+        const file = rel === first ? byPath.get(at(rel)) : undefined;
+        if (file) take(file);
+        else sweep(first);
+      }
+      const entry = { ...f, path: entryPathFor(kind, name) };
+      const prefixes = prefixesOf(at(entry.path));
+      // ponytail: the 49 entries before this one at most, so a manifest naming thousands stays linear; past that a source update may hand this unit a folder an earlier one took.
+      const upTo = rels.slice(Math.max(0, i - 49), i + 1);
+      units.push({ path: r, kind, tree: [entry, ...taken], name, fallbackName: name, entry: f.path, entries: upTo, ...(prefixes && { prefixes }) });
+    }
+    // The manifest's outputStyles replace the default folder (DECLARED took them).
+    if (!own.some((m) => m.data.outputStyles !== undefined && m.data.outputStyles !== null)) {
+      for (const g of byDir.get(at('output-styles')) ?? []) if (dirOf(g.path) === at('output-styles') && isMd(g.path) && !claimed.has(g.path)) fileDirUnit(g, baseOf(g.path), 'output-style', true);
+    }
+  };
+  if (opts.exec !== false) for (const r of plugins) execUnits(r);
   // As in the whole repository, the plugin root's skill keeps everything else: nested skill folders, CLAUDE.md.
   if (opts.pluginFolder && rootSkillMd && !claimed.has(rootSkillMd.path)) {
     units.push({ path: '', kind: 'skill', tree: skillTree(free()), fallbackName: rootName, folderName: rootName });
@@ -777,15 +870,17 @@ export function detectUnits(
     // skipped, and a 400 nothing_to_import carries them too): a folder under a skills/ dir with no
     // SKILL.md, a .md nested below a layout folder that takes its files at one level, and any other
     // loose .md apart from README-style docs, which a repository is expected to carry. Each file is read
-    // relative to the deepest plugin root above it (bppq), and a plugin's hooks, MCP servers and other
-    // unsupported components are reported once each (dnxq), not file by file.
+    // relative to the deepest plugin root above it (bppq), and a plugin's unsupported components (and what
+    // no hook, MCP server or output-style unit took, mc52) are reported once each (dnxq, snqk), not file by file.
     const folders = new Set<string>();
     const components = new Map<string, string>();
     for (const f of rest) {
       const [r, rel] = rootOf(f.path);
-      const component = pluginSet.has(r) ? PLUGIN_COMPONENTS.find((c) => (c.endsWith('/') ? rel.startsWith(c) : rel === c)) : undefined;
+      // Folded, as componentOf: on a case-insensitive install disk BIN/ is the bin/ put on the PATH.
+      const key = pathKey(rel);
+      const component = pluginSet.has(r) ? PLUGIN_COMPONENTS.find((c) => (c.endsWith('/') ? key.startsWith(c) : key === c)) : undefined;
       if (component) {
-        components.set(join(r, component.replace(/\/$/, '')), component);
+        components.set(join(r, component.endsWith('/') ? rel.split('/')[0] : rel), component);
         continue;
       }
       const dir = SKILL_DIRS.find((d) => rel.startsWith(d + '/'));
@@ -922,6 +1017,7 @@ export function updateTree(db: Db, item: ItemRow, tree: TreeFile[]): TreeFile[] 
     // mas4: the one .md file a skill was imported from (its source path names that file) is its SKILL.md again.
     if (item.kind === 'skill' && isMd(tree[0].path) && item.source_path !== null && baseOf(item.source_path) === tree[0].path) return [{ ...tree[0], path: 'SKILL.md' }];
   }
+  if (isExecutable(item.kind)) return execTree(item, tree);
   if (item.kind !== 'skill') return tree;
   const cut = new Set<string>(item.source_carve ? JSON.parse(item.source_carve) : []);
   const isCut = (p: string) => {
@@ -935,24 +1031,43 @@ export function updateTree(db: Db, item: ItemRow, tree: TreeFile[]): TreeFile[] 
   // A carved skill with a source path is a plugin root's (detectUnits folderUnit); one at the repository root has none.
   // nenk: an import that kept the repository's tooling keeps it in the root skill on every update too.
   const pluginFolder = item.source_scope === 'root' && !!item.source_path;
-  const rootOf = (includeRepoTooling: boolean) => detectUnits(kept, item.name, { pluginFolder, includeRepoTooling }).units.find((u) => u.path === '' && u.kind === 'skill');
+  const rootOf = (includeRepoTooling: boolean, exec = true) => detectUnits(kept, item.name, { pluginFolder, includeRepoTooling, exec }).units.find((u) => u.path === '' && u.kind === 'skill');
   const root = rootOf(!!item.source_tooling);
   if (!root || root.tree.length === kept.length) return whole;
   if (item.source_scope === 'root') {
-    if (item.source_tooling) return root.tree;
-    // source_tooling is 0 on every row from before it was recorded, ones imported with the flag included.
-    // While the latest version holds a file only the tooling detection keeps, it is detected with it, so an
-    // update never drops GEMINI.md or .claude/ unreported; a re-import records the flag either way.
-    const tooled = rootOf(true);
-    const toolingOnly = new Set(tooled?.tree.map((f) => f.path));
-    for (const f of root.tree) toolingOnly.delete(f.path);
-    if (!tooled || !toolingOnly.size) return root.tree;
-    return listFiles(db, resolveVersion(db, item).id).some((f) => toolingOnly.has(f.path)) ? tooled.tree : root.tree;
+    // Detected as an older import detected while the latest version holds a file only that detection keeps,
+    // so an update never drops it unreported; a re-import records what the import does now.
+    const stored = new Set(listFiles(db, resolveVersion(db, item).id).map((f) => f.path));
+    const older = (cur: Unit, then: Unit | undefined) => {
+      const has = new Set(cur.tree.map((f) => f.path));
+      return then?.tree.some((f) => !has.has(f.path) && stored.has(f.path)) ? then : cur;
+    };
+    // nenk: source_tooling is 0 on every row from before it was recorded, ones imported with the flag included
+    // (GEMINI.md and the loose tooling kept).
+    const tooled = item.source_tooling ? root : older(root, rootOf(true));
+    // mc52: a root skill imported before it kept its hooks, MCP servers and output styles (no unit carved them);
+    // a re-import makes their items and writes the carved skill.
+    return older(tooled, rootOf(!!item.source_tooling || tooled !== root, false)).tree;
   }
   const carved = new Set(whole.map((f) => f.path));
   for (const f of root.tree) carved.delete(f.path);
   const stored = listFiles(db, resolveVersion(db, item).id);
   return stored.some((f) => carved.has(f.path)) ? whole : root.tree;
+}
+
+/**
+ * mc52: a hook's or MCP server's tree from its source path, the plugin root: the unit detection makes there
+ * for the upstream entry its import recorded (source_entries, its own last), the entries made before it
+ * re-made first and in order, so each takes what it took then. A file a marketplace entry's `hooks` or
+ * `mcpServers` names is in no manifest of the plugin folder alone, so only the record finds it; a row
+ * without one is the kind's default file.
+ */
+function execTree(item: ItemRow, tree: TreeFile[]): TreeFile[] {
+  const entries: ExecEntry[] = item.source_entries ? JSON.parse(item.source_entries) : [[item.kind as ExecutableKind, entryPathFor(item.kind, '')]];
+  const own = entries.at(-1)![1];
+  const unit = detectUnits(tree, item.name, { pluginFolder: true, entries }).units.find((u) => u.kind === item.kind && u.path === '' && u.entry === own);
+  if (!unit) throw new HttpError(400, 'bad_source', `the ${item.kind === 'hook' ? 'hooks' : 'MCP servers'} file '${own.slice(0, 200)}' that '${item.name}' was imported from is no longer in its plugin`);
+  return unit.tree;
 }
 
 /** GitHub resolves repository names case-insensitively, and a zip's name is a file name on a case-insensitive disk. */
@@ -972,14 +1087,18 @@ const TOO_LONG = 'would exceed the 64-character name limit';
  * A skill's SKILL.md or an agent's one file with its frontmatter name set to name, inserted when it
  * names none (5ef6). Frontmatter that does not parse cannot take it: 422, the unit skipped at import and
  * the source write refused, never stored under its bare name. what: 'prefixed name' or 'name' (supplied).
+ * Review (outputstyle-prefix-not-pinned): an output style's frontmatter `name` too, which Claude Code lists
+ * it by; one with none (or YAML that does not parse, which Claude Code still loads) goes by its file name,
+ * the item's, so it is left as it is.
  */
 function pinName(kind: Kind, tree: TreeFile[], name: string, what = 'prefixed name'): TreeFile[] {
-  if (kind !== 'skill' && kind !== 'agent') return tree;
+  if (kind !== 'skill' && kind !== 'agent' && kind !== 'output-style') return tree;
   return tree.map((f) => {
     if (kind === 'skill' ? f.path !== 'SKILL.md' : tree.length !== 1) return f;
     // jcfm: an entry with no frontmatter takes the block SCP supplies (supply), which carries the name;
     // a name-only block here would keep it out. ponytail: with no description to supply it stays nameless.
-    if (!parseFrontmatter(utf8.decode(f.bytes)).hasFrontmatter) return f;
+    const fm = parseFrontmatter(utf8.decode(f.bytes));
+    if (!fm.hasFrontmatter || (kind === 'output-style' && fm.data.name === undefined)) return f;
     const text = renameFrontmatter(utf8.decode(f.bytes), name);
     if (text === null) throw new HttpError(422, 'frontmatter_invalid', `its frontmatter is not valid YAML, so it cannot take the ${what} '${name}'`);
     return { ...f, bytes: new TextEncoder().encode(text) };
@@ -1020,14 +1139,14 @@ function wasPrefixed(item: ItemRow, bare: string): boolean {
 }
 
 /**
- * 5ef6: the upstream entry of a prefixed skill or agent names it bare, or nothing at all (or its YAML
+ * 5ef6: the upstream entry of a prefixed skill, agent or output style names it bare, or nothing at all (or its YAML
  * does not parse); it takes the item's prefixed name again, as at import (pinName refuses what it cannot set).
  * pin (mas4): SCP supplied the name, so whatever name upstream's own frontmatter gives becomes the item's (its install folder).
  * ponytail: a nameless entry counts as prefixed only by a recorded source_prefix; a row from before the
  * column keeps upstream's nameless entry, still installed under its prefixed folder.
  */
 function keepPrefix(item: ItemRow, tree: TreeFile[], pin = false): TreeFile[] {
-  const entry = item.kind === 'skill' ? tree.find((f) => f.path === 'SKILL.md') : item.kind === 'agent' && tree.length === 1 ? tree[0] : undefined;
+  const entry = item.kind === 'skill' ? tree.find((f) => f.path === 'SKILL.md') : (item.kind === 'agent' || item.kind === 'output-style') && tree.length === 1 ? tree[0] : undefined;
   if (!entry) return tree;
   const fmName = parseFrontmatter(utf8.decode(entry.bytes)).data.name;
   if (fmName === item.name) return tree;
@@ -1080,6 +1199,7 @@ function unitInput(u: Unit, opts: ImportOpts): CreateItemInput & { source: ItemS
     folderName: u.folderName,
     suppliedFrontmatter: supplied ? u.supplied : undefined,
     sourceTooling: opts.includeRepoTooling,
+    sourceEntries: u.entries,
   };
 }
 
@@ -1110,14 +1230,21 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
   // Upstream's entry: a supplied block (input.tree) goes only where there was none, so never on an unclosed one.
   const entry = entryOf(u.kind, u.tree);
   const headed = entry && parseFrontmatter(utf8.decode(entry.bytes)).error === UNCLOSED ? previewItem(input, waive, true)?.name : undefined;
-  let own = takes
-    ? (ctx.db.prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND source_path IS ? AND source_repo IS NOT NULL ORDER BY created_at, rowid').all(p.userId, u.kind, source.path) as unknown as ItemRow[])
-      .find(
-        (h) =>
-          sameRepo(h.source_repo, source.repo) &&
-          (h.name === takes || h.name === legacy || h.name === headed || h.name === u.bare || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes)) || suppliedOf(h)?.name !== undefined),
+  const rows = takes
+    ? (ctx.db.prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND source_path IS ? AND source_repo IS NOT NULL ORDER BY created_at, rowid').all(p.userId, u.kind, source.path) as unknown as ItemRow[]).filter((h) =>
+        sameRepo(h.source_repo, source.repo),
       )
-    : undefined;
+    : [];
+  // mc52: a hook or MCP server unit is its upstream entry (source_entries, its own last, plugin-relative), never
+  // its positional name (-hooks, -hooks-2): one added, removed or reordered upstream must not write its code
+  // into another entry's item. A row recorded without an entry is found by name as before.
+  const mine = u.entries?.at(-1)?.[1];
+  const entryOfRow = (h: ItemRow) => (JSON.parse(h.source_entries!) as ExecEntry[]).at(-1)?.[1];
+  let own = rows.find((h) =>
+    mine !== undefined && h.source_entries
+      ? entryOfRow(h) === mine
+      : h.name === takes || h.name === legacy || h.name === headed || h.name === u.bare || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes!)) || suppliedOf(h)?.name !== undefined,
+  );
   // naming-1: found under its recorded prefix, or under its bare name (an unprefixed copy of this import takes
   // that now, prefixClashes), while another unit of this import now carries that name (so prefixClashes gave
   // this one a longer prefix, or none): the item takes the name this import gives the unit, as a fresh import
@@ -1138,11 +1265,12 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
     // nenk: carved otherwise than last time (the same zip or commit with includeRepoTooling toggled): the stored
     // tree is not this carving's, so the same commit alone does not make it untouched below.
     const carve = u.carve?.length ? JSON.stringify(u.carve) : null; // as createItemTx stores it
-    const recarved = !!own.source_tooling !== !!input.sourceTooling || own.source_carve !== carve;
+    const entries = u.entries?.length ? JSON.stringify(u.entries) : null;
+    const recarved = !!own.source_tooling !== !!input.sourceTooling || own.source_carve !== carve || own.source_entries !== entries;
     // How this import carved the unit replaces the last one's: the next source/update follows the manifest as it is now, with or without the tooling (nenk).
     ctx.db
-      .prepare('UPDATE items SET source_scope = ?, source_carve = ?, source_tooling = ? WHERE id = ?')
-      .run(input.sourceScope ?? null, carve, input.sourceTooling ? 1 : 0, own.id);
+      .prepare('UPDATE items SET source_scope = ?, source_carve = ?, source_tooling = ?, source_entries = ? WHERE id = ?')
+      .run(input.sourceScope ?? null, carve, input.sourceTooling ? 1 : 0, entries, own.id);
     // The same commit (or the same zip) again, or one whose unit tree, with the stored block, is what the
     // source last wrote: nothing changed upstream here, so a local edit made since stays the latest version.
     // The ref and commit still follow the ones named (a tag, then the branch at the same commit).
@@ -1162,8 +1290,12 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
     }
     return versionFromSource(ctx, p, own, tree, source, opts.note, waive, u.supplied);
   }
+  // mc52: a new entry's positional name may be a sibling's, kept since its entry moved: the next free -n instead.
+  let fresh = takes;
+  const m = mine !== undefined && fresh ? /^(.*?)(-hooks|-mcp)(?:-\d+)?$/.exec(fresh) : null;
+  for (let n = 2; m && rows.some((h) => h.name === fresh); n++) fresh = `${m[1].slice(0, 64 - `${m[2]}-${n}`.length).replace(/-+$/, '')}${m[2]}-${n}`;
   try {
-    return { item: createItemTx(ctx, p, input, { waiveFrontmatter: waive }), op: 'create' };
+    return { item: createItemTx(ctx, p, fresh === takes ? input : { ...input, name: fresh }, { waiveFrontmatter: waive }), op: 'create' };
   } catch (e) {
     if (!(e instanceof HttpError) || e.code !== 'name_taken') throw e;
     const taken = (e.details as { name: string }).name;
@@ -1214,6 +1346,8 @@ function prefixClashes(units: Unit[], names: (string | undefined)[], opts: Impor
   const dropped = new Set<number>();
   // A generated name another unit of this import already carries would make that unit the clash's loser.
   const used = new Set(byName.keys());
+  // Where a unit is reported: a hook's or MCP server's entry file (mc52), else its path; every push and the splice agree.
+  const where = (u: Unit) => u.entry ?? u.path;
   for (const idx of byName.values()) {
     const { kind } = units[idx[0]];
     const name = names[idx[0]]!;
@@ -1249,7 +1383,7 @@ function prefixClashes(units: Unit[], names: (string | undefined)[], opts: Impor
         } else if (n && !stuck) continue;
         tries.delete(i);
         dropped.add(i);
-        skipped.push({ path: units[i].path, reason: `another ${kind} of this import is named '${name}', and ${why}` });
+        skipped.push({ path: where(units[i]), reason: `another ${kind} of this import is named '${name}', and ${why}` });
       }
     }
     // A held copy that found no free prefixed name keeps the bare name after all, as before v4: its item keeps
@@ -1257,11 +1391,12 @@ function prefixClashes(units: Unit[], names: (string | undefined)[], opts: Impor
     const keep = unprefixed.length ? copies.find((i) => dropped.has(i) && held(i, name)) : undefined;
     if (keep !== undefined) {
       dropped.delete(keep);
-      skipped.splice(skipped.findLastIndex((s) => s.path === units[keep].path), 1);
+      const k = skipped.findLastIndex((s) => s.path === where(units[keep]));
+      if (k >= 0) skipped.splice(k, 1);
       const at = unitInput(units[keep], opts).source.path ?? 'the root';
       for (const i of unprefixed) {
         dropped.add(i);
-        skipped.push({ path: units[i].path, reason: `another ${kind} of this import (${at}) is named '${name}', which an earlier import of this source gave it, and it has no free prefixed name to give way with` });
+        skipped.push({ path: where(units[i]), reason: `another ${kind} of this import (${at}) is named '${name}', which an earlier import of this source gave it, and it has no free prefixed name to give way with` });
       }
       continue;
     }
@@ -1269,7 +1404,7 @@ function prefixClashes(units: Unit[], names: (string | undefined)[], opts: Impor
     const at = unitInput(units[copies[0]], opts).source.path ?? 'the root';
     for (const i of idx.filter((i) => unitPort(units[i]))) {
       dropped.add(i);
-      skipped.push({ path: units[i].path, reason: `another copy of this ${kind} (${at}) was imported; this one is the ${unitPort(units[i])} port` });
+      skipped.push({ path: where(units[i]), reason: `another copy of this ${kind} (${at}) was imported; this one is the ${unitPort(units[i])} port` });
     }
   }
   return dropped;
@@ -1362,10 +1497,11 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
   // jcfm: one description cannot fit many items.
   if (opts.description !== undefined && units.length !== 1) throw badRequest(`description applies to an import of exactly one item (found ${units.length})`);
   // A package's entry is README.md or else its first .md, which can move between source updates: no one file to supply.
-  if (opts.description !== undefined && units[0].kind === 'package') throw badRequest(PACKAGE_DESCRIPTION);
+  // A hook's or MCP server's entry is JSON (mc52): supply would skip it without a word.
+  if (opts.description !== undefined && !takesDescription(units[0].kind)) throw badRequest(PACKAGE_DESCRIPTION);
   const { db } = ctx;
-  // A one-file import's unit is the root of its one-file tree (''): it is reported at the file's path.
-  const at = (u: Unit) => (opts.pathIsFile && opts.source.path) || u.path;
+  // A one-file import's unit is the root of its one-file tree (''): it is reported at the file's path; a hook or MCP server at its entry file.
+  const at = (u: Unit) => (opts.pathIsFile && opts.source.path) || u.entry || u.path;
   // jcfm: the description, else the fields an earlier import of the same unit stored, become the frontmatter of
   // a unit whose entry has none upstream (a skill or agent gets its name too); before the previews, so lint sees them.
   const storedFm = db.prepare('SELECT supplied_frontmatter AS s FROM items WHERE owner_id = ? AND kind = ? AND lower(source_repo) = lower(?) AND source_path IS ? AND supplied_frontmatter IS NOT NULL');

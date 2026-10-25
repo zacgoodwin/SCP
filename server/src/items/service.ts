@@ -9,7 +9,7 @@ import { HttpError, badRequest, forbidden, notFound } from '../lib/http.ts';
 import { assertNoCollisions, isJunkPath, isTextPath, mediaTypeFor, normalizePath, segmentProblem } from '../lib/paths.ts';
 import { LIMITS, checkLimits, stripTopFolder, tooLarge, treeSha256, type TreeFile } from '../lib/tree.ts';
 import { sweepBlobs } from './gc.ts';
-import { FRONTMATTER_ERRORS, FRONTMATTER_KEYS, lintVersion, parseRequires, type Lint } from './lint.ts';
+import { FRONTMATTER_ERRORS, FRONTMATTER_KEYS, lintVersion, parseRequires, versionExecutable, type Lint } from './lint.ts';
 import { touchGroupsOfItem } from '../groups/touch.ts';
 import { FORMATS, KINDS, aKind, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type SuppliedFrontmatter, type VersionRow } from '../types.ts';
 
@@ -55,6 +55,8 @@ export interface CreateItemInput {
   suppliedFrontmatter?: SuppliedFrontmatter;
   /** With source: the import kept the repository's own tooling (ItemRow.source_tooling). */
   sourceTooling?: boolean;
+  /** With source: a hook's or MCP server's upstream entry, last, after those its plugin root made before it (ItemRow.source_entries). */
+  sourceEntries?: [string, string][];
 }
 
 export interface VersionInput {
@@ -92,6 +94,8 @@ export interface ItemSummary {
   visibility: 'private' | 'public';
   format: Format | null;
   latestSeq: number;
+  /** mc52: the latest version's item_versions.executable (items/lint.ts versionExecutable), which drives the web "runs code" badge. */
+  executable: boolean;
   owner: { id: string; username: string };
   updatedAt: string;
 }
@@ -103,6 +107,8 @@ export interface VersionSummary {
   totalBytes: number;
   note: string;
   createdAt: string;
+  /** mc52: this version's item_versions.executable, so the item page badges the version on screen. */
+  executable: boolean;
   /** clientId: the connected OAuth app that wrote it (MCP), so two apps and the owner's own edits stay tellable apart. */
   createdBy: { userId: string | null; keyId: string | null; clientId: string | null };
 }
@@ -125,7 +131,7 @@ export interface ItemDetail extends ItemSummary {
   canEdit: boolean;
 }
 
-export const SINGLE_FILE = new Set<Kind>(['agent', 'command', 'prompt', 'instructions', 'artifact']);
+export const SINGLE_FILE = new Set<Kind>(['agent', 'command', 'prompt', 'instructions', 'artifact', 'output-style']);
 const ARTIFACT_ENTRY: Record<Format, string> = {
   html: 'index.html',
   markdown: 'index.md',
@@ -151,6 +157,11 @@ export function entryPathFor(kind: Kind, name: string, format?: Format | null): 
       return 'README.md';
     case 'artifact':
       return ARTIFACT_ENTRY[format ?? 'code'];
+    // mc52: a plugin's own layout, so `${CLAUDE_PLUGIN_ROOT}/<path>` in the entry finds the item's other files.
+    case 'hook':
+      return 'hooks/hooks.json';
+    case 'mcp-server':
+      return '.mcp.json';
     default:
       return `${name}.md`;
   }
@@ -204,7 +215,9 @@ export function readTree(db: Db, versionId: string): TreeFile[] {
 }
 
 export function itemSummary(db: Db, row: ItemRow): ItemSummary {
-  const owner = db.prepare('SELECT username FROM users WHERE id = ?').get(row.owner_id) as { username: string } | undefined;
+  const r = db
+    .prepare('SELECT (SELECT username FROM users WHERE id = ?) AS username, (SELECT executable FROM item_versions WHERE item_id = ? AND seq = ?) AS executable')
+    .get(row.owner_id, row.id, row.latest_seq) as { username: string | null; executable: number | null };
   return {
     id: row.id,
     kind: row.kind,
@@ -217,7 +230,8 @@ export function itemSummary(db: Db, row: ItemRow): ItemSummary {
     visibility: row.visibility,
     format: row.format,
     latestSeq: row.latest_seq,
-    owner: { id: row.owner_id, username: owner?.username ?? '' },
+    executable: !!r.executable,
+    owner: { id: row.owner_id, username: r.username ?? '' },
     updatedAt: row.updated_at,
   };
 }
@@ -229,6 +243,7 @@ export const versionSummary = (v: VersionRow): VersionSummary => ({
   totalBytes: v.total_bytes,
   note: v.note,
   createdAt: v.created_at,
+  executable: !!v.executable,
   createdBy: { userId: v.created_by_user, keyId: v.created_by_key, clientId: v.created_by_client },
 });
 
@@ -388,8 +403,10 @@ function shapeTree(kind: Kind, format: Format | null, raw: TreeFile[], unwrap: '
   } else {
     entryPath = entryPathFor(kind, '', format);
     const stripped = stripTopFolder(files).files;
-    const unwrapsEntry = kind !== 'package' && !files.some((f) => f.path === entryPath) && stripped.some((f) => f.path === entryPath);
-    if (unwrap === 'always' || unwrapsEntry) files = stripped;
+    const hasEntry = files.some((f) => f.path === entryPath);
+    const unwrapsEntry = kind !== 'package' && !hasEntry && stripped.some((f) => f.path === entryPath);
+    // A hook's entry sits in a folder (hooks/hooks.json): a tree with it in place is never a wrapper to strip.
+    if ((unwrap === 'always' && !hasEntry) || unwrapsEntry) files = stripped;
     if (kind === 'package' && !files.some((f) => f.path === entryPath)) {
       entryPath = files.map((f) => f.path).filter((p) => p.toLowerCase().endsWith('.md')).sort()[0] ?? entryPath;
     }
@@ -537,9 +554,9 @@ function checkVisibility(v: unknown): void {
 // steered by whatever keys a row happens to carry.
 const INSERT_COLUMNS = {
   items: ['id', 'owner_id', 'kind', 'name', 'title', 'description', 'category', 'tags', 'visibility', 'format',
-    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'lint_waived', 'source_prefix', 'supplied_frontmatter', 'upstream_frontmatter', 'source_tooling', 'forked_from', 'created_at', 'updated_at'],
+    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'lint_waived', 'source_prefix', 'supplied_frontmatter', 'upstream_frontmatter', 'source_tooling', 'source_entries', 'forked_from', 'created_at', 'updated_at'],
   item_versions: ['id', 'item_id', 'seq', 'entry_path', 'tree_sha256', 'frontmatter', 'lint', 'total_bytes', 'note',
-    'created_by_user', 'created_by_key', 'created_by_client', 'created_at'],
+    'created_by_user', 'created_by_key', 'created_by_client', 'created_at', 'executable'],
 } as const;
 
 export function insertRow(db: Db, table: keyof typeof INSERT_COLUMNS, row: object): void {
@@ -552,7 +569,7 @@ export function insertRow(db: Db, table: keyof typeof INSERT_COLUMNS, row: objec
   db.prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`).run(...values);
 }
 
-function insertVersion(db: Db, p: Principal, itemId: string, seq: number, s: Shaped, lint: Lint[], note = ''): VersionRow {
+function insertVersion(db: Db, p: Principal, kind: Kind, itemId: string, seq: number, s: Shaped, lint: Lint[], note = ''): VersionRow {
   const entries = s.files.map((f) => ({ path: f.path, mode: f.mode, sha256: sha256Hex(f.bytes), size: f.bytes.length, bytes: f.bytes }));
   const v: VersionRow = {
     id: newId(),
@@ -568,6 +585,7 @@ function insertVersion(db: Db, p: Principal, itemId: string, seq: number, s: Sha
     created_by_key: p.keyId ?? null,
     created_by_client: p.oauthClientId ?? null,
     created_at: now(),
+    executable: versionExecutable(kind, s.fm, s.entryText) ? 1 : 0,
   };
   insertRow(db, 'item_versions', v);
   const req = db.prepare('INSERT INTO version_requires (version_id, name) VALUES (?, ?)');
@@ -679,6 +697,7 @@ export function createItemTx(
     supplied_frontmatter: input.source && input.suppliedFrontmatter ? JSON.stringify(input.suppliedFrontmatter) : null,
     upstream_frontmatter: 0,
     source_tooling: input.source && input.sourceTooling ? 1 : 0,
+    source_entries: input.source && input.sourceEntries?.length ? JSON.stringify(input.sourceEntries) : null,
     forked_from: input.forkedFrom ?? null,
     created_at: ts,
     updated_at: ts,
@@ -690,7 +709,7 @@ export function createItemTx(
       if (isUniqueViolation(e)) throw new HttpError(409, 'name_taken', `you already have ${aKind(kind)} named '${name}'`, { name });
       throw e;
     }
-    const v = insertVersion(db, p, row.id, 1, s, lint, input.note);
+    const v = insertVersion(db, p, kind, row.id, 1, s, lint, input.note);
     if (input.source) db.prepare('UPDATE items SET source_tree_sha256 = ? WHERE id = ?').run(v.tree_sha256, row.id);
     refreshFts(db, row.id);
     return getItemRow(db, row.id)!;
@@ -711,7 +730,7 @@ export function addVersion(ctx: Ctx, p: Principal, item: ItemRow, input: Version
   return tx(db, () => {
     const cur = getItemRow(db, item.id);
     if (!cur) throw notFound('item');
-    const v = insertVersion(db, p, cur.id, cur.latest_seq + 1, s, lint, input.note);
+    const v = insertVersion(db, p, cur.kind, cur.id, cur.latest_seq + 1, s, lint, input.note);
     if (lint.some((l) => l.waived)) db.prepare('UPDATE items SET lint_waived = 1 WHERE id = ?').run(cur.id);
     db.prepare('UPDATE items SET title = ?, description = ? WHERE id = ?').run(
       fmString(s.fm, 'title') ?? cur.title,

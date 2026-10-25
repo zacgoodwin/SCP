@@ -1,11 +1,20 @@
 import { Link } from 'react-router';
-import type { ItemSummary } from '../api.ts';
+import { type ItemSummary } from '../api.ts';
 import { timeAgo } from '../format.ts';
 
-export function KindBadges({ item }: { item: Pick<ItemSummary, 'kind' | 'format' | 'visibility'> }) {
+/** mc52: on every item row, card and page, and each group member, whose version is executable (hooks, MCP servers, skills or commands that run shell, forced output styles). */
+export const RunsCodeBadge = () => (
+  <span className="badge badge-danger" title="Runs commands on the installing machine (or forces its output style) when its group is installed as a Claude Code plugin">
+    runs code
+  </span>
+);
+
+/** `executable`: the version shown (the latest on rows and cards; a member row passes its served version's, the item page the one on screen). */
+export function KindBadges({ item }: { item: Pick<ItemSummary, 'kind' | 'format' | 'visibility' | 'executable'> }) {
   return (
     <span className="badges">
       <span className={`badge badge-kind badge-${item.kind}`}>{item.kind}</span>
+      {item.executable && <RunsCodeBadge />}
       {item.format && <span className="badge">{item.format}</span>}
       <span className={`badge badge-${item.visibility}`}>{item.visibility}</span>
     </span>

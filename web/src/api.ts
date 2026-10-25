@@ -5,7 +5,7 @@ export const API = '/api/v1';
 // ---------- shared types ----------
 
 export type Plane = 'skill' | 'md' | 'artifact';
-export type Kind = 'skill' | 'agent' | 'command' | 'instructions' | 'prompt' | 'design' | 'package' | 'artifact';
+export type Kind = 'skill' | 'agent' | 'command' | 'instructions' | 'prompt' | 'design' | 'package' | 'artifact' | 'hook' | 'mcp-server' | 'output-style';
 export type Format = 'html' | 'markdown' | 'svg' | 'mermaid' | 'react' | 'code';
 export type Visibility = 'private' | 'public';
 export type GroupVisibility = 'private' | 'shared' | 'public';
@@ -13,9 +13,18 @@ export type Scope = 'read' | 'write';
 
 export const KINDS_BY_PLANE: Record<Plane, Kind[]> = {
   skill: ['skill'],
-  md: ['agent', 'command', 'instructions', 'prompt', 'design', 'package'],
+  md: ['agent', 'command', 'instructions', 'prompt', 'design', 'package', 'hook', 'mcp-server', 'output-style'],
   artifact: ['artifact'],
 };
+/** mc52: mirrors server/src/types.ts EXECUTABLE_KINDS: the kinds whose entry the item page shows first. The badges read the per-version `executable` instead. */
+export const EXECUTABLE_KINDS: Kind[] = ['hook', 'mcp-server'];
+/** mc52: kinds read from a plugin's files only; an import's kind override does not offer them (server types.ts PLUGIN_KINDS). */
+export const PLUGIN_KINDS: Kind[] = ['hook', 'mcp-server', 'output-style'];
+/** The server's `executable` flag (groups/bundle.ts executableOf: hooks, MCP servers, skills and commands that run code, forced output styles): `items` on a group's detail, kinds only in lists. */
+export interface ExecutableFlag {
+  kinds: Kind[];
+  items?: { id: string; kind: Kind; name: string }[];
+}
 export const FORMATS: Format[] = ['html', 'markdown', 'svg', 'mermaid', 'react', 'code'];
 export const ARTIFACT_CATEGORIES = ['component', 'design', 'deck', 'document', 'dashboard', 'tool', 'other'];
 export const planeOf = (kind: Kind): Plane => (kind === 'skill' ? 'skill' : kind === 'artifact' ? 'artifact' : 'md');
@@ -82,6 +91,8 @@ export interface VersionDetail {
   totalBytes: number;
   note: string | null;
   createdAt: string;
+  /** mc52: this version acts on the installing machine as a plugin (server items/lint.ts versionExecutable). */
+  executable: boolean;
   /** clientId: the connected OAuth app that wrote it over MCP, when one did. */
   createdBy: { userId: string | null; keyId: string | null; clientId?: string | null };
   files: VersionFile[];
@@ -102,6 +113,8 @@ export interface ItemSummary {
   visibility: Visibility;
   format: Format | null;
   latestSeq: number;
+  /** mc52: the latest version's `executable` (VersionDetail.executable). */
+  executable: boolean;
   owner: { id: string; username: string };
   updatedAt: string;
 }
@@ -149,6 +162,7 @@ export interface GroupSummary {
   visibility: GroupVisibility;
   owner: { id: string; username: string };
   counts: { skill: number; md: number; artifact: number };
+  executable?: ExecutableFlag | null;
   updatedAt: string;
 }
 export interface GroupMember {
@@ -156,6 +170,8 @@ export interface GroupMember {
   pinnedSeq: number | null;
   installAs: string | null;
   resolvedSeq: number;
+  /** mc52: the served version's (resolvedSeq) `executable`; item.executable is the latest's. */
+  executable: boolean;
   installPath: string;
 }
 export interface GroupDetail extends GroupSummary {
@@ -190,6 +206,8 @@ export interface BuildProblem {
   ok: boolean;
   problem: string | null;
   code?: string | null;
+  /** With path_conflict: the path (`mcpServers:<name>` for a server name, `outputStyle:<name>` for an output style's) and the members' names. */
+  conflict?: { path: string; items: string[] };
 }
 export interface Manifest {
   group: { slug: string; name: string; description: string | null; instructions: string | null };
@@ -199,6 +217,9 @@ export interface Manifest {
   plugin?: BuildProblem;
   /** Whether bundle.zip builds for the requested target and scope; `problem` says why not. */
   bundle?: BuildProblem;
+  executable?: ExecutableFlag | null;
+  /** Hooks and MCP servers another owner's included group holds: this group does not serve them (add one directly to serve it). */
+  withheld?: { id: string; kind: Kind; name: string; via: string }[];
 }
 export type BundleTarget = 'claude-code' | 'codex' | 'generic';
 export interface ApiKey {

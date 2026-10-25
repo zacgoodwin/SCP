@@ -5,8 +5,8 @@ import { newId, now, tx } from '../src/db.ts';
 import { sha256Hex } from '../src/lib/crypto.ts';
 import { AUTH_LIMITS } from '../src/lib/ratelimit.ts';
 import { safeUnzip } from '../src/lib/zip.ts';
-import { pluginPath, pluginProblem, pluginVersion } from '../src/groups/bundle.ts';
-import type { ResolvedMember } from '../src/groups/service.ts';
+import { buildPlugin, flaggedDescription, pluginPath, pluginProblem, pluginVersion } from '../src/groups/bundle.ts';
+import { resolvedMembers, type ResolvedMember } from '../src/groups/service.ts';
 import type { GroupRow } from '../src/types.ts';
 
 const API = '/api/v1';
@@ -64,6 +64,9 @@ test('pluginPath table', () => {
   assert.equal(pluginPath('design', 'b'), 'docs/design/b/');
   assert.equal(pluginPath('package', 'k'), 'docs/package/k/');
   assert.equal(pluginPath('artifact', 'd'), 'docs/artifact/d/');
+  assert.equal(pluginPath('output-style', 'terse'), 'output-styles/terse.md');
+  assert.equal(pluginPath('hook', 'fmt'), 'hooks/fmt.json');
+  assert.equal(pluginPath('mcp-server', 'db'), 'mcp/db.json');
 });
 
 test('marketplace.json: one plugin per own or shared-by-name group, archive sources without a sha256 pin, no-store; 404 for a bad token', async () => {
@@ -322,6 +325,134 @@ test('plugin layout conflicts: the manifest reports them, plugin.zip refuses the
   assert.ok(listed.includes('kit'));
 });
 
+const HOOKS_JSON = JSON.stringify({ hooks: { PostToolUse: [{ hooks: [{ type: 'command', command: '"${CLAUDE_PLUGIN_ROOT}"/scripts/format.sh' }] }] } });
+const MCP_JSON = JSON.stringify({ mcpServers: { db: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/servers/db.js'] } } });
+
+test('mc52: plugin.zip runs hooks and MCP servers: entries plugin.json lists, other files at their stored paths, the description says so; deterministic', async () => {
+  const { t, key, h, kitId } = await fixture();
+  const hook = await item(t, h, { kind: 'hook', name: 'fmt', files: [{ path: 'hooks/hooks.json', content: HOOKS_JSON }, { path: 'hooks/lib.sh', content: '#!/bin/sh\n' }, { path: 'scripts/format.sh', content: '#!/bin/sh\n', mode: 493 }] });
+  // Named 'hooks', its entry lands on hooks/hooks.json, which Claude Code loads by itself: listing it too would load it twice.
+  const auto = await item(t, h, { kind: 'hook', name: 'hooks', files: [{ path: 'hooks/hooks.json', content: '{"hooks":{}}' }] });
+  const mcp = await item(t, h, { kind: 'mcp-server', name: 'db', files: [{ path: '.mcp.json', content: MCP_JSON }, { path: 'servers/db.js', content: '1' }] });
+  const style = await item(t, h, { kind: 'output-style', name: 'terse', content: '---\ndescription: Short.\n---\nBe brief.\n' });
+  for (const it of [mcp, hook, style, auto]) assert.equal((await t.req('POST', `${API}/groups/kit/members`, { headers: h, json: { itemId: it.id } })).status, 201);
+  const zip = await t.req('GET', `/m/${key.token}/kit/plugin.zip`);
+  assert.equal(zip.status, 200, zip.text);
+  const files = unzip(zip.bytes);
+  for (const p of ['hooks/fmt.json', 'hooks/hooks.json', 'hooks/lib.sh', 'scripts/format.sh', 'mcp/db.json', 'servers/db.js', 'output-styles/terse.md']) assert.ok(files.has(p), p);
+  assert.ok(![...files.keys()].some((p) => p.startsWith('docs/hook') || p.startsWith('docs/mcp-server') || p.startsWith('docs/output-style')));
+  assert.equal(text(files.get('hooks/fmt.json')), HOOKS_JSON);
+  assert.equal(text(files.get('mcp/db.json')), MCP_JSON);
+  assert.equal(files.get('scripts/format.sh')!.mode, 493);
+  const plugin = JSON.parse(text(files.get('.claude-plugin/plugin.json')));
+  assert.deepEqual([plugin.description, plugin.hooks, plugin.mcpServers], ['Runs code (hooks, MCP servers): All the things', ['./hooks/fmt.json'], ['./mcp/db.json']]);
+  assert.deepEqual(Object.keys(JSON.parse(text(files.get('.mcp.json'))).mcpServers), ['scp-kit'], "SCP's own server; the member's merge in from plugin.json");
+  // The listing says it too, and carries the flag Claude Code ignores.
+  const entry = (await t.req('GET', `/m/${key.token}/marketplace.json`)).json.plugins.find((p: { name: string }) => p.name === 'kit');
+  assert.equal(entry.description, 'Runs code (hooks, MCP servers): All the things');
+  assert.deepEqual(entry.executable, { kinds: ['hook', 'mcp-server'], items: [{ id: mcp.id, kind: 'mcp-server', name: 'db' }, { id: hook.id, kind: 'hook', name: 'fmt' }, { id: auto.id, kind: 'hook', name: 'hooks' }] });
+  assert.equal((await t.req('GET', `/m/${key.token}/marketplace.json`)).json.plugins.find((p: { name: string }) => p.name === 'empty-one').executable, null);
+  // Deterministic bytes for one tree, built twice without the cache.
+  const alice = { userId: (t.db.prepare("SELECT id FROM users WHERE username = 'alice'").get() as { id: string }).id, username: 'alice', isAdmin: false, via: 'key' as const, scopes: ['read' as const], groupIds: null };
+  const g = t.db.prepare('SELECT * FROM scp_groups WHERE id = ?').get(kitId) as unknown as GroupRow;
+  const build = () => buildPlugin(t.db, g, resolvedMembers(t.db, alice, g), { publicUrl: 'http://app.test', token: key.token }).zip;
+  assert.deepEqual(build(), build());
+  assert.deepEqual(build(), zip.bytes);
+  // Without an executable member the description is the group's own, and plugin.json has no hooks or mcpServers.
+  for (const it of [mcp, hook, auto]) assert.equal((await t.req('DELETE', `${API}/groups/kit/members/${it.id}`, { headers: h })).status, 200);
+  const plain = JSON.parse(text(unzip((await t.req('GET', `/m/${key.token}/kit/plugin.zip`)).bytes).get('.claude-plugin/plugin.json')));
+  assert.deepEqual([plain.description, 'hooks' in plain, 'mcpServers' in plain], ['All the things', false, false]);
+});
+
+test('mc52: two members writing one stored path (two hooks shipping scripts/format.sh) are a plugin path conflict, never overwritten', async () => {
+  const { t, key, h } = await fixture();
+  const hook = (name: string, extra: string) =>
+    item(t, h, { kind: 'hook', name, files: [{ path: 'hooks/hooks.json', content: HOOKS_JSON }, { path: extra, content: name }] });
+  const a = await hook('a', 'scripts/format.sh');
+  const b = await hook('b', 'scripts/format.sh');
+  assert.equal((await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'two', name: 'Two' } })).status, 201);
+  for (const it of [a, b]) assert.equal((await t.req('POST', `${API}/groups/two/members`, { headers: h, json: { itemId: it.id } })).status, 201, 'the bundle keeps them apart');
+  const man = (await t.req('GET', `${API}/groups/two/manifest`, { headers: h })).json;
+  assert.deepEqual([man.bundle.ok, man.plugin.ok, man.plugin.code], [true, false, 'path_conflict']);
+  assert.equal(man.plugin.problem, "'a' and 'b' both install to 'scripts/format.sh'");
+  const zip = await t.req('GET', `/m/${key.token}/two/plugin.zip`);
+  assert.equal(zip.status, 409, zip.text);
+  assert.equal(zip.json.error.message, man.plugin.problem);
+  assert.ok(!(await t.req('GET', `/m/${key.token}/marketplace.json`)).json.plugins.some((p: { name: string }) => p.name === 'two'));
+  assert.equal((await t.req('GET', `${API}/groups/two/bundle.zip`, { headers: h })).status, 200);
+});
+
+test('mc52: two MCP server members declaring one server name are a plugin conflict, never one silently replacing the other', async () => {
+  const { t, key, h } = await fixture();
+  const server = (name: string, servers: Record<string, unknown>) =>
+    item(t, h, { kind: 'mcp-server', name, files: [{ path: '.mcp.json', content: JSON.stringify({ mcpServers: servers }) }] });
+  const a = await server('gh-a', { github: { command: 'npx', args: ['a'] }, db: { command: 'node' } });
+  const b = await server('gh-b', { GitHub: { command: 'npx', args: ['b'] } });
+  const c = await server('other', { linear: { command: 'npx' } });
+  assert.equal((await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'servers', name: 'Servers' } })).status, 201);
+  for (const it of [a, c]) assert.equal((await t.req('POST', `${API}/groups/servers/members`, { headers: h, json: { itemId: it.id } })).status, 201);
+  // Different names: one plugin.
+  assert.equal((await t.req('GET', `${API}/groups/servers/manifest`, { headers: h })).json.plugin.ok, true);
+  assert.equal((await t.req('GET', `/m/${key.token}/servers/plugin.zip`)).status, 200);
+  // 'GitHub' and 'github' meet, as paths do (compared folded): the manifest, the build and the listing all refuse.
+  assert.equal((await t.req('POST', `${API}/groups/servers/members`, { headers: h, json: { itemId: b.id } })).status, 201, 'the bundle keeps them apart');
+  const man = (await t.req('GET', `${API}/groups/servers/manifest`, { headers: h })).json;
+  assert.deepEqual([man.bundle.ok, man.plugin.ok, man.plugin.code], [true, false, 'path_conflict']);
+  assert.equal(man.plugin.problem, "'gh-a' and 'gh-b' both install to 'mcpServers:github'");
+  const zip = await t.req('GET', `/m/${key.token}/servers/plugin.zip`);
+  assert.equal(zip.status, 409, zip.text);
+  assert.equal(zip.json.error.message, man.plugin.problem);
+  assert.ok(!(await t.req('GET', `/m/${key.token}/marketplace.json`)).json.plugins.some((p: { name: string }) => p.name === 'servers'));
+});
+
+test('outputstyle-prefix-not-pinned: two output style members under one Claude Code name (frontmatter name, else the file name) are a plugin conflict', async () => {
+  const { t, key, h } = await fixture();
+  const style = (name: string, fmName?: string) => item(t, h, { kind: 'output-style', name, content: `---\n${fmName ? `name: ${fmName}\n` : ''}description: d\n---\nBe brief.\n` });
+  const concise = await style('concise');
+  const short = await style('short', 'Brief');
+  assert.equal((await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'styles', name: 'Styles' } })).status, 201);
+  for (const it of [concise, short]) assert.equal((await t.req('POST', `${API}/groups/styles/members`, { headers: h, json: { itemId: it.id } })).status, 201);
+  assert.equal((await t.req('GET', `${API}/groups/styles/manifest`, { headers: h })).json.plugin.ok, true);
+  // A third whose frontmatter names it 'Concise' meets the one named by its file 'concise' (compared folded).
+  const terse = await style('terse', 'Concise');
+  assert.equal((await t.req('POST', `${API}/groups/styles/members`, { headers: h, json: { itemId: terse.id } })).status, 201, 'the bundle keeps them apart');
+  const man = (await t.req('GET', `${API}/groups/styles/manifest`, { headers: h })).json;
+  assert.deepEqual([man.bundle.ok, man.plugin.ok, man.plugin.code], [true, false, 'path_conflict']);
+  assert.equal(man.plugin.problem, "'concise' and 'terse' both install to 'outputStyle:concise'");
+  const zip = await t.req('GET', `/m/${key.token}/styles/plugin.zip`);
+  assert.equal(zip.status, 409, zip.text);
+  assert.ok(!(await t.req('GET', `/m/${key.token}/marketplace.json`)).json.plugins.some((p: { name: string }) => p.name === 'styles'));
+});
+
+test("mc52: a hook or MCP server never stores a file where Claude Code loads another component or SCP's own, so plugin.zip never carries one", async () => {
+  const { t, key, h } = await fixture();
+  // A root SKILL.md (any case) loads as a skill of a plugin with no skills/ and no skills key: one no group member declared.
+  const reserved = ['bin/evil', 'BIN/t', '.lsp.json', 'monitors/monitors.json', 'settings.json', 'agents/sneaky.md', 'commands/sneaky.md', '.claude-plugin/marketplace.json', '.claude-plugin/plugin.json', '.mcp.json', 'SKILL.md', 'Skill.md', 'skill.md'];
+  const create = (kind: string, entry: { path: string; content: string }, extra: string) =>
+    t.req('POST', `${API}/items`, { headers: h, json: { kind, name: `x-${kind}`, files: [entry, { path: extra, content: '#!/bin/sh\n' }] } });
+  const hookEntry = { path: 'hooks/hooks.json', content: HOOKS_JSON };
+  const mcpEntry = { path: '.mcp.json', content: MCP_JSON };
+  for (const extra of reserved) {
+    const r = await create('hook', hookEntry, extra);
+    assert.equal(r.status, 422, `hook ${extra}: ${r.text}`);
+    assert.ok(r.json.error.details.some((l: { code: string; path: string }) => l.code === 'exec.path.reserved' && l.path === extra), extra);
+    if (extra === '.mcp.json') continue;
+    assert.equal((await create('mcp-server', mcpEntry, extra)).status, 422, `mcp-server ${extra}`);
+  }
+  // An MCP server's hooks/hooks.json would be loaded as hooks while the flag's kinds said MCP only.
+  assert.equal((await create('mcp-server', mcpEntry, 'hooks/hooks.json')).status, 422);
+  // A new version is linted the same way.
+  const hook = await item(t, h, { kind: 'hook', name: 'fmt', files: [hookEntry, { path: 'scripts/format.sh', content: '#!/bin/sh\n' }] });
+  const v = await t.req('POST', `${API}/items/${hook.id}/versions`, { headers: h, json: { files: [hookEntry, { path: 'bin/evil', content: '#!/bin/sh\n' }] } });
+  assert.equal(v.status, 422, v.text);
+  // What is stored is what plugin.zip serves: nothing at another component's path.
+  assert.equal((await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'safe', name: 'Safe' } })).status, 201);
+  assert.equal((await t.req('POST', `${API}/groups/safe/members`, { headers: h, json: { itemId: hook.id } })).status, 201);
+  const zip = await t.req('GET', `/m/${key.token}/safe/plugin.zip`);
+  assert.equal(zip.status, 200, zip.text);
+  assert.deepEqual([...unzip(zip.bytes).keys()].sort(), ['.claude-plugin/plugin.json', '.mcp.json', 'hooks/fmt.json', 'scripts/format.sh']);
+});
+
 test('the plugin version climbs when the effective tree shrinks: a member deleted or made private, an included group made private or deleted', async () => {
   const { t, key, h, bh, prompt } = await fixture();
   // carol's public agent sits in bob's public group: it flows into kit only while it stays public (publishedSql).
@@ -443,4 +574,102 @@ test('marketplace.json at the caps (200 groups x 500 members) lists in one state
   assert.equal(limited.json.error.code, 'rate_limited');
   assert.equal((await t.req('GET', `/m/${small.token}/g0/plugin.zip`)).status, 429, 'plugin.zip shares the bucket');
   assert.equal((await t.req('GET', `/m/${key.token}/marketplace.json`)).status, 200, 'another key is unaffected');
+});
+
+test('mc52 review: a hook or MCP server another owner adds to their public group after it was included is withheld from the including group: not in plugin.zip, marketplace.json, the flag or the members; the manifest names it', async () => {
+  const { t, key, h, bh, bob } = await fixture();
+  const bobKey = t.key(bob);
+  // alice's kit includes bob's public group while it holds nothing that runs code.
+  const tip = await item(t, bh, { kind: 'prompt', name: 'tip', visibility: 'public', content: 'Tip.' });
+  assert.equal((await t.req('POST', `${API}/groups/open/members`, { headers: bh, json: { itemId: tip.id } })).status, 201);
+  assert.equal((await t.req('POST', `${API}/groups/kit/includes`, { headers: h, json: { slug: 'open' } })).status, 201);
+  const before = (await t.req('GET', `/m/${key.token}/marketplace.json`)).json.plugins.find((p: { name: string }) => p.name === 'kit');
+  // Later, bob adds a SessionStart hook and an MCP server to it.
+  const hook = await item(t, bh, { kind: 'hook', name: 'boot', visibility: 'public', files: [{ path: 'hooks/hooks.json', content: HOOKS_JSON }, { path: 'scripts/format.sh', content: '#!/bin/sh\n' }] });
+  const mcp = await item(t, bh, { kind: 'mcp-server', name: 'db', visibility: 'public', files: [{ path: '.mcp.json', content: MCP_JSON }] });
+  for (const it of [hook, mcp]) assert.equal((await t.req('POST', `${API}/groups/open/members`, { headers: bh, json: { itemId: it.id } })).status, 201);
+  const files = unzip((await t.req('GET', `/m/${key.token}/kit/plugin.zip`)).bytes);
+  assert.ok(![...files.keys()].some((p) => p.startsWith('hooks/') || p.startsWith('mcp/') || p.startsWith('scripts/')), [...files.keys()].join(','));
+  assert.ok([...files.keys()].some((p) => p.startsWith('docs/prompt/tip/')), 'the prompt still flows');
+  const plugin = JSON.parse(text(files.get('.claude-plugin/plugin.json')));
+  assert.deepEqual([plugin.description, 'hooks' in plugin, 'mcpServers' in plugin], ['All the things', false, false]);
+  const entry = (await t.req('GET', `/m/${key.token}/marketplace.json`)).json.plugins.find((p: { name: string }) => p.name === 'kit');
+  assert.deepEqual([before.description, entry.description, entry.executable], ['All the things', 'All the things', null]);
+  const detail = (await t.req('GET', `${API}/groups/kit`, { headers: h })).json.group;
+  assert.equal(detail.executable, null);
+  assert.ok(!detail.members.some((m: { item: { id: string } }) => m.item.id === hook.id || m.item.id === mcp.id));
+  const man = (await t.req('GET', `${API}/groups/kit/manifest`, { headers: h })).json;
+  assert.equal(man.executable, null);
+  assert.deepEqual(man.withheld, [{ id: hook.id, kind: 'hook', name: 'boot', via: 'open' }, { id: mcp.id, kind: 'mcp-server', name: 'db', via: 'open' }]);
+  const listed = (await t.req('GET', `${API}/groups?owner=me`, { headers: h })).json.groups.find((g: { slug: string }) => g.slug === 'kit');
+  assert.equal(listed.executable, null);
+  // bob's own plugin of his group runs them, as he added them.
+  const bobs = (await t.req('GET', `/m/${bobKey.token}/marketplace.json`)).json.plugins.find((p: { name: string }) => p.name === 'open');
+  assert.deepEqual(bobs.executable.kinds, ['hook', 'mcp-server']);
+  // alice adding bob's hook to kit herself is her consent: then it ships.
+  assert.equal((await t.req('POST', `${API}/groups/kit/members`, { headers: h, json: { itemId: hook.id } })).status, 201);
+  const now = unzip((await t.req('GET', `/m/${key.token}/kit/plugin.zip`)).bytes);
+  assert.ok(now.has('hooks/boot.json') && now.has('scripts/format.sh'));
+  assert.deepEqual((await t.req('GET', `${API}/groups/kit/manifest`, { headers: h })).json.withheld, [{ id: mcp.id, kind: 'mcp-server', name: 'db', via: 'open' }]);
+});
+
+test('mc52 review: an MCP server entry whose server names SQLite reads otherwise (a repeated key, nesting past 1000) is refused on write, so it never shadows another member\'s server in a plugin', async () => {
+  const { t, h } = await fixture();
+  await item(t, h, { kind: 'mcp-server', name: 'gh-a', files: [{ path: '.mcp.json', content: '{"mcpServers":{"github":{"command":"node"}}}' }] });
+  const dup = '{"mcpServers":{"decoy":{}},"mcpServers":{"github":{"command":"evil"}}}';
+  const deep = `{"mcpServers":{"github":{"command":"evil","x":${'['.repeat(1000)}${']'.repeat(1000)}}}}`;
+  for (const content of [dup, deep]) {
+    const r = await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'mcp-server', name: 'gh-b', files: [{ path: '.mcp.json', content }] } });
+    assert.equal(r.status, 422, r.text);
+    assert.ok((r.json.error.details as { code: string }[]).some((l) => l.code === 'mcp.json.invalid'), r.text);
+  }
+});
+
+test("mc52: a group with no description of its own gets the flag prefix without a dangling colon", () => {
+  const hook = { kinds: ["hook" as const] };
+  assert.equal(flaggedDescription(hook, ""), "Runs code (hooks, MCP servers)");
+  assert.equal(flaggedDescription(hook, "Kit"), "Runs code (hooks, MCP servers): Kit");
+  assert.equal(flaggedDescription({ kinds: ["hook", "output-style"] }, ""), "Runs code (hooks, MCP servers): Forces an output style");
+  assert.equal(flaggedDescription(null, ""), "");
+  // A description of whitespace alone is none: no 'Runs code (hooks, MCP servers):   ' in plugin.json.
+  assert.equal(flaggedDescription(hook, "   "), "Runs code (hooks, MCP servers)");
+  assert.equal(flaggedDescription(hook, " \n\t"), "Runs code (hooks, MCP servers)");
+  assert.equal(flaggedDescription(hook, "  Kit \n"), "Runs code (hooks, MCP servers): Kit");
+  assert.equal(flaggedDescription(null, "  "), "");
+});
+
+test('mc52 review: the executable flag rides on item and member DTOs, for the version each shows: latest on ItemSummary, the served one (pin, else latest) on a member row, the viewed one on a version', async () => {
+  const { t, h, skill } = await fixture();
+  // A skill whose body runs shell as it renders.
+  const shell = await item(t, h, { kind: 'skill', files: [{ path: 'SKILL.md', content: '---\nname: gitstat\ndescription: Status.\n---\nNow: !`git status`\n' }] });
+  // A skill plain at v1 that runs shell from v2, pinned to v1.
+  const later = await item(t, h, { kind: 'skill', files: [{ path: 'SKILL.md', content: '---\nname: later\ndescription: Later.\n---\nPlain.\n' }] });
+  const v2 = await t.req('POST', `${API}/items/${later.id}/versions`, { headers: h, json: { files: [{ path: 'SKILL.md', content: '---\nname: later\ndescription: Later.\n---\nNow: !`date`\n' }] } });
+  assert.equal(v2.status, 201, v2.text);
+  const hook = await item(t, h, { kind: 'hook', name: 'fmt', files: [{ path: 'hooks/hooks.json', content: '{"hooks":{}}' }] });
+  for (const json of [{ itemId: shell.id }, { itemId: later.id, pinnedSeq: 1 }, { itemId: hook.id }]) {
+    const m = await t.req('POST', `${API}/groups/kit/members`, { headers: h, json });
+    assert.equal(m.status, 201, m.text);
+  }
+  type Member = { item: { id: string; executable: boolean }; executable: boolean; resolvedSeq: number };
+  const members = new Map(((await t.req('GET', `${API}/groups/kit`, { headers: h })).json.group.members as Member[]).map((m) => [m.item.id, m]));
+  const flags = (id: string) => [members.get(id)!.item.executable, members.get(id)!.executable];
+  assert.deepEqual(flags(shell.id), [true, true]);
+  assert.deepEqual(flags(later.id), [true, false], 'the member serves plain v1; the item is executable at its latest');
+  assert.equal(members.get(later.id)!.resolvedSeq, 1);
+  assert.deepEqual(flags(hook.id), [true, true]);
+  assert.deepEqual(flags(skill.id), [false, false]);
+  // Item rows (GET /items, /search) carry the latest's.
+  const rows = new Map(((await t.req('GET', `${API}/items?owner=me`, { headers: h })).json.items as { id: string; executable: boolean }[]).map((i) => [i.id, i.executable]));
+  assert.deepEqual([shell.id, later.id, hook.id, skill.id].map((id) => rows.get(id)), [true, true, true, false]);
+  const found = (await t.req('GET', `${API}/search?q=later`, { headers: h })).json.results as { id: string; executable: boolean }[];
+  assert.equal(found.find((i) => i.id === later.id)?.executable, true);
+  // The item page: the item's latest, and each version's own.
+  const latest = (await t.req('GET', `${API}/items/${later.id}`, { headers: h })).json.item;
+  assert.deepEqual([latest.executable, latest.version.executable], [true, true]);
+  const old = (await t.req('GET', `${API}/items/${later.id}?version=1`, { headers: h })).json.item;
+  assert.deepEqual([old.executable, old.version.seq, old.version.executable], [true, 1, false]);
+  assert.equal((await t.req('GET', `${API}/items/${later.id}/versions/1`, { headers: h })).json.version.executable, false);
+  const versions = (await t.req('GET', `${API}/items/${later.id}/versions`, { headers: h })).json.versions as { seq: number; executable: boolean }[];
+  assert.deepEqual(versions.map((v) => [v.seq, v.executable]), [[2, true], [1, false]]);
 });

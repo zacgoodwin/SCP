@@ -5,8 +5,8 @@ import { pathKey } from '../lib/paths.ts';
 import { buildZip } from '../lib/zip.ts';
 import type { TreeFile } from '../lib/tree.ts';
 import { itemSummary, listFiles, readTree } from '../items/service.ts';
-import { MAX_GROUP_FILES, resolvedMembers, type ResolvedMember } from './service.ts';
-import { planeOf, type GroupRow, type ItemRow, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
+import { MAX_GROUP_FILES, resolvedMembers, serverNames, type ResolvedMember, type WithheldMember } from './service.ts';
+import { EXECUTABLE_KINDS, isExecutable, planeOf, type GroupRow, type ItemRow, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
 
 const MB = 1024 * 1024;
 /** Uncompressed bytes per bundle.zip: it is built in memory (~5x that in RSS) on the request thread. */
@@ -29,6 +29,7 @@ export const INSTALL_AS_KINDS = new Set<Kind>(['instructions', 'design', 'prompt
 type PathFn = (name: string, entry: string, user: boolean) => string;
 
 // Folder kinds end in '/'; everything else is one file path, relative to the project (or home) root.
+// mc52: hooks and MCP servers are inert copies here (only plugin.zip runs them), so never where a client loads them.
 const PATHS: Record<Target, Record<Kind, PathFn>> = {
   'claude-code': {
     skill: (n) => `.claude/skills/${n}/`,
@@ -40,6 +41,9 @@ const PATHS: Record<Target, Record<Kind, PathFn>> = {
     prompt: (n) => `.scp/prompts/${n}.md`,
     package: (n) => `.scp/packages/${n}/`,
     artifact: (n, e) => `.scp/artifacts/${n}/${e}`,
+    'output-style': (n) => `.claude/output-styles/${n}.md`,
+    hook: (n) => `.scp/hooks/${n}/`,
+    'mcp-server': (n) => `.scp/mcp-servers/${n}/`,
   },
   codex: {
     skill: (n) => `.agents/skills/${n}/`,
@@ -50,6 +54,9 @@ const PATHS: Record<Target, Record<Kind, PathFn>> = {
     prompt: (n) => `.codex/prompts/${n}.md`,
     package: (n) => `.scp/packages/${n}/`,
     artifact: (n, e) => `.scp/artifacts/${n}/${e}`,
+    'output-style': (n) => `.scp/output-styles/${n}.md`,
+    hook: (n) => `.scp/hooks/${n}/`,
+    'mcp-server': (n) => `.scp/mcp-servers/${n}/`,
   },
   generic: {
     skill: (n) => `skills/${n}/`,
@@ -60,6 +67,9 @@ const PATHS: Record<Target, Record<Kind, PathFn>> = {
     prompt: (n) => `prompts/${n}.md`,
     package: (n) => `packages/${n}/`,
     artifact: (n, e) => `artifacts/${n}/${e}`,
+    'output-style': (n) => `output-styles/${n}.md`,
+    hook: (n) => `hooks/${n}/`,
+    'mcp-server': (n) => `mcp-servers/${n}/`,
   },
 };
 
@@ -176,6 +186,8 @@ export interface BuildProblem {
   ok: boolean;
   problem: string | null;
   code: string | null;
+  /** With path_conflict: the path and the members' names, so the UI can say what fixes it (a rename fixes no server name or stored path). */
+  conflict?: Conflict;
 }
 
 export interface Manifest {
@@ -188,14 +200,20 @@ export interface Manifest {
   plugin: BuildProblem;
   /** Whether bundle.zip builds for this target and scope, else the refusal buildBundle would answer with. */
   bundle: BuildProblem;
+  /** mc52: the members that run code as a plugin (executableOf); in bundle.zip they are inert copies. */
+  executable: ExecutableFlag | null;
+  /** mc52 (review): hooks and MCP servers another owner's included group holds, which this group does not serve (service.ts resolvedMembers). */
+  withheld: WithheldMember[];
 }
 
-const asProblem = (e: HttpError | null): BuildProblem => ({ ok: e === null, problem: e && e.message, code: e && e.code });
+const asProblem = (e: HttpError | null): BuildProblem => ({ ok: e === null, problem: e && e.message, code: e && e.code, ...(e?.code === 'path_conflict' && { conflict: e.details as Conflict }) });
 
 interface Placed {
   member: ResolvedMember;
   path: string;
   paths: string[];
+  /** The member's stored paths (an executable kind's land at those paths in plugin.zip: pluginFootprint). */
+  files: string[];
   owner: string;
 }
 
@@ -206,24 +224,26 @@ export function fileCount(db: Db, versionIds: string[]): number {
 
 const groupFull = (n: number) => new HttpError(400, 'group_full', `this group's members hold ${n} files; groups are limited to ${MAX_GROUP_FILES}`);
 
-function place(db: Db, p: Principal, group: GroupRow, opts: InstallOpts): { placed: Placed[]; files: number } {
+function place(db: Db, p: Principal, group: GroupRow, opts: InstallOpts): { placed: Placed[]; files: number; withheld: WithheldMember[] } {
   checkInstallOpts(opts);
-  const members = resolvedMembers(db, p, group);
+  const withheld: WithheldMember[] = [];
+  const members = resolvedMembers(db, p, group, withheld);
   // Member adds enforce the cap, but unpinned members follow their latest version, which can grow
   // past it later; count before listing (and conflict-checking) every file of every member.
   const files = fileCount(db, members.map((m) => m.version.id));
   if (files > MAX_GROUP_FILES) throw groupFull(files);
   const placed = members.map((m) => {
     const o = { ...opts, installAs: m.installAs };
-    const paths = listFiles(db, m.version.id).map((f) => f.path);
+    const files = listFiles(db, m.version.id).map((f) => f.path);
     return {
       member: m,
       path: installPath(m.item.kind, m.item.name, m.version.entry_path, o),
-      paths: footprint(m.item.kind, m.item.name, m.version.entry_path, paths, o),
+      paths: footprint(m.item.kind, m.item.name, m.version.entry_path, files, o),
+      files,
       owner: itemSummary(db, m.item).owner.username,
     };
   });
-  return { placed, files };
+  return { placed, files, withheld };
 }
 
 const placedConflicts = (placed: Placed[]) =>
@@ -243,11 +263,14 @@ function bundleProblem(placed: Placed[], conflicts: Conflict[]): HttpError | nul
 
 /** Catalog for agents: what the group holds and where each piece installs. No file bodies. */
 export function buildManifest(db: Db, p: Principal, group: GroupRow, opts: { target: Target; scope: InstallScope }): Manifest {
-  const { placed, files } = place(db, p, group, opts);
+  const { placed, files, withheld } = place(db, p, group, opts);
   const conflicts = placedConflicts(placed);
+  const servers = serverNames(db, placed.filter((x) => x.member.item.kind === 'mcp-server').map((x) => x.member.version.id));
   return {
-    plugin: asProblem(pluginProblem(placed.map((x) => x.member), files)),
+    plugin: asProblem(pluginProblem(placed.map((x) => ({ ...x.member, paths: x.files, servers: servers.get(x.member.version.id) })), files)),
     bundle: asProblem(bundleProblem(placed, conflicts)),
+    executable: executableOf(placed.map((x) => x.member)),
+    withheld,
     group: { slug: group.slug, name: group.name, description: group.description, instructions: group.instructions, updatedAt: group.updated_at },
     target: opts.target,
     scope: opts.scope,
@@ -354,7 +377,11 @@ export function buildBundle(
 /** DOS zip epoch, in local time: fflate stamps entries from local getters, so these bytes are the same in every TZ. */
 const PLUGIN_MTIME = new Date(1980, 0, 1);
 
-/** Where a member lands in a plugin: Claude Code's component folders; every other kind under docs/. */
+/**
+ * Where a member lands in a plugin: Claude Code's component folders; every other kind under docs/. mc52: a
+ * hook's or MCP server's entry is one file plugin.json names (its other files keep their stored paths, at
+ * the plugin root, where `${CLAUDE_PLUGIN_ROOT}` finds them).
+ */
 export function pluginPath(kind: Kind, name: string): string {
   switch (kind) {
     case 'skill':
@@ -363,6 +390,12 @@ export function pluginPath(kind: Kind, name: string): string {
       return `agents/${name}.md`;
     case 'command':
       return `commands/${name}.md`;
+    case 'output-style':
+      return `output-styles/${name}.md`;
+    case 'hook':
+      return `hooks/${name}.json`;
+    case 'mcp-server':
+      return `mcp/${name}.json`;
     default:
       return `docs/${kind}/${name}/`;
   }
@@ -371,8 +404,59 @@ export function pluginPath(kind: Kind, name: string): string {
 /** What listing a group as a plugin reads of a member (service.ts pluginMembers); a ResolvedMember is one. */
 export interface PluginMember {
   item: Pick<ItemRow, 'id' | 'kind' | 'name'>;
-  version: Pick<VersionRow, 'total_bytes' | 'created_at'>;
+  /** `frontmatter` is read for an output style only (styleName). */
+  version: Pick<VersionRow, 'total_bytes' | 'created_at' | 'entry_path' | 'executable'> & Partial<Pick<VersionRow, 'frontmatter'>>;
+  /** An executable kind's stored paths (pluginFootprint); unread for the other kinds. */
+  paths?: string[];
+  /** An MCP server's server names (service.ts serverNames), which pluginConflicts compares. */
+  servers?: string[];
 }
+
+/**
+ * mc52: the effective members that act on the installing machine as a plugin (their served version's
+ * `executable`: hooks, MCP servers, skills and commands that run code, forced output styles), derived from
+ * them (never stored on the group, so it cannot drift); null when none.
+ */
+export interface ExecutableFlag {
+  kinds: Kind[];
+  items?: { id: string; kind: Kind; name: string }[];
+}
+/** The order `kinds` lists them in. */
+const FLAG_KINDS: Kind[] = [...EXECUTABLE_KINDS, 'skill', 'command', 'output-style'];
+
+export function executableOf(members: { item: Pick<ItemRow, 'id' | 'kind' | 'name'>; version: Pick<VersionRow, 'executable'> }[], withItems = true): ExecutableFlag | null {
+  const exec = members.filter((m) => m.version.executable).map((m) => m.item);
+  if (!exec.length) return null;
+  const kinds = FLAG_KINDS.filter((k) => exec.some((i) => i.kind === k));
+  return withItems ? { kinds, items: exec.map((i) => ({ id: i.id, kind: i.kind, name: i.name })) } : { kinds };
+}
+
+/** mc52: what the marketplace entry's and plugin.json's description start with when the plugin carries a member that runs code. */
+export const RUNS_CODE = 'Runs code (hooks, MCP servers): ';
+/** Review (output-style-force): and when it carries a forced output style. */
+export const FORCES_STYLE = 'Forces an output style: ';
+export const flagPrefix = (f: ExecutableFlag | null) =>
+  f ? (f.kinds.some((k) => k !== 'output-style') ? RUNS_CODE : '') + (f.kinds.includes('output-style') ? FORCES_STYLE : '') : '';
+/**
+ * The plugin description: the flag prefix, then the group's own, trimmed; with no description of its own (or only
+ * whitespace, which would leave the prefix's ': ' dangling) the prefix drops its trailing ': '.
+ */
+export function flaggedDescription(f: ExecutableFlag | null, description: string): string {
+  const d = description.trim();
+  return d ? flagPrefix(f) + d : flagPrefix(f).replace(/: $/, '');
+}
+/** mc52: the warning MCP get_group and get_bundle carry with an `executable` flag. */
+export const EXECUTABLE_WARNING =
+  "This group holds items that run commands on the installing machine when the group is installed as a Claude Code plugin (hooks, MCP servers, skills or commands that run shell), or an output style that replaces the user's own there. Show the user which ones, and do not install the plugin without their consent.";
+
+/** Every path a member writes in plugin.zip: its pluginPath, plus an executable kind's other stored files at their own paths. */
+export function pluginFootprint(m: PluginMember): string[] {
+  const at = pluginPath(m.item.kind, m.item.name);
+  return isExecutable(m.item.kind) ? [at, ...(m.paths ?? []).filter((p) => p !== m.version.entry_path)] : [at];
+}
+
+/** SCP's own files in every plugin.zip (buildPlugin): an executable member's file there is a conflict like any other. */
+const PLUGIN_OWN = ['.claude-plugin/plugin.json', '.mcp.json'];
 
 /**
  * `<yyyymmdd>.<hhmmssmmm>` (UTC) of the latest change: the newest member version, or the group row,
@@ -388,10 +472,28 @@ export function pluginVersion(group: GroupRow, members: PluginMember[]): string 
 /**
  * Members at one plugin path. pluginPath is kind and name alone (installAs does not apply, extras
  * stay under docs/<kind>/<name>/), so this is two members of one kind with the same name as pathKey
- * sees it, which two owners can produce; the folder is the unit, whatever files are in it.
+ * sees it, which two owners can produce; the folder is the unit, whatever files are in it. mc52: an
+ * executable member's other files sit at their stored paths, so two hooks both shipping
+ * scripts/format.sh, or one writing into another member's folder or over SCP's own files, conflict too.
+ * So do two MCP servers declaring one server name: Claude Code keeps whichever loads last, the other gone
+ * without a word. Each name is a pseudo-path `mcpServers:<name>` (URI-encoded, so a '/' in it is no
+ * folder), which no stored path can be (':' is refused in paths). Review (outputstyle-prefix-not-pinned):
+ * likewise two output styles under one name (styleName), `outputStyle:<name>`: Claude Code lists a plugin's
+ * styles by that name, so one of them would be unreachable.
  */
 export const pluginConflicts = (members: PluginMember[]): Conflict[] =>
-  findConflicts(members.map(({ item }) => ({ path: pluginPath(item.kind, item.name), name: item.name, id: item.id })));
+  findConflicts([
+    ...PLUGIN_OWN.map((path) => ({ path, name: 'scp', id: '' })),
+    ...members.flatMap((m) => pluginFootprint(m).map((path) => ({ path, name: m.item.name, id: m.item.id }))),
+    ...members.flatMap((m) => [...new Set(m.servers)].map((s) => ({ path: `mcpServers:${encodeURIComponent(s)}`, name: m.item.name, id: m.item.id }))),
+    ...members.filter((m) => m.item.kind === 'output-style').map((m) => ({ path: `outputStyle:${encodeURIComponent(styleName(m))}`, name: m.item.name, id: m.item.id })),
+  ]);
+
+/** An output style's name in Claude Code: its frontmatter `name`, else its file name, which in a plugin is the item's. */
+function styleName(m: PluginMember): string {
+  const n: unknown = m.version.frontmatter ? (JSON.parse(m.version.frontmatter) as Record<string, unknown>).name : undefined;
+  return typeof n === 'string' && n.trim() ? n : m.item.name;
+}
 
 /**
  * The error buildPlugin throws for these members (holding `files` across their versions), or null,
@@ -422,7 +524,9 @@ export interface PluginBuild {
  * the last line of defence for every file written, SCP's own included.
  */
 export function buildPlugin(db: Db, group: GroupRow, members: ResolvedMember[], opts: { publicUrl: string; token: string }): PluginBuild {
-  const problem = pluginProblem(members, fileCount(db, members.map((m) => m.version.id)));
+  const servers = serverNames(db, members.filter((m) => m.item.kind === 'mcp-server').map((m) => m.version.id));
+  const withPaths = members.map((m) => (isExecutable(m.item.kind) ? { ...m, paths: listFiles(db, m.version.id).map((f) => f.path), servers: servers.get(m.version.id) } : m));
+  const problem = pluginProblem(withPaths, fileCount(db, members.map((m) => m.version.id)));
   if (problem) throw problem;
   const files: TreeFile[] = [];
   const owners = new Map<string, string>(); // pathKey -> member name
@@ -436,11 +540,18 @@ export function buildPlugin(db: Db, group: GroupRow, members: ResolvedMember[], 
   };
   for (const { item, version } of members) {
     const at = pluginPath(item.kind, item.name);
-    for (const f of placeTree(at, version.entry_path, readTree(db, version.id), `docs/${item.kind}/${item.name}/`)) add(f, item.name);
+    // An executable kind's other files resolve against the plugin root (${CLAUDE_PLUGIN_ROOT}/scripts/x.sh): stored paths, no folder of their own.
+    const extras = isExecutable(item.kind) ? '' : `docs/${item.kind}/${item.name}/`;
+    for (const f of placeTree(at, version.entry_path, readTree(db, version.id), extras)) add(f, item.name);
   }
   const version = pluginVersion(group, members);
   const json = (v: unknown) => enc(JSON.stringify(v, null, 2) + '\n');
-  add({ path: '.claude-plugin/plugin.json', bytes: json({ name: group.slug, version, description: group.description }), mode: 420 }, 'scp');
+  // mc52: Claude Code merges these with hooks/hooks.json (which it loads by itself, so a hook named 'hooks' is not listed again) and SCP's own .mcp.json.
+  const listed = (kind: Kind, skip?: string) => members.filter((m) => m.item.kind === kind && m.item.name !== skip).map((m) => `./${pluginPath(kind, m.item.name)}`).sort();
+  const hooks = listed('hook', 'hooks');
+  const mcpServers = listed('mcp-server');
+  const description = flaggedDescription(executableOf(members), group.description);
+  add({ path: '.claude-plugin/plugin.json', bytes: json({ name: group.slug, version, description, ...(hooks.length ? { hooks } : {}), ...(mcpServers.length ? { mcpServers } : {}) }), mode: 420 }, 'scp');
   const server = { type: 'http', url: `${opts.publicUrl}/mcp/${group.slug}`, headers: { Authorization: `Bearer ${opts.token}` } };
   add({ path: '.mcp.json', bytes: json({ mcpServers: { [`scp-${group.slug}`]: server } }), mode: 420 }, 'scp');
   files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));

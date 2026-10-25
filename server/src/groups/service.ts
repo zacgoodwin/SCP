@@ -5,10 +5,10 @@ import { isUniqueViolation, newId, now, tx, type Db } from '../db.ts';
 import { HttpError, badRequest, forbidden, notFound } from '../lib/http.ts';
 import { normalizePath, segmentProblem } from '../lib/paths.ts';
 import { ftsQuery, getItemRow, itemSummary, listFiles, resolveVersion, type ItemSummary } from '../items/service.ts';
-import { INSTALL_AS_KINDS, INSTALL_SCOPES, TARGETS, fileCount, findConflicts, footprint, installPath, pathConflict, type PluginMember } from './bundle.ts';
+import { INSTALL_AS_KINDS, INSTALL_SCOPES, TARGETS, executableOf, fileCount, findConflicts, footprint, installPath, pathConflict, type ExecutableFlag, type PluginMember } from './bundle.ts';
 import { touchGroup, touchIncluders } from './touch.ts';
 import { requiresOf, type RequiredCli } from '../tools/service.ts';
-import { MD_KINDS, planeOf, type Ctx, type GroupRow, type ItemRow, type Kind, type Principal, type VersionRow } from '../types.ts';
+import { EXECUTABLE_KINDS, MD_KINDS, isExecutable, planeOf, type Ctx, type GroupRow, type ItemRow, type Kind, type Principal, type VersionRow } from '../types.ts';
 
 export { buildBundle, buildManifest, catalogMarkdown, installPath } from './bundle.ts';
 // The effective-membership CTE lives in access.ts (this module evaluates publishedSql() at load, so
@@ -26,6 +26,8 @@ export interface GroupSummary {
   visibility: GroupVisibility;
   owner: { id: string; username: string };
   counts: { skill: number; md: number; artifact: number };
+  /** mc52: the kinds of the members that run code as a plugin (bundle.ts executableOf; with `items` on GET /groups/:slug), null when none. */
+  executable: ExecutableFlag | null;
   updatedAt: string;
 }
 
@@ -34,6 +36,8 @@ export interface GroupMember {
   pinnedSeq: number | null;
   installAs: string | null;
   resolvedSeq: number;
+  /** mc52: the served version's (resolvedSeq: the pin, else latest) executable; item.executable is the latest's. */
+  executable: boolean;
   /** claude-code, project scope. */
   installPath: string;
   /** Slug of the included group whose member row this is; null for the group's own members. */
@@ -203,7 +207,32 @@ export interface EffectiveGroup {
   group: GroupRow;
   /** 0 for the root; the include it came through is at depth 1. */
   depth: number;
+  /**
+   * mc52 (review): reached from the root through groups its owner owns alone, the root included. Only these
+   * serve hooks and MCP servers (withheldExec): an include of another owner's public group never consented to
+   * code that owner adds to it later, which every installed plugin would otherwise run on its next update.
+   */
+  own: boolean;
 }
+
+/** mc52 (review): a hook or MCP server member another owner's included group brings, which `group` does not serve. */
+export interface WithheldMember {
+  id: string;
+  kind: Kind;
+  name: string;
+  /** Slug of the group whose member it is. */
+  via: string;
+}
+
+/**
+ * mc52 (review): a hook or MCP server reached through another owner's include is withheld. By kind, not by
+ * the version's `executable` (human, 2026-10-24): another owner's included skill, command or output style
+ * that runs code or forces a style is served as before v4, and sets the group's flag and warnings since it
+ * is served. Only the kinds whose whole purpose is to run code wait for the owner's consent (a member row).
+ */
+const withheldExec = (kind: Kind, own: boolean) => !own && isExecutable(kind);
+/** The served version's `executable` of a member row `gm` of item `i`, for the flag the SQL walks feed. */
+const SERVED_EXEC = '(SELECT v_e.executable FROM item_versions v_e WHERE v_e.item_id = i.id AND v_e.seq = COALESCE(gm.pinned_seq, i.latest_seq))';
 
 // Prepared once per database (tests open many): the walk runs this per visited group on every listing.
 const kidsStmts = new WeakMap<Db, StatementSync>();
@@ -234,28 +263,37 @@ const kidsStmt = (db: Db) => {
  */
 export function effectiveGroups(db: Db, root: GroupRow, limit = MAX_EFFECTIVE_GROUPS): EffectiveGroup[] {
   const kids = kidsStmt(db);
-  const out: EffectiveGroup[] = [{ group: root, depth: 0 }];
+  const out: EffectiveGroup[] = [{ group: root, depth: 0, own: true }];
   const best = new Map([[root.id, 0]]);
-  const walk = (g: GroupRow, depth: number) => {
+  const listed = new Map([[root.id, out[0]]]);
+  const walk = (g: GroupRow, depth: number, own: boolean) => {
     if (depth >= MAX_INCLUDE_DEPTH) return;
     for (const c of kids.all(g.id) as unknown as GroupRow[]) {
       if (out.length >= limit) return;
+      const mine = own && c.owner_id === root.owner_id;
       const seen = best.get(c.id);
-      if (seen !== undefined && seen <= depth + 1) continue;
-      best.set(c.id, depth + 1);
-      if (seen === undefined) out.push({ group: c, depth: depth + 1 });
-      walk(c, depth + 1);
+      const e = listed.get(c.id);
+      // Also re-walked when first reached through the owner's own groups alone, so its subtree is marked own too.
+      if (seen !== undefined && seen <= depth + 1 && !(mine && !e!.own)) continue;
+      if (seen === undefined || depth + 1 < seen) best.set(c.id, depth + 1);
+      if (e) e.own ||= mine;
+      else {
+        const n = { group: c, depth: depth + 1, own: mine };
+        out.push(n);
+        listed.set(c.id, n);
+      }
+      walk(c, depth + 1, mine);
     }
   };
-  walk(root, 0);
+  walk(root, 0, true);
   return out;
 }
 
-/** Item ids the group serves (own and included, published), for conflict focus sets. */
+/** Item ids the group serves (own and included, published; withheld ones not), for conflict focus sets. */
 function servedItemIds(db: Db, group: GroupRow): Set<string> {
-  const stmt = db.prepare(`SELECT i.id FROM group_members gm JOIN items i ON i.id = gm.item_id JOIN scp_groups g ON g.id = gm.group_id WHERE gm.group_id = ? AND ${PUBLISHED}`);
+  const stmt = db.prepare(`SELECT i.id, i.kind FROM group_members gm JOIN items i ON i.id = gm.item_id JOIN scp_groups g ON g.id = gm.group_id WHERE gm.group_id = ? AND ${PUBLISHED}`);
   const ids = new Set<string>();
-  for (const { group: g } of effectiveGroups(db, group)) for (const r of stmt.all(g.id) as { id: string }[]) ids.add(r.id);
+  for (const { group: g, own } of effectiveGroups(db, group)) for (const r of stmt.all(g.id) as { id: string; kind: Kind }[]) if (!withheldExec(r.kind, own)) ids.add(r.id);
   return ids;
 }
 
@@ -263,15 +301,17 @@ function servedItemIds(db: Db, group: GroupRow): Set<string> {
 export function groupSummary(db: Db, row: GroupRow): GroupSummary {
   const counts = { skill: 0, md: 0, artifact: 0 };
   const stmt = db.prepare(
-    `SELECT i.id, i.kind FROM group_members gm JOIN items i ON i.id = gm.item_id JOIN scp_groups g ON g.id = gm.group_id
+    `SELECT i.id, i.kind, i.name, ${SERVED_EXEC} AS executable FROM group_members gm JOIN items i ON i.id = gm.item_id JOIN scp_groups g ON g.id = gm.group_id
      WHERE gm.group_id = ? AND ${PUBLISHED}`,
   );
   const seen = new Set<string>();
-  for (const { group: g } of effectiveGroups(db, row)) {
-    for (const k of stmt.all(g.id) as { id: string; kind: Kind }[]) {
-      if (seen.has(k.id)) continue;
+  const served: { item: { id: string; kind: Kind; name: string }; version: { executable: number } }[] = [];
+  for (const { group: g, own } of effectiveGroups(db, row)) {
+    for (const { executable, ...k } of stmt.all(g.id) as { id: string; kind: Kind; name: string; executable: number }[]) {
+      if (seen.has(k.id) || withheldExec(k.kind, own)) continue;
       seen.add(k.id);
       counts[planeOf(k.kind)]++;
+      served.push({ item: k, version: { executable } });
     }
   }
   return {
@@ -283,6 +323,7 @@ export function groupSummary(db: Db, row: GroupRow): GroupSummary {
     visibility: row.visibility,
     owner: { id: row.owner_id, username: usernameOf(db, row.owner_id) },
     counts,
+    executable: executableOf(served, false),
     updatedAt: row.updated_at,
   };
 }
@@ -290,9 +331,11 @@ export function groupSummary(db: Db, row: GroupRow): GroupSummary {
 /**
  * Effective members p can read: the group's own published members in position order, then each
  * included group's (effectiveGroups order), at their pinned or latest version. The first occurrence
- * of an item wins, with the pin and installAs of the member row it came through.
+ * of an item wins, with the pin and installAs of the member row it came through. A hook or MCP server
+ * of a group not reached through the owner's own groups alone is withheld (EffectiveGroup.own, withheldExec), listed
+ * in `withheld` when given, unless an own group serves the same item.
  */
-export function resolvedMembers(db: Db, p: Principal, group: GroupRow): ResolvedMember[] {
+export function resolvedMembers(db: Db, p: Principal, group: GroupRow, withheld?: WithheldMember[]): ResolvedMember[] {
   const read = itemReadSql(p);
   const stmt = db.prepare(
     `SELECT i.*, gm.pinned_seq AS gm_pinned_seq, gm.install_as AS gm_install_as
@@ -301,10 +344,15 @@ export function resolvedMembers(db: Db, p: Principal, group: GroupRow): Resolved
   );
   const out: ResolvedMember[] = [];
   const seen = new Set<string>();
-  for (const { group: g, depth } of effectiveGroups(db, group)) {
+  const held = new Map<string, WithheldMember>();
+  for (const { group: g, depth, own } of effectiveGroups(db, group)) {
     const rows = stmt.all(g.id, ...read.params) as unknown as (ItemRow & { gm_pinned_seq: number | null; gm_install_as: string | null })[];
     for (const { gm_pinned_seq, gm_install_as, ...item } of rows) {
       if (seen.has(item.id)) continue;
+      if (withheldExec(item.kind, own)) {
+        if (!held.has(item.id)) held.set(item.id, { id: item.id, kind: item.kind, name: item.name, via: g.slug });
+        continue;
+      }
       seen.add(item.id);
       out.push({
         item,
@@ -315,8 +363,20 @@ export function resolvedMembers(db: Db, p: Principal, group: GroupRow): Resolved
       });
     }
   }
+  if (withheld) for (const [id, m] of held) if (!seen.has(id)) withheld.push(m);
   return out;
 }
+
+/**
+ * mc52: the server names an MCP server version declares, its entry's top-level `mcpServers` keys, as a
+ * JSON array for the version row `v` ('[]' when the entry is not that JSON). Claude Code keeps the last of
+ * two servers one plugin declares under one name, so bundle.ts pluginConflicts compares them; read in
+ * SQL, so pluginMembers stays one statement per group.
+ */
+const ENTRY_TEXT = 'CAST(b.data AS TEXT)';
+const SERVER_NAMES = `(SELECT json_group_array(j.key) FROM version_files vf JOIN blobs b ON b.sha256 = vf.sha256,
+  json_each(CASE WHEN json_valid(${ENTRY_TEXT}) THEN CASE json_type(${ENTRY_TEXT}, '$.mcpServers') WHEN 'object' THEN ${ENTRY_TEXT} END END, '$.mcpServers') j
+  WHERE vf.version_id = v.id AND vf.path = v.entry_path)`;
 
 /**
  * What listing a group as a plugin needs of its effective members (bundle.ts pluginProblem,
@@ -328,8 +388,12 @@ export function resolvedMembers(db: Db, p: Principal, group: GroupRow): Resolved
  */
 export function pluginMembers(db: Db, p: Principal, group: GroupRow): { members: PluginMember[]; files: number } {
   const read = itemReadSql(p);
+  // mc52: an executable member's stored paths too, which land at those paths in plugin.zip (bundle.ts pluginFootprint), an MCP server's server names
+  // and an output style's frontmatter (its name, bundle.ts styleName).
   const stmt = db.prepare(
-    `SELECT i.id, i.kind, i.name, v.total_bytes, v.created_at, (SELECT COUNT(*) FROM version_files vf WHERE vf.version_id = v.id) AS files FROM group_members gm
+    `SELECT i.id, i.kind, i.name, v.entry_path, v.total_bytes, v.created_at, v.executable, (SELECT COUNT(*) FROM version_files vf WHERE vf.version_id = v.id) AS files,
+       CASE WHEN i.kind IN (SELECT value FROM json_each(?)) THEN (SELECT json_group_array(vf.path) FROM version_files vf WHERE vf.version_id = v.id) END AS paths,
+       CASE WHEN i.kind = 'mcp-server' THEN ${SERVER_NAMES} END AS servers, CASE WHEN i.kind = 'output-style' THEN v.frontmatter END AS frontmatter FROM group_members gm
      JOIN items i ON i.id = gm.item_id JOIN scp_groups g ON g.id = gm.group_id
      JOIN item_versions v ON v.item_id = i.id AND v.seq = COALESCE(gm.pinned_seq, i.latest_seq)
      WHERE gm.group_id = ? AND ${PUBLISHED} AND ${read.sql} ORDER BY gm.position, gm.added_at`,
@@ -337,15 +401,27 @@ export function pluginMembers(db: Db, p: Principal, group: GroupRow): { members:
   const members: PluginMember[] = [];
   let files = 0;
   const seen = new Set<string>();
-  for (const { group: g } of effectiveGroups(db, group)) {
-    for (const r of stmt.all(g.id, ...read.params) as unknown as { id: string; kind: Kind; name: string; total_bytes: number; created_at: string; files: number }[]) {
-      if (seen.has(r.id)) continue;
+  type Row = { id: string; kind: Kind; name: string; entry_path: string; total_bytes: number; created_at: string; executable: number; files: number; paths: string | null; servers: string | null; frontmatter: string | null };
+  for (const { group: g, own } of effectiveGroups(db, group)) {
+    for (const r of stmt.all(JSON.stringify(EXECUTABLE_KINDS), g.id, ...read.params) as unknown as Row[]) {
+      if (seen.has(r.id) || withheldExec(r.kind, own)) continue;
       seen.add(r.id);
       files += r.files;
-      members.push({ item: { id: r.id, kind: r.kind, name: r.name }, version: { total_bytes: r.total_bytes, created_at: r.created_at } });
+      members.push({
+        item: { id: r.id, kind: r.kind, name: r.name },
+        version: { entry_path: r.entry_path, total_bytes: r.total_bytes, created_at: r.created_at, executable: r.executable, ...(r.frontmatter !== null && { frontmatter: r.frontmatter }) },
+        ...(r.paths !== null && { paths: JSON.parse(r.paths) as string[] }),
+        ...(r.servers !== null && { servers: JSON.parse(r.servers) as string[] }),
+      });
     }
   }
   return { members, files };
+}
+
+/** SERVER_NAMES of these MCP server versions, by version id, in one statement (bundle.ts buildManifest, buildPlugin). */
+export function serverNames(db: Db, versionIds: string[]): Map<string, string[]> {
+  const rows = db.prepare(`SELECT v.id, ${SERVER_NAMES} AS s FROM item_versions v WHERE v.id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(versionIds)) as { id: string; s: string }[];
+  return new Map(rows.map((r) => [r.id, JSON.parse(r.s) as string[]]));
 }
 
 /**
@@ -393,6 +469,7 @@ export function groupDetail(db: Db, p: Principal, row: GroupRow, publicUrl: stri
   const members = resolvedMembers(db, p, row);
   return {
     ...groupSummary(db, row),
+    executable: executableOf(members),
     instructions: row.instructions,
     sharedWith: shared.map((s) => s.username),
     members: members.map((m) => ({
@@ -400,6 +477,7 @@ export function groupDetail(db: Db, p: Principal, row: GroupRow, publicUrl: stri
       pinnedSeq: m.pinnedSeq,
       installAs: m.installAs,
       resolvedSeq: m.version.seq,
+      executable: !!m.version.executable,
       installPath: installPath(m.item.kind, m.item.name, m.version.entry_path, { target: 'claude-code', scope: 'project', installAs: m.installAs }),
       via: m.via,
     })),
@@ -604,9 +682,10 @@ function memberRows(db: Db, group: GroupRow): PlacedRow[] {
   );
   const out: PlacedRow[] = [];
   const seen = new Set<string>();
-  for (const { group: g } of effectiveGroups(db, group)) {
+  for (const { group: g, own } of effectiveGroups(db, group)) {
     for (const r of stmt.all(g.id) as unknown as PlacedRow[]) {
-      if (seen.has(r.id)) continue;
+      // A withheld hook or MCP server installs nowhere, so it neither conflicts nor counts (resolvedMembers).
+      if (seen.has(r.id) || withheldExec(r.kind, own)) continue;
       seen.add(r.id);
       out.push(r);
     }

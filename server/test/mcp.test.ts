@@ -875,3 +875,42 @@ test('get_group and get_bundle carry the required CLIs, commands from the regist
     for (const r of [g, b]) assert.ok(!JSON.stringify(r).includes('evil.example'), 'frontmatter install reached MCP');
   });
 });
+
+// Adds a group too, so it stays after the listing tests.
+test('mc52: get_group (first page) and get_bundle carry the executable flag and the consent warning; get_md lists a hook\'s files', async () => {
+  const h = f.full.headers;
+  const hook = await item(f.t, h, {
+    kind: 'hook',
+    name: 'fmt',
+    files: [
+      { path: 'hooks/hooks.json', content: JSON.stringify({ hooks: { PostToolUse: [{ hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/format.sh' }] }] } }) },
+      { path: 'scripts/format.sh', content: '#!/bin/sh\n' },
+    ],
+  });
+  assert.equal((await f.t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'execs', name: 'Execs' } })).status, 201);
+  assert.equal((await f.t.req('POST', `${API}/groups/execs/members`, { headers: h, json: { itemId: hook.id } })).status, 201);
+  assert.equal((await f.t.req('POST', `${API}/groups/execs/members`, { headers: h, json: { itemId: f.prompt.id } })).status, 201);
+  const flag = { kinds: ['hook'], items: [{ id: hook.id, kind: 'hook', name: 'fmt' }] };
+  await withClient('/mcp/execs', h, async (c) => {
+    const g = await call(c, 'get_group');
+    assert.deepEqual(g.structuredContent.group.executable, flag);
+    assert.match(g.structuredContent.warning, /run commands on the installing machine.*do not install the plugin without their consent\. Executable members: hook fmt\./);
+    assert.ok(text(g).includes(g.structuredContent.warning) && g.structuredContent.message.startsWith(g.structuredContent.warning));
+    assert.equal((await call(c, 'get_group', { offset: 1 })).structuredContent.group.executable, undefined, 'first page only');
+    const b = await call(c, 'get_bundle');
+    assert.deepEqual(b.structuredContent.executable, flag);
+    assert.equal(b.structuredContent.warning, g.structuredContent.warning);
+    assert.match(text(b), /inert copies under \.scp\//);
+    assert.match(text(b), /\.scp\/hooks\/fmt\/ \(hook fmt v1\)/);
+    const md = await call(c, 'get_md', { name: 'fmt' });
+    assert.ok(!md.isError, text(md));
+    assert.deepEqual(md.structuredContent.files.map((x: { path: string }) => x.path), ['hooks/hooks.json', 'scripts/format.sh']);
+  });
+  // A group without one carries neither.
+  await withClient('/mcp/kit', h, async (c) => {
+    const g = await call(c, 'get_group');
+    assert.equal(g.structuredContent.group.executable, null);
+    assert.equal(g.structuredContent.warning, undefined);
+    assert.equal((await call(c, 'get_bundle')).structuredContent.executable, null);
+  });
+});

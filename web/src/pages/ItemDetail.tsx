@@ -6,7 +6,7 @@ import { ArtifactPreview } from '../components/ArtifactPreview.tsx';
 import { CopyBlock } from '../components/CopyBlock.tsx';
 import { ErrorBox, LintList } from '../components/ErrorBox.tsx';
 import { FilesEditor } from '../components/FilesEditor.tsx';
-import { KindBadges } from '../components/ItemCard.tsx';
+import { KindBadges, RunsCodeBadge } from '../components/ItemCard.tsx';
 import { Tabs } from '../components/Tabs.tsx';
 import { useToast } from '../components/Toast.tsx';
 import { bytes, dateTime, decodeText, parseTags, timeAgo, toBase64 } from '../format.ts';
@@ -143,7 +143,7 @@ function ItemView({ id }: { id: string }) {
         <div className="page-title">
           <h1>{item.title || item.name}</h1>
           <p className="row wrap">
-            <KindBadges item={item} />
+            <KindBadges item={{ ...item, executable: version?.executable ?? item.executable }} />
             <code className="muted">{item.name}</code>
             <span className="muted">
               by {item.owner.username} · updated <time dateTime={item.updatedAt}>{timeAgo(item.updatedAt)}</time>
@@ -175,6 +175,8 @@ function ItemView({ id }: { id: string }) {
           )}
         </div>
       </header>
+
+      {version && api.EXECUTABLE_KINDS.includes(item.kind) && <EntryPanel key={version.seq} item={item} version={version} />}
 
       {waived.length > 0 && (
         <details className="stack">
@@ -274,6 +276,35 @@ function ItemView({ id }: { id: string }) {
         )}
       </section>
     </div>
+  );
+}
+
+/** mc52: what a hook or MCP server runs, before anything else on its page. */
+function EntryPanel({ item, version }: { item: api.ItemDetail; version: api.VersionDetail }) {
+  const [text, setText] = useState<string | null | undefined>(undefined); // undefined loading, null binary
+  const [error, setError] = useState<unknown>(null);
+  useEffect(() => {
+    let live = true;
+    api.getFileBytes(item.id, version.entryPath, version.seq).then(
+      (buf) => live && setText(decodeText(buf)),
+      (e) => live && setError(e),
+    );
+    return () => {
+      live = false;
+    };
+  }, [item.id, version.seq, version.entryPath]);
+  return (
+    <section className="card stack-tight" aria-label="What this item runs">
+      <p className="row wrap">
+        <RunsCodeBadge />
+        <span>
+          Installed with its group as a Claude Code plugin, this {item.kind === 'hook' ? 'hook runs these commands on Claude Code events' : 'starts these MCP servers'} on the
+          installing machine (<code>{version.entryPath}</code>):
+        </span>
+      </p>
+      <ErrorBox error={error} />
+      {text === undefined && !error ? <p className="muted" role="status">Loading…</p> : text === null ? <p className="muted">Not text.</p> : text !== undefined && <pre className="code-view">{text}</pre>}
+    </section>
   );
 }
 

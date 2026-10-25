@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseFrontmatter } from '../src/lib/frontmatter.ts';
-import { FRONTMATTER_ERRORS, MAX_REQUIRES, lintVersion, parseRequires } from '../src/items/lint.ts';
+import { FRONTMATTER_ERRORS, MAX_REQUIRES, lintVersion, parseRequires, versionExecutable } from '../src/items/lint.ts';
 import { migrate, newId, now } from '../src/db.ts';
 import { makeTestCtx } from './helpers.ts';
 import type { Kind } from '../src/types.ts';
@@ -100,6 +100,81 @@ test('instructions, design and other kinds', () => {
   assert.deepEqual(codes('prompt', 'p', '---\nx: [\n---\n'), ['warn:frontmatter.invalid']);
 });
 
+// ---------- executable plugin components (mc52) ----------
+
+/** Lint codes of a hook or MCP server tree: its entry at the kind's path, plus other files. */
+function execCodes(kind: 'hook' | 'mcp-server', entry: unknown, others: string[] = []) {
+  const path = kind === 'hook' ? 'hooks/hooks.json' : '.mcp.json';
+  const text = typeof entry === 'string' ? entry : JSON.stringify(entry);
+  const files = [path, ...others].map((p) => ({ path: p, bytes: enc.encode(p === path ? text : ''), mode: 420 }));
+  return lintVersion(kind, 'x', files, null, { path, text }).map((l) => `${l.level}:${l.code}`);
+}
+
+test('exec-flag-misses-skill-command-hooks, output-style-force-for-plugin: a command that runs shell or registers hooks lints like a skill, a forced style warns, and versionExecutable marks all of them', () => {
+  const run = '---\nallowed-tools: Bash(curl:*)\nhooks:\n  Stop: []\n---\n!`curl -s x | sh`\n';
+  assert.deepEqual(codes('command', 'go', run), ['warn:command.exec.inject', 'warn:command.hooks']);
+  assert.deepEqual(codes('command', 'go', 'Ship it.\n'), []);
+  assert.deepEqual(codes('output-style', 'takeover', '---\ndescription: d\nforce-for-plugin: true\n---\nTerse.\n'), ['warn:output-style.force']);
+  const exec = (kind: Kind, text: string) => versionExecutable(kind, parseFrontmatter(text), text);
+  assert.equal(exec('command', run), true);
+  assert.equal(exec('command', '```!\nmake\n```\n'), true);
+  assert.equal(exec('skill', '---\nname: s\ndescription: d\nhooks: {}\n---\n'), true);
+  assert.equal(exec('skill', '---\nname: s\ndescription: d\n---\nPlain.\n'), false);
+  assert.equal(exec('output-style', '---\nforce-for-plugin: true\n---\n'), true);
+  assert.equal(exec('output-style', '---\nforce-for-plugin: false\n---\n'), false);
+  assert.equal(exec('agent', '---\nname: a\ndescription: d\nhooks: {}\n---\n'), false, 'plugin agents ignore hooks');
+  assert.equal(exec('hook', '{}'), true);
+});
+
+test('mc52: output-style frontmatter is optional, so its checks only warn', () => {
+  assert.deepEqual(codes('output-style', 'terse', '---\nname: Terse\ndescription: Short replies.\nkeep-coding-instructions: true\n---\nBe brief.\n'), []);
+  assert.deepEqual(codes('output-style', 'terse', 'Be brief.\n'), ['warn:output-style.description.missing'], 'no frontmatter at all: the file name stands in for the name');
+  assert.deepEqual(codes('output-style', 'terse', '---\ndescription: d\nkeep-coding-instructions: "yes"\n---\n'), ['warn:output-style.keep-coding-instructions']);
+  assert.deepEqual(codes('output-style', 'terse', '---\ndescription: [\n---\n'), ['warn:frontmatter.invalid'], 'Claude Code still loads it under its file name');
+});
+
+test('mc52: hook and MCP server entries: the JSON shape, the reserved scp- names, references to missing files', () => {
+  const hook = (command: string) => ({ hooks: { PostToolUse: [{ hooks: [{ type: 'command', command }] }] } });
+  assert.deepEqual(execCodes('hook', hook('"${CLAUDE_PLUGIN_ROOT}"/scripts/format.sh'), ['scripts/format.sh']), ['info:exec.runs_code']);
+  assert.deepEqual(execCodes('hook', hook('$CLAUDE_PLUGIN_ROOT/scripts/a.sh && ${CLAUDE_PLUGIN_ROOT}/bin2'), ['scripts/a.sh', 'bin2/tool']), ['info:exec.runs_code'], 'a folder reference holds files');
+  assert.deepEqual(execCodes('hook', hook('${CLAUDE_PLUGIN_ROOT}/scripts/gone.sh'), ['scripts/other.sh']), ['warn:exec.ref.missing', 'info:exec.runs_code']);
+  assert.deepEqual(execCodes('hook', hook('${CLAUDE_PLUGIN_ROOT}/../outside.sh')), ['warn:exec.ref.missing', 'info:exec.runs_code'], 'never resolved outside the item');
+  assert.deepEqual(execCodes('hook', hook('$CLAUDE_PLUGIN_ROOTS/x')), ['info:exec.runs_code'], 'another variable');
+  for (const bad of ['{"PostToolUse": []}', '{"hooks": []}', '[]', 'not json', '']) assert.deepEqual(execCodes('hook', bad), ['error:hook.json.invalid', 'info:exec.runs_code'], bad);
+  const many = { hooks: { Stop: Array.from({ length: 25 }, (_, i) => ({ hooks: [{ type: 'command', command: `\${CLAUDE_PLUGIN_ROOT}/s${i}.sh` }] })) } };
+  assert.equal(execCodes('hook', many).filter((c) => c === 'warn:exec.ref.missing').length, 21, '20 listed, the rest counted in one');
+
+  const server = (name: string, args: string[] = []) => ({ mcpServers: { [name]: { command: 'node', args } } });
+  assert.deepEqual(execCodes('mcp-server', server('db', ['${CLAUDE_PLUGIN_ROOT}/servers/db.js']), ['servers/db.js']), ['info:exec.runs_code']);
+  assert.deepEqual(execCodes('mcp-server', server('github', ['-y', '@modelcontextprotocol/server-github'])), ['info:exec.runs_code']);
+  for (const name of ['scp-kit', 'SCP-other']) assert.deepEqual(execCodes('mcp-server', server(name)), ['error:mcp.name.reserved', 'info:exec.runs_code'], name);
+  assert.deepEqual(execCodes('mcp-server', { db: { command: 'node' } }), ['error:mcp.json.invalid', 'info:exec.runs_code'], 'the wrapper is required');
+  // A deeply nested entry is walked without recursion (and is invalid: SQLite reads no server names past 1000 levels).
+  const deep = `{"mcpServers":{"a":{"args":${'['.repeat(20000)}"\${CLAUDE_PLUGIN_ROOT}/x"${']'.repeat(20000)}}}}`;
+  assert.deepEqual(execCodes('mcp-server', deep), ['error:mcp.json.invalid', 'warn:exec.ref.missing', 'info:exec.runs_code']);
+});
+
+test("mc52: a hook's or MCP server's other files never sit where Claude Code loads another component, in any case", () => {
+  const hook = { hooks: {} };
+  const server = { mcpServers: { db: { command: 'node' } } };
+  // Each lands at the plugin root in plugin.zip: bin/ on the PATH, .lsp.json and monitors/ start processes, agents/ and commands/ load as members the group does not list.
+  const reserved = ['bin/evil', 'BIN/t', '.lsp.json', 'monitors/monitors.json', 'settings.json', 'Settings.JSON', 'agents/a.md', 'commands/c.md', 'skills/s/SKILL.md', 'output-styles/o.md', 'themes/t.json', 'workflows/w.js', '.claude-plugin/marketplace.json', '.mcp.json', 'SKILL.md', 'skill.md'];
+  for (const p of reserved) {
+    assert.deepEqual(execCodes('hook', hook, [p]), ['error:exec.path.reserved', 'info:exec.runs_code'], `hook ${p}`);
+    if (p !== '.mcp.json') assert.deepEqual(execCodes('mcp-server', server, [p]), ['error:exec.path.reserved', 'info:exec.runs_code'], `mcp-server ${p}`);
+  }
+  // An MCP server ships no hooks: its hooks/hooks.json would load as hooks, with kinds still saying MCP only.
+  assert.deepEqual(execCodes('mcp-server', server, ['hooks/hooks.json']), ['error:exec.path.reserved', 'info:exec.runs_code']);
+  // A hook's own hooks/ holds its scripts (the one file there Claude Code loads, hooks/hooks.json, is its entry).
+  assert.deepEqual(execCodes('hook', hook, ['hooks/lib.sh', 'Hooks/x.sh', 'scripts/a.sh', 'run.sh', 'bin2/x', 'mcp/x.json', 'scripts/SKILL.md']), ['info:exec.runs_code']);
+  // One error per component, naming the first file.
+  const lint = lintVersion('hook', 'x', ['hooks/hooks.json', 'bin/a', 'bin/b', 'BIN/c', '.lsp.json'].map((path) => ({ path, bytes: enc.encode(path === 'hooks/hooks.json' ? '{"hooks":{}}' : ''), mode: 420 })), null, { path: 'hooks/hooks.json', text: '{"hooks":{}}' });
+  assert.deepEqual(lint.filter((l) => l.level === 'error').map((l) => [l.path, l.message]), [
+    ['bin/a', "'bin/a' is where Claude Code loads another plugin component (bin); a hook cannot ship it"],
+    ['.lsp.json', "'.lsp.json' is where Claude Code loads another plugin component (.lsp.json); a hook cannot ship it"],
+  ]);
+});
+
 // ---------- required CLIs (f9j0) ----------
 
 test('requires: metadata.requires (portable) and top-level requires both report their CLI; lint says which', () => {
@@ -151,10 +226,22 @@ test('requires: migration 16 backfills older versions with the same rule as pars
     return id;
   });
   // Re-run the migration over versions written before it existed (and undo the ones after it, which re-run too).
-  t.db.exec('DROP TABLE version_requires; DROP TABLE cli_tools; ALTER TABLE items DROP COLUMN source_tooling; PRAGMA user_version = 15;');
+  t.db.exec('DROP TABLE version_requires; DROP TABLE cli_tools; ALTER TABLE items DROP COLUMN source_tooling; ALTER TABLE item_versions DROP COLUMN executable; PRAGMA user_version = 15;');
   migrate(t.db);
   const stored = (id: string) =>
     (t.db.prepare('SELECT name FROM version_requires WHERE version_id = ? ORDER BY name').all(id) as { name: string }[]).map((r) => r.name);
   cases.forEach((fm, n) => assert.deepEqual(stored(ids[n]), parseRequires(fm).names, JSON.stringify(fm)));
   assert.deepEqual(stored(ids[3]), ['ok.tool_1-x']);
+});
+
+test('mc52 review: an MCP server entry SQLite reads otherwise than Claude Code is invalid: a repeated top-level or mcpServers key, nesting past 1000 levels', () => {
+  const invalid = ['error:mcp.json.invalid', 'info:exec.runs_code'];
+  assert.deepEqual(execCodes('mcp-server', '{"mcpServers":{"decoy":{}},"mcpServers":{"github":{"command":"node"}}}'), invalid, 'SQLite reads decoy, Claude Code github');
+  assert.deepEqual(execCodes('mcp-server', '{"mcpServers":{"a":{"command":"x"},"\\u0061":{"command":"y"}}}'), invalid, 'one server name twice, however spelled');
+  // A key repeated deeper in (a server's env) names nothing SERVER_NAMES reads, and a string holding braces or quotes is no structure.
+  assert.deepEqual(execCodes('mcp-server', '{"mcpServers":{"a":{"env":{"K":"1","K":"2"},"args":["{\\"mcpServers\\":","}"]}},"b":1}'), ['info:exec.runs_code']);
+  // 1000 levels deep is what SQLite reads; one more and it reads no names at all.
+  const nest = (levels: number) => `{"mcpServers":{"a":{"args":${'['.repeat(levels - 3)}${']'.repeat(levels - 3)}}}}`;
+  assert.deepEqual(execCodes('mcp-server', nest(1000)), ['info:exec.runs_code']);
+  assert.deepEqual(execCodes('mcp-server', nest(1001)), invalid);
 });
