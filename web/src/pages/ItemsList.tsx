@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import * as api from '../api.ts';
-import { useAuth } from '../auth.tsx';
 import { idRange, keepLoaded } from '../bulk.ts';
 import { BulkBar } from '../components/BulkBar.tsx';
 import { ErrorBox } from '../components/ErrorBox.tsx';
@@ -30,11 +29,8 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
   const [importOpen, setImportOpen] = useState(false);
   // Bumped when an import or a bulk action finished, so the first page reloads (and the selection shrinks to it).
   const [reloads, setReloads] = useState(0);
-  const { me } = useAuth();
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [anchor, setAnchor] = useState<string | null>(null);
-  // Mirrors canEditItem (server/src/access.ts): the owner or an admin, holding the write scope.
-  const canEdit = (it: api.ItemSummary) => !!me && me.principal.scopes.includes('write') && (me.user.isAdmin || it.owner.id === me.user.id);
 
   // setParams closes over the params of its render, so the debounced search must call the latest
   // one or it would revert a chip/toggle clicked during the debounce window.
@@ -95,7 +91,7 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [selected.size]);
 
-  const editable = (items ?? []).filter(canEdit);
+  const editable = (items ?? []).filter((it) => it.canEdit);
   const selectedItems = editable.filter((it) => selected.has(it.id));
   const allSelected = editable.length > 0 && selectedItems.length === editable.length;
 
@@ -217,7 +213,7 @@ export function ItemsListPage({ plane }: { plane: api.Plane }) {
           </div>
           <ul className="item-grid">
             {items.map((it) => (
-              <ItemCard key={it.id} item={it} select={{ checked: selected.has(it.id), disabled: !canEdit(it), onToggle: (shift) => toggle(it.id, shift) }} />
+              <ItemCard key={it.id} item={it} select={{ checked: selected.has(it.id), disabled: !it.canEdit, onToggle: (shift) => toggle(it.id, shift) }} />
             ))}
           </ul>
           {items.length < total && (

@@ -180,7 +180,7 @@ export function listReadableGroups(
   return { groups: rows.map((r) => groupSummary(db, r)), total };
 }
 
-const usernameOf = (db: Db, id: string) =>
+export const usernameOf = (db: Db, id: string) =>
   (db.prepare('SELECT username FROM users WHERE id = ?').get(id) as { username: string } | undefined)?.username ?? '';
 
 /**
@@ -261,14 +261,18 @@ const kidsStmt = (db: Db) => {
  * this group beyond MAX_INCLUDE_DEPTH (assertIncludeDepth counts the owner's own chain only, so a
  * stranger cannot block a public group's owner) truncates at depth 4 on read, here and in SQL.
  */
-export function effectiveGroups(db: Db, root: GroupRow, limit = MAX_EFFECTIVE_GROUPS): EffectiveGroup[] {
-  const kids = kidsStmt(db);
+export function effectiveGroups(
+  db: Db,
+  root: GroupRow,
+  limit = MAX_EFFECTIVE_GROUPS,
+  kidsOf = (id: string) => kidsStmt(db).all(id) as unknown as GroupRow[],
+): EffectiveGroup[] {
   const out: EffectiveGroup[] = [{ group: root, depth: 0, own: true }];
   const best = new Map([[root.id, 0]]);
   const listed = new Map([[root.id, out[0]]]);
   const walk = (g: GroupRow, depth: number, own: boolean) => {
     if (depth >= MAX_INCLUDE_DEPTH) return;
-    for (const c of kids.all(g.id) as unknown as GroupRow[]) {
+    for (const c of kidsOf(g.id)) {
       if (out.length >= limit) return;
       const mine = own && c.owner_id === root.owner_id;
       const seen = best.get(c.id);
@@ -425,6 +429,54 @@ export function serverNames(db: Db, versionIds: string[]): Map<string, string[]>
 }
 
 /**
+ * A check, for /tools usedBy, that a group's effective members include one whose served version
+ * requires CLI `cli`: the same members as resolvedMembers (first occurrence wins, at that row's pin),
+ * so usedBy agrees with the group's Requires panel (requiresOf) when one item reaches the group twice.
+ * One check serves one usedBy call: each group's includes and rows are loaded once across all the
+ * candidates it is asked about, and once its loads have cost `budget` it answers null for every later
+ * group (past it by at most one walk and one group's rows). A load costs 1 plus a tenth per row it
+ * returns: a statement costs about what ten rows do. Candidates are attacker-sized: any account can
+ * build groups that reach a CLI and share nothing, and node:sqlite blocks every request meanwhile.
+ */
+export function servesRequiringCheck(db: Db, p: Principal, cli: string, budget: number): (group: GroupRow) => boolean | null {
+  const read = itemReadSql(p);
+  // Only items with some version requiring the CLI: any other can neither require it nor shadow one that does.
+  const stmt = db.prepare(
+    `SELECT i.id, EXISTS (SELECT 1 FROM item_versions v JOIN version_requires vr ON vr.version_id = v.id
+       WHERE v.item_id = i.id AND v.seq = COALESCE(gm.pinned_seq, i.latest_seq) AND vr.name = ?) AS req
+     FROM group_members gm JOIN items i ON i.id = gm.item_id JOIN scp_groups g ON g.id = gm.group_id
+     WHERE gm.group_id = ? AND ${PUBLISHED} AND ${read.sql}
+       AND EXISTS (SELECT 1 FROM item_versions v JOIN version_requires vr ON vr.version_id = v.id WHERE v.item_id = i.id AND vr.name = ?)`,
+  );
+  const kids = new Map<string, GroupRow[]>();
+  const rows = new Map<string, { id: string; req: number }[]>();
+  let spent = 0;
+  const load = <T>(rs: T[]) => ((spent += 1 + rs.length / 10), rs);
+  const kidsOf = (id: string) => {
+    let k = kids.get(id);
+    if (!k) kids.set(id, (k = load(kidsStmt(db).all(id) as unknown as GroupRow[])));
+    return k;
+  };
+  return (group) => {
+    if (spent >= budget) return null;
+    const seen = new Set<string>();
+    for (const { group: g } of effectiveGroups(db, group, MAX_EFFECTIVE_GROUPS, kidsOf)) {
+      let rs = rows.get(g.id);
+      if (!rs) {
+        if (spent >= budget) return null;
+        rows.set(g.id, (rs = load(stmt.all(cli, g.id, ...read.params, cli) as { id: string; req: number }[])));
+      }
+      for (const r of rs) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        if (r.req) return true;
+      }
+    }
+    return false;
+  };
+}
+
+/**
  * Direct includes in position order. Readers see the ones that flow (the owner vouches for them);
  * editors see every row, a stale one included, so they can remove it, but a child they can no longer
  * read (it went private) shows its slug alone: its live name and member count are not theirs to see.
@@ -473,7 +525,7 @@ export function groupDetail(db: Db, p: Principal, row: GroupRow, publicUrl: stri
     instructions: row.instructions,
     sharedWith: shared.map((s) => s.username),
     members: members.map((m) => ({
-      item: itemSummary(db, m.item),
+      item: itemSummary(db, p, m.item),
       pinnedSeq: m.pinnedSeq,
       installAs: m.installAs,
       resolvedSeq: m.version.seq,

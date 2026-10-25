@@ -98,6 +98,8 @@ export interface ItemSummary {
   executable: boolean;
   owner: { id: string; username: string };
   updatedAt: string;
+  /** canEditItem for the viewer, so a client never re-derives it (a restricted key's containment is server-side). */
+  canEdit: boolean;
 }
 
 export interface VersionSummary {
@@ -128,7 +130,6 @@ export interface ItemDetail extends ItemSummary {
   forkedFrom: string | null;
   version: VersionDetail;
   groups: { slug: string; name: string }[];
-  canEdit: boolean;
 }
 
 export const SINGLE_FILE = new Set<Kind>(['agent', 'command', 'prompt', 'instructions', 'artifact', 'output-style']);
@@ -214,7 +215,7 @@ export function readTree(db: Db, versionId: string): TreeFile[] {
   return rows.map((r) => ({ path: r.path, mode: r.mode, bytes: r.data }));
 }
 
-export function itemSummary(db: Db, row: ItemRow): ItemSummary {
+export function itemSummary(db: Db, p: Principal, row: ItemRow): ItemSummary {
   const r = db
     .prepare('SELECT (SELECT username FROM users WHERE id = ?) AS username, (SELECT executable FROM item_versions WHERE item_id = ? AND seq = ?) AS executable')
     .get(row.owner_id, row.id, row.latest_seq) as { username: string | null; executable: number | null };
@@ -233,6 +234,7 @@ export function itemSummary(db: Db, row: ItemRow): ItemSummary {
     executable: !!r.executable,
     owner: { id: row.owner_id, username: r.username ?? '' },
     updatedAt: row.updated_at,
+    canEdit: canEditItem(db, p, row),
   };
 }
 
@@ -259,7 +261,7 @@ export function itemDetail(db: Db, p: Principal, row: ItemRow, seq?: number): It
   const g = servingGroupsSql(p);
   const groups = db.prepare(g.sql).all(row.id, ...g.params) as { slug: string; name: string }[];
   return {
-    ...itemSummary(db, row),
+    ...itemSummary(db, p, row),
     createdAt: row.created_at,
     source: itemSource(row),
     suppliedFrontmatter: suppliedOf(row),
@@ -267,7 +269,6 @@ export function itemDetail(db: Db, p: Principal, row: ItemRow, seq?: number): It
     forkedFrom: row.forked_from,
     version: versionDetail(db, resolveVersion(db, row, seq)),
     groups: groups.map((r) => ({ slug: r.slug, name: r.name })),
-    canEdit: canEditItem(db, p, row),
   };
 }
 
@@ -339,7 +340,7 @@ export function searchItems(
   const rows = db
     .prepare(`SELECT i.* FROM ${from} WHERE ${w} ORDER BY ${match ? 'bm25(items_fts),' : ''} i.updated_at DESC, i.id DESC LIMIT ? OFFSET ?`)
     .all(...params, opts.limit ?? 50, opts.offset ?? 0) as unknown as ItemRow[];
-  return { items: rows.map((r) => itemSummary(db, r)), total };
+  return { items: rows.map((r) => itemSummary(db, p, r)), total };
 }
 
 // ---------- writes ----------

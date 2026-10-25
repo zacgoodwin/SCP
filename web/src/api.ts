@@ -117,6 +117,8 @@ export interface ItemSummary {
   executable: boolean;
   owner: { id: string; username: string };
   updatedAt: string;
+  /** The server's canEditItem for this viewer (a restricted key's containment included). */
+  canEdit: boolean;
 }
 export interface ItemDetail extends ItemSummary {
   createdAt: string;
@@ -128,7 +130,6 @@ export interface ItemDetail extends ItemSummary {
   forkedFrom: string | null;
   version: VersionDetail;
   groups: { slug: string; name: string }[];
-  canEdit: boolean;
 }
 export interface ItemCreate {
   kind: Kind;
