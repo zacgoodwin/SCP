@@ -196,9 +196,10 @@ POST   /items/:id/fork?version=N                                                
 GET    /search?q=&plane=&kind=&group=&limit=                                       -> {results:[ItemSummary & {groups?}]}  (FTS over readable items)
 ```
 `FileIn = {path, content?: string(utf8), contentBase64?: string, mode?: 420|493}`.
-`ItemSummary = {id, kind, plane, name, title, description, category, tags, visibility, format, latestSeq, owner:{id,username}, updatedAt}`.
+`ItemSummary = {id, kind, plane, name, title, description, category, tags, visibility, format, latestSeq, executable, owner:{id,username}, updatedAt}`
+(`executable`: the latest version's runs-code flag, docs/PLAN-v4.md mc52).
 `ItemDetail = ItemSummary & {createdAt, source, forkedFrom, version: VersionDetail, groups:[{slug,name}], canEdit}`.
-`VersionDetail = {seq, entryPath, treeSha256, frontmatter, lint:[Lint], totalBytes, note, createdAt, createdBy:{userId, keyId}, files:[{path, mode, size, sha256}]}`.
+`VersionDetail = {seq, entryPath, treeSha256, frontmatter, lint:[Lint], totalBytes, note, createdAt, executable, createdBy:{userId, keyId}, files:[{path, mode, size, sha256}]}`.
 `Lint = {level: error|warn|info, code, message, path?}`. Writes with any `error` lint return 422 with the lint list.
 Name: skills `^[a-z0-9]+(-[a-z0-9]+)*$` <= 64; other kinds `^[a-z0-9][a-z0-9._-]{0,63}$`; derived
 from frontmatter `name` or title when omitted (an imported skill's wrapper folder comes before the title).
@@ -241,7 +242,7 @@ GET    /groups/:slug/catalog.md                     -> roster markdown
 GET    /stats                                       -> {skills, mds, artifacts, groups, keys}  (own, for dashboard)
 ```
 `GroupSummary = {id, slug, name, description, tags, visibility, owner:{id,username}, counts:{skill, md, artifact}, updatedAt}`.
-`GroupDetail = GroupSummary & {instructions, sharedWith:[username], members:[{item: ItemSummary, pinnedSeq, installAs, resolvedSeq}], endpoints:{mcp, manifest, bundle}, canEdit}`.
+`GroupDetail = GroupSummary & {instructions, sharedWith:[username], members:[{item: ItemSummary, pinnedSeq, installAs, resolvedSeq, executable}], endpoints:{mcp, manifest, bundle}, canEdit}`.
 `Manifest = {group:{slug,name,description,instructions}, items:[{id, kind, plane, name, title, description, version, installPath}]}`.
 
 Bundle paths (`target=claude-code`; `generic` uses `skills/ agents/ commands/ prompts/ ...`;

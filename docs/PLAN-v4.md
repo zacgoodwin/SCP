@@ -83,8 +83,9 @@ Inside a plugin root (bppq's `pluginRoots`), these leave `PLUGIN_COMPONENTS` and
 - `hooks/hooks.json` → one `hook` unit; `.mcp.json` → one `mcp-server` unit. A `.json` file named by the
   manifest's `hooks` or `mcpServers` (string or array of `./` paths) is one more unit of that kind, its
   file stored as the entry. Name: the plugin's name (5w3w manifest name, else folder name), suffixed
-  `-hooks` / `-mcp` (a second unit of the kind adds `-2`, `-3` in manifest order); 5ef6 prefixing and the
-  64-char rule apply as for any unit.
+  `-hooks` / `-mcp` (a second unit of the kind adds `-2`, `-3` in manifest order, on first import: an
+  item keeps its name after, see Source path and updates); 5ef6 prefixing and the 64-char rule apply as
+  for any unit.
 - A unit's tree is its entry plus, for each `${CLAUDE_PLUGIN_ROOT}/<p>` or `$CLAUDE_PLUGIN_ROOT/<p>`
   reference in the entry's strings (`<p>` ends at whitespace, a quote, or `}`), every plugin file under
   `<p>`'s first segment (`scripts/` for `scripts/format.sh`), or `<p>` itself when it is a root file;
@@ -113,7 +114,12 @@ Only the plugin.zip runs them: its `plugin.json` gains `"hooks": ["./hooks/<n>.j
 SCP's own root `.mcp.json`. In bundle.zip they are inert copies (hooks live in settings.json, and
 `${CLAUDE_PLUGIN_ROOT}` is unset outside a plugin); the bundle's install text says so. Two members
 writing the same stored path (two hooks both shipping `scripts/format.sh`) are a path conflict, refused
-by the existing `pluginConflicts`/`findConflicts` (409), never silently overwritten. `INSTALL_AS_KINDS`
+by the existing `pluginConflicts`/`findConflicts` (409), never silently overwritten. So are two MCP
+servers declaring one server name (Claude Code keeps the one declared later, the other gone without a
+word): `pluginConflicts` adds a pseudo-path `mcpServers:<name>` per name each MCP server member's entry
+declares (`groups/service.ts SERVER_NAMES`, read in SQL from the stored entry, compared folded like
+paths), so the manifest's `plugin`, the marketplace listing and plugin.zip refuse it alike, a plugin
+whose `.mcp.json` and a manifest `mcpServers` file share a name included. `INSTALL_AS_KINDS`
 does not gain them.
 
 ### The flag and the warnings
@@ -121,15 +127,153 @@ does not gain them.
 - `executable: {kinds: ('hook'|'mcp-server')[], items: [{id, kind, name}]} | null` on `GET
   /api/v1/groups/:slug`, on each group in list responses (`null` or the same object without `items`),
   on the MCP `get_group` first page and `get_bundle`, and on the marketplace entry. Derived from the
-  effective members (`resolvedMembers`: includes and pins count), never stored, so it cannot drift.
+  effective members (`resolvedMembers`: includes and pins count, but not another owner's included
+  group's hooks and MCP servers, which are withheld: see Includes below), never stored, so it cannot drift.
 - MCP `get_bundle` / `get_group` add a warning string when `executable` is set: these items run commands
   on the installing machine when installed as a Claude Code plugin; show the user, do not install
   without their consent.
 - The marketplace entry's and plugin.json's `description` start with `Runs code (hooks, MCP servers): `
   when the group's plugin carries an executable member.
 - Web: the group page shows a warning banner above the install options and a "runs code" badge on each
-  executable member; item rows and item pages of an executable kind show the same badge; the item page
-  of a `hook`/`mcp-server` shows its entry JSON before anything else.
+  member whose served version is executable; item rows and item pages of an executable version show the
+  same badge; the item page of a `hook`/`mcp-server` shows its entry JSON before anything else. The
+  badges read the per-version flag (refinements below), never the kind: `ItemSummary.executable` (the
+  latest version) on item rows and cards, `members[].executable` (the served version: the pin, else
+  latest) on a group member row, `version.executable` (`VersionSummary`) for the version on the item page.
+
+### Refinements made while building it (I4)
+
+Where the contract above met the code or the Claude Code docs (plugins-reference, components,
+output-styles, marketplace-reference, read 2026-10-24), the safer reading was taken:
+
+- Output styles: every frontmatter field is optional in Claude Code (the file name stands in for `name`,
+  and a style whose YAML does not parse still loads), so "like an agent" became warnings only:
+  `output-style.description.missing`, `output-style.keep-coding-instructions` (not a boolean). An
+  agent-style error would refuse files Claude Code loads.
+- References: the docs write `"${CLAUDE_PLUGIN_ROOT}"/scripts/format.sh` (the quote closes the variable
+  before the slash), so a quote may sit between the variable and `/`. `<p>` still ends at whitespace, a
+  quote or `}`; `relPath` resolves it and one climbing out is `exec.ref.missing`.
+- What a unit takes: only files no other unit claimed (exec units are made after the declared paths and
+  each root's layout folders, before the root skill and the any-`SKILL.md` pass), only inside its own
+  plugin root (not a nested one's), and never from another component: a reference whose first segment
+  is `skills`, `agents`, `commands`, `output-styles`, `hooks` (a hook takes its own `hooks/` anyway),
+  `monitors`, `themes`, `workflows`, `bin`, `.claude-plugin`, `settings.json`, `.lsp.json`,
+  `.mcp.json` or a root `SKILL.md` (any case) takes nothing. Otherwise `bin/` would reach the plugin's
+  PATH inside a hook item, a nested agent file would load as an agent, or a root `SKILL.md` would load
+  as a skill no group member declared (plugins-reference: a plugin with `SKILL.md` at its root, no
+  `skills/` and no `skills` key loads as a single skill); such a reference stays an `exec.ref.missing` warning
+  (the file belongs to another item). Folder references are swept once per root, so a manifest naming
+  many files stays linear.
+- The same rule binds every write, not only the import (verifier, I4): a hook's or MCP server's other
+  files land at their stored paths at the plugin root, so one stored through `POST /items` or a new
+  version at `bin/x`, `.lsp.json`, `monitors/`, `settings.json`, `agents/x.md`, `SKILL.md` or
+  `.claude-plugin/` would run or load in every installed plugin, and an MCP server's `hooks/hooks.json` would load as
+  hooks while the flag's `kinds` said MCP only. Lint refuses a non-entry file whose first segment is one
+  of those components (error `exec.path.reserved`, one per component; `items/lint.ts componentOf`, the
+  one list the import reads too), except a hook's own `hooks/` (its scripts; the one file there Claude
+  Code loads, `hooks/hooks.json`, is its entry, and a case variant of it collides with the entry). The
+  segment is compared folded (`pathKey`): on a case-insensitive install disk `BIN/` is `bin/`. So
+  detection takes no `BIN/` for a reference either, and reports a plugin's `BIN/` or `Settings.json`
+  in `skipped` like `bin/` and `settings.json`.
+- Source path and updates: a hook's or MCP server's `source_path` is its plugin root (the entry and its
+  files are plugin-relative), and `updateTree` re-detects that root (`pluginFolder`, which now makes
+  `''` a plugin root even when its manifest is a marketplace entry). The unit is found by its upstream
+  entry, which the import records (`source_entries`: `[kind, plugin-relative path]` of the root's hook
+  and MCP server entries up to the item's own, last), not by the name's suffix: a `hooks` or
+  `mcpServers` file a marketplace entry names is in no manifest of the plugin folder alone (verifier,
+  I4: every such update was 400), and a manifest that reorders its files no longer swaps two items'
+  trees. A re-import finds the item the same way (`importUnit`: kind, repository, plugin root and the
+  last recorded entry; a row without the record by name), so an entry added before another, removed or
+  reordered upstream versions the item of its own entry, which keeps its name; a new entry whose
+  positional name such a sibling still holds takes the next free `-<n>`. The recorded entries are re-made first and in order, so each takes what it took at import (a
+  server whose `scripts/` reference found the folder taken by the hook made before it takes none
+  again); at most the 49 before its own are kept, so a manifest naming thousands stays linear. A row
+  without the record is the kind's default file. A unit gone upstream is 400 `bad_source`, never the
+  whole root written into the item. A plugin root's own skill carves the exec files out
+  (`source_carve`), on import and on update alike. A root skill imported before mc52 held those files
+  (no unit carved them): while its latest version still holds a file only an exec unit takes now,
+  `updateTree` detects it without exec units (`detectUnits` `exec: false`), so an update never drops
+  them unreported; a re-import makes the hook, MCP server and output-style items and writes the carved
+  skill, after which updates carve. ponytail: a re-import at the commit the item already holds writes
+  no version, so the skill keeps its copies (inert inside its skill folder) until upstream moves.
+- `outputStyles` in the manifest replaces the default `output-styles/` folder, as in Claude Code; the
+  declared paths go through the existing 4ky8 `DECLARED` pass (named by file, prefixed like commands).
+- snqk wording: `inline '<key>' in the manifest is not supported by SCP; it was not imported`, and
+  `MCP bundle '<x>' is not supported by SCP; it was not imported` (a `.mcpb`/`.dxt` path or any
+  `http(s):` value); a declared `hooks`/`mcpServers` path that is not a `.json` file of the plugin is
+  reported like a 4ky8 path (`names no .json file; not imported`). `themes/`, `workflows/` and `bin/`
+  join `PLUGIN_COMPONENTS`; `hooks/`, `.mcp.json` and `output-styles/` stay there for what no unit
+  took (a `hooks/` without `hooks.json`).
+- `.mcp.json` must carry the `mcpServers` wrapper, as the contract says, although Claude Code also reads a
+  bare server map in a plugin's `.mcp.json`: a bare map is refused (`mcp.json.invalid`, in `skipped`), the
+  side that stores no code. The reserved-name check is case-insensitive (`SCP-x` too).
+- There is no MCP `create_item` tool (the MCP server writes artifacts only); the items API
+  (`POST /items`, new versions) accepts the kinds with their entry paths, and a fresh upload whose only
+  folder holds the entry (`hooks/hooks.json`) is not unwrapped. The kind override is refused on the
+  single-file `POST /items/import` too.
+- plugin.zip: a hook named `hooks` lands on `hooks/hooks.json`, which Claude Code loads by itself, so
+  plugin.json does not list it again (a duplicate hooks file is a load error). SCP's own
+  `.claude-plugin/plugin.json` and `.mcp.json` are paths in `pluginConflicts`, so a member's stored file
+  there is the same 409 as two members' clash, in the manifest, the marketplace listing and the build.
+  Lint (`exec.path.reserved`, above) refuses storing one there in the first place; the conflict stays
+  as the builder's last line.
+- The flag: list responses compute it from the members the group publishes (the same walk as `counts`);
+  the detail, MCP and the marketplace entry from `resolvedMembers`. The marketplace entry carries the
+  flag with `items` (Claude Code ignores an unknown entry key), and the bundle manifest carries it too,
+  which `get_bundle` reads.
+- Includes (review, exec-include-injection): a hook or MCP server is served only from a group reached
+  through the including group's owner's own groups alone, the group itself included
+  (`effectiveGroups` marks each group `own`; `resolvedMembers`, `pluginMembers` and `groupSummary`
+  skip the rest). Another owner's public group flows by design (`includeVouchSql`), so without this a
+  hook its owner adds after the include was made would ship in every installed plugin's next update
+  with no consent step: every include made before mc52 was made when nothing could run code. The
+  withheld members leave the members list, the flag, bundle.zip, MCP, plugin.zip and the marketplace
+  alike, so they all agree; so do the SQL walks (`access.ts upCte` climbs a hook or MCP server only to
+  a parent of the child's owner: `?group=` listing and search, the item's groups, a key restricted to
+  the group), and the write checks (`memberRows`, `servedItemIds`: a withheld member neither conflicts
+  with nor counts against an add or include); the manifest lists them (`withheld: [{id, kind, name, via}]`) and the
+  group page names them beside the install options. Adding such an item to the group directly (a
+  member row of the owner's own) is the consent that serves it. Human decision (2026-10-24): withholding
+  stays by kind, hooks and MCP servers only, and there is no per-group opt-in; foreign hooks and MCP
+  servers stay withheld, and adding the item directly remains the consent.
+- Executable is a property of the version, not only of the kind (review, exec-flag-misses-skill-command-hooks
+  and output-style-force-for-plugin). Claude Code keeps a plugin skill's frontmatter `hooks` (run once it is
+  invoked), runs a skill's or command's `` !`cmd` `` and ` ```! ` blocks as it renders them (without a prompt
+  when `allowed-tools` pre-approves them; commands take skills' frontmatter), and applies an output style
+  with `force-for-plugin` in every session of an enabled plugin, over the user's own `outputStyle`. So
+  `item_versions.executable` (migration 20, backfilled from each entry by the same rule) is written at
+  every version by `items/lint.ts versionExecutable`: 1 for a hook or MCP server, for a skill or command
+  whose entry frontmatter has `hooks` or whose body matches the `skill.exec.inject` test, and for an output
+  style with `force-for-plugin` set; agents never (plugin agents ignore `hooks`). The flag reads the served
+  version's column (the member row's pin, else latest): `kinds` may now hold `skill`, `command` and
+  `output-style`, and so do the badges, the MCP warning and the description prefix (`Forces an output
+  style: ` for a forced style, after `Runs code (hooks, MCP servers): ` when both apply). Human decision
+  (2026-10-24): the withholding does not read it. It keys on the kind alone (`withheldExec`, `memberRows`,
+  `servedItemIds`, `pluginMembers`, `groupSummary`, `access.ts upCte`), so another owner's included skill,
+  command or output style that runs code or forces a style is served as before v4, and, being served, sets
+  the including group's flag, warnings and prefix; a withheld foreign hook or MCP server sets none of them.
+  A member row pinned to a version that does none of this drops it from the flag. Lint warns
+  `command.exec.inject`, `command.hooks` and `output-style.force`. `isExecutable(kind)` stays the list of
+  kinds laid out at the plugin root and withheld from another owner's include.
+- Output style names (review, outputstyle-prefix-not-pinned): Claude Code lists a plugin's styles by their
+  frontmatter `name`, else the file name. An output style prefixed in an import takes the prefixed name in
+  its frontmatter when it names itself (`pinName`, kept on source updates by `keepPrefix`, as for an agent);
+  one without a `name` already goes by its file name, the item's. `pluginConflicts` adds a pseudo-path
+  `outputStyle:<name>` per output-style member (compared folded), so two members under one name are a
+  `path_conflict` in the manifest, the marketplace listing and plugin.zip alike, like two server names.
+- Server names in SQL (review): `SERVER_NAMES` reads `.mcp.json` with SQLite's JSON, which keeps the
+  first of repeated keys and refuses nesting past 1000 levels, while `JSON.parse` (and Claude Code)
+  keep the last. So lint refuses (`mcp.json.invalid`) an MCP server entry that repeats a key at its
+  top level or in `mcpServers`, or nests deeper than 1000 levels (`items/lint.ts sqlJsonDivergence`):
+  every stored entry then names, in SQL, the servers Claude Code installs.
+- Badges and the description (review of PR #32, mc52): the web badges keyed on the kind, so a skill that
+  runs shell went unbadged and a member pinned to a plain version was badged by its latest. The DTOs now
+  carry the flag (`ItemSummary.executable`, `GroupMember.executable`, `VersionSummary.executable`) and the
+  badges read it. `flaggedDescription` trims the group's description, so one of whitespace alone is none
+  and the prefix drops its `: ` as for an empty one.
+- Migration: `MIGRATIONS` entries may be `{fkOff: true, sql}`; `migrate()` turns `foreign_keys` off around
+  such a one, runs `PRAGMA foreign_key_check` before commit, and restores the pragma. `migrate(db, to)`
+  stops early, for the migration test. Migration 19 adds `items.source_entries` (above).
 
 ### Tests
 

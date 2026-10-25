@@ -11,7 +11,7 @@ import { normalizePath } from '../lib/paths.ts';
 import { AUTH_LIMITS, rateLimited, spend, take } from '../lib/ratelimit.ts';
 import type { TreeFile } from '../lib/tree.ts';
 import type { ZipLink } from '../lib/zip.ts';
-import { KINDS, type AppEnv, type GroupRow, type ItemRow, type ItemSource, type Principal } from '../types.ts';
+import { KINDS, isPluginKind, type AppEnv, type GroupRow, type ItemRow, type ItemSource, type Principal } from '../types.ts';
 import { SHA_REF, archiveTooLarge, badSource, fetchFolder, fetchZipball, freshSpent, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
 import {
   ARTIFACT_FROM_TREE,
@@ -55,6 +55,8 @@ const folderKinds = z.preprocess(
     .record(z.string().refine(isTreePath, 'a folder path inside the tree (no ../, no leading /)'), z.enum(FOLDER_KINDS))
     .refine((m) => Object.keys(m).length <= 100, 'at most 100 folders'),
 );
+/** mc52: hooks, MCP servers and output styles come from a plugin's own files (detection), never a kind override. */
+export const overrideKind = z.enum(KINDS).refine((k) => !isPluginKind(k), 'hook, mcp-server and output-style items come from a plugin\'s files; they are not a kind override');
 const description = z
   .string()
   .trim()
@@ -66,7 +68,7 @@ const groupFields = {
   group: z.string().min(1).max(100).optional(),
   groupName: z.string().trim().min(1).max(100).optional(),
   intoGroup: z.string().min(1).max(100).optional(),
-  kind: z.enum(KINDS).optional(),
+  kind: overrideKind.optional(),
   folderKinds: folderKinds.optional(),
   onNameClash: z.enum(['skip', 'prefix']).optional(),
   frontmatterErrors: z.enum(['ask', 'import', 'skip']).optional(),

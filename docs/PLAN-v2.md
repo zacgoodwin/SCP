@@ -298,14 +298,38 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   source shipping the same skill, agent or command name both import, prefixed (5ef6 below; agents and
   commands since v4 7k2p); a same-source clash nothing prefixes is skipped as `name_taken`, naming the
   path that holds it. `updateTree` runs the same detection, so a nested plugin's agent updates like a root one.
-- Unsupported plugin components (v3 dnxq part 1): inside a plugin root, `hooks/`, `.mcp.json`,
-  `output-styles/`, `settings.json`, `.lsp.json` and `monitors/` are never stored or served; each
-  lands in `skipped` once (`plugin <component> is not supported by SCP; it was not imported`), not
-  file by file. Outside a plugin these are ordinary files. Part 2, whether SCP should store and serve
-  hooks and MCP servers at all, is pending a human decision (options: never; admin-published only;
-  any owner with an install-time warning; each widens who can run code on subscriber machines).
-  Until it is taken SCP is report-only (docs/PLAN-v3.md "Decisions taken"). The plugin.zip SCP
-  builds carries only its own `.mcp.json`.
+- Executable plugin components (v4 mc52, the contract in docs/PLAN-v4.md; dnxq part 2 decided: any
+  owner, with an install-time warning and a per-group flag). Inside a plugin root, after the declared
+  paths and the root's layout folders: `hooks/hooks.json` and each `.json` the manifest's `hooks`
+  names (a string or a list of `./` paths) is one `hook` item, `.mcp.json` and each `.json` its
+  `mcpServers` names one `mcp-server` item, named `<plugin>-hooks` / `<plugin>-mcp` (`-2`, `-3` in
+  manifest order; the plugin's manifest `name`, else its folder) and prefixed on a clash like any
+  unit. The entry is stored at the kind's path (`hooks/hooks.json`, `.mcp.json`) beside, at their
+  plugin-relative paths, every other file under `hooks/` (a hook) and, for each
+  `${CLAUDE_PLUGIN_ROOT}/<p>` or `$CLAUDE_PLUGIN_ROOT/<p>` in the entry (a quote may close the variable
+  first), the plugin's files under `<p>`'s first folder, or `<p>` itself when it is a root file; never
+  files another unit took, a nested plugin's, or another component's (`skills`, `agents`, `commands`,
+  `output-styles`, `monitors`, `themes`, `workflows`, `bin`, `.claude-plugin`, `settings.json`,
+  `.lsp.json`, `.mcp.json`, a root `SKILL.md`, compared case-folded, so `BIN/` too). A reference that names no file of the
+  item is lint `exec.ref.missing`, an entry without a top-level `hooks` / `mcpServers` object is
+  `hook.json.invalid` / `mcp.json.invalid` (the unit skipped), a server name starting `scp-` is
+  `mcp.name.reserved` (skipped), and any other file at one of those components (a hook's own `hooks/`
+  apart) is `exec.path.reserved`, refused on every write. The source path is the plugin root, and
+  `updateTree` re-detects it, finding the unit by the upstream entry the import recorded
+  (`source_entries`, with the root's entries made before it, re-made first and in order), so a file a
+  marketplace entry's `hooks` or `mcpServers` names updates too. `output-styles/*.md` (or, replacing it, the manifest's `outputStyles` paths) is one
+  `output-style` per file, named by file. A `.mcp.json` or `hooks/` outside every plugin root is
+  repository tooling: not an item, not reported. The import's `kind` override does not offer these
+  kinds (400).
+- Report-only plugin components (v3 dnxq part 1, v4 snqk): inside a plugin root, `settings.json`,
+  `.lsp.json`, `monitors/`, `themes/`, `workflows/` and `bin/` (a skill folder's own `bin/` stays the
+  skill's), and what no unit took of `hooks/`, `.mcp.json` and `output-styles/`, land in `skipped` once
+  each (`plugin <component> is not supported by SCP; it was not imported`), not file by file, matched
+  in any case (`BIN/`, `Settings.json`: on a case-insensitive install disk they are the same). So do,
+  against the manifest, an inline `hooks`, `mcpServers` or `lspServers` object (`inline '<key>' in the
+  manifest is not supported by SCP; it was not imported`, a marketplace entry's prefixed `plugin
+  '<name>': `) and an `mcpServers` entry naming a `.mcpb`/`.dxt` bundle or a URL (`MCP bundle '<x>' is
+  not supported by SCP; it was not imported`).
 - Manifest component paths (v3 4ky8, `pack.ts declaredPath`), detected before every convention
   pass: a plugin root's `plugin.json`, or its same-repository `marketplace.json` entry, may name
   `skills`, `agents` and `commands` (a string or a list). Each path is resolved against the plugin
@@ -484,7 +508,8 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
 - Supplied frontmatter (v3 jcfm, `pack.ts supply`, `lib/frontmatter.ts prependFrontmatter`):
   `description` (trimmed, at most 1024 characters, lint's cap; blank is none) applies to an import
   of exactly one unit that is not a package (a package's entry is README.md or its first .md, so
-  none is fixed), else 400 before anything is written. When the unit's entry (`SKILL.md`,
+  none is fixed) and, since v4, not a hook or MCP server (a JSON entry takes no frontmatter), else
+  400 before anything is written, never dropped without a word. When the unit's entry (`SKILL.md`,
   `DESIGN.md`, a single-file kind's file) has no frontmatter block upstream, SCP puts one in front
   of it: `name` (skills and agents only: the item name, so a 5ef6 prefix carries over) and
   `description`, emitted by the `yaml` library (never concatenated), so `:`, `#` and newlines
@@ -547,7 +572,9 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   components) stays out, since the folder's subtree shows neither the marketplace.json nor the other
   declared paths; a re-import records the carve afresh. Rows from before `source_scope` was recorded
   infer it from the stored version (it holds none of the carved files exactly when the import carved
-  them). A lone loose `.md` the md-only fallback re-homed (`design.md` -> `DESIGN.md`, `skill.md` ->
+  them), and so does a root skill imported before v4 mc52 for its hooks, MCP servers and output
+  styles (kept in the skill while its latest version holds them, until a re-import carves them into
+  items; docs/PLAN-v4.md). A lone loose `.md` the md-only fallback re-homed (`design.md` -> `DESIGN.md`, `skill.md` ->
   `SKILL.md`) is re-homed the same way on update.
   Both require edit rights; audit `item.source_check`, `item.version` with `via: 'github'`.
 - A group-restricted key is refused (403 `restricted_key`) before any body is parsed or anything
@@ -765,7 +792,8 @@ include; the UI links via only when it names an includes[] row with a name). Rea
 child they cannot read carries slug and flowing alone (name '', owner '', memberCount 0): flowing:false for an editor's stale edge, flowing:true for
 a reader's row whose child they cannot open (the owner's private group under their public one), as its members' via say.
 The manifest reports bundle: {ok, problem, code} and plugin: {ok, problem, code} (code: group_full | bundle_too_large | path_conflict), the very
-refusal bundle.zip / plugin.zip would answer, so the group page gates both downloads and says why.
+refusal bundle.zip / plugin.zip would answer, so the group page gates both downloads and says why. With path_conflict it adds
+conflict: {path, items} (v4 mc52: the page then says what fixes it; a rename moves no server name, `mcpServers:<name>`, SCP's own file or stored path).
 GET /groups?owner=others lists other users' readable groups (the dashboard's "Shared with you"), never buried under the caller's own.
 ```
 - Effective members of G = G's own members, then each included group's effective members in
@@ -829,6 +857,9 @@ GET /m/:token/marketplace.json     -> Claude Code marketplace: name "scp-<userna
 GET /m/:token/:slug/plugin.zip     -> plugin layout: .claude-plugin/plugin.json {name, version, description}, skills/<name>/..., agents/<name>.md, commands/<name>.md,
                                       .mcp.json {mcpServers: {scp-<slug>: {type:'http', url:'<publicUrl>/mcp/<slug>', headers:{Authorization:'Bearer <token>'}}}},
                                       other kinds under docs/<kind>/<name>/... ; deterministic bytes (fixed mtime 1980-01-01 in buildZip's caller), so sha256 is stable per effective tree
+                                      v4 mc52: output-styles/<name>.md, a hook's entry at hooks/<name>.json and an MCP server's at mcp/<name>.json, their other files at their
+                                      stored paths; plugin.json gains hooks: [...] and mcpServers: [...] (sorted, omitted when empty), and its description and the listing's
+                                      start with 'Runs code (hooks, MCP servers): ' when one is a member; each listing entry carries executable (docs/PLAN-v4.md)
 ```
 - `:token` resolves through `principalFromKey` (read scope); unknown -> 404. The response of
   `marketplace.json` is `no-store`. The listing reads its members in one statement per effective

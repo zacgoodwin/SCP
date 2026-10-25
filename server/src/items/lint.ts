@@ -1,7 +1,7 @@
 import type { Frontmatter } from '../lib/frontmatter.ts';
-import { isTextPath } from '../lib/paths.ts';
+import { isTextPath, pathKey, relPath } from '../lib/paths.ts';
 import { LIMITS, type TreeFile } from '../lib/tree.ts';
-import type { Kind } from '../types.ts';
+import { aKind, isExecutable, type Kind } from '../types.ts';
 
 export interface Lint {
   level: 'error' | 'warn' | 'info';
@@ -74,6 +74,109 @@ export function parseRequires(d: Record<string, unknown>): { names: string[]; in
 }
 
 /**
+ * mc52: `${CLAUDE_PLUGIN_ROOT}/<p>` or `$CLAUDE_PLUGIN_ROOT/<p>`, a quote allowed between the variable and
+ * the slash (the plugin docs write `"${CLAUDE_PLUGIN_ROOT}"/scripts/format.sh`); `<p>` ends at whitespace,
+ * a quote or `}`.
+ */
+const ROOT_REF = /\$(?:\{CLAUDE_PLUGIN_ROOT\}|CLAUDE_PLUGIN_ROOT\b)["']?\/([^\s"'}]+)/g;
+
+/** A skill's or command's body runs shell as it renders (!`cmd` or ```!), before the model sees it; pre-approved by allowed-tools, without a prompt. */
+const injectsShell = (body: string) => /!`[^`\n]+`/.test(body) || /^```!/m.test(body);
+
+/**
+ * Review (exec-flag, output-style-force): whether a version acts on the installing machine once its plugin is
+ * enabled, with no step of the user's: a hook or MCP server always; a skill or command whose entry frontmatter
+ * registers `hooks` (kept by plugin skills, run once invoked) or whose body runs shell as it renders; an output
+ * style with `force-for-plugin` set, which replaces the user's own style in every session (truthy, so any value
+ * Claude Code might read as set counts). Agents are not: plugin agents ignore `hooks`. Stored per version
+ * (item_versions.executable, written by items/service.ts insertVersion, backfilled by db.ts migration 20) and read
+ * by the group flag and its warnings. The include withholding reads the kind instead (groups/service.ts withheldExec).
+ */
+export function versionExecutable(kind: Kind, fm: Frontmatter | null, entryText: string): boolean {
+  if (isExecutable(kind)) return true;
+  const d = fm?.data ?? {};
+  if (kind === 'skill' || kind === 'command') return 'hooks' in d || injectsShell(fm?.body ?? entryText);
+  return kind === 'output-style' && !!d['force-for-plugin'];
+}
+
+/** The JSON object an executable kind's entry (hooks.json, .mcp.json) holds, or null. */
+export function entryJson(text: string): Record<string, unknown> | null {
+  try {
+    const v: unknown = JSON.parse(text);
+    return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** SQLite's JSON nesting limit: json_valid is 0 past it (node:sqlite 3.53). */
+const SQL_JSON_DEPTH = 1000;
+
+/**
+ * Why SQLite reads this valid JSON text otherwise than JSON.parse (and Claude Code) does, or null: a key
+ * repeated in the top-level object or its `mcpServers` object (SQLite keeps the first, JSON.parse the last),
+ * or nesting past SQL_JSON_DEPTH (SQLite refuses the whole text, so no names at all). Then a server name
+ * SERVER_NAMES compares would not be the one installed. One pass over the text, strings skipped.
+ */
+export function sqlJsonDivergence(text: string): string | null {
+  const stack: { keys: Set<string> | null; obj: boolean; key: boolean }[] = [];
+  let last = ''; // the key last read in the top-level object
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+      const top = stack.at(-1);
+      if (top?.obj && top.key) {
+        top.key = false;
+        const k = JSON.parse(text.slice(i, j + 1)) as string;
+        if (top.keys?.has(k)) return `repeats the key '${k.slice(0, 100)}', which SCP and Claude Code would read differently`;
+        top.keys?.add(k);
+        if (stack.length === 1) last = k;
+      }
+      i = j;
+    } else if (c === '{' || c === '[') {
+      if (stack.length >= SQL_JSON_DEPTH) return `nests deeper than ${SQL_JSON_DEPTH} levels`;
+      const watched = c === '{' && (stack.length === 0 || (stack.length === 1 && last === 'mcpServers'));
+      stack.push({ keys: watched ? new Set() : null, obj: c === '{', key: c === '{' });
+    } else if (c === '}' || c === ']') stack.pop();
+    else if (c === ',' && stack.at(-1)?.obj) stack.at(-1)!.key = true;
+  }
+  return null;
+}
+
+/** The `<p>` of every plugin-root reference in the strings of a JSON value, walked with a stack: an entry can nest deeper than the call stack. */
+export function pluginRootRefs(json: unknown): string[] {
+  const out = new Set<string>();
+  const stack = [json];
+  while (stack.length) {
+    const v = stack.pop();
+    if (typeof v === 'string') for (const m of v.matchAll(ROOT_REF)) out.add(m[1]);
+    else if (v && typeof v === 'object') for (const x of Object.values(v)) stack.push(x);
+  }
+  return [...out];
+}
+
+/**
+ * mc52: the first path segments where Claude Code loads a plugin's components by itself (`bin/` goes on
+ * the PATH, `.lsp.json` starts servers, `agents/*.md` load as agents, SCP's own manifest and `.mcp.json`;
+ * a root `SKILL.md` in a plugin with no skills/ and no `skills` key loads as a skill, which a group
+ * without skill members has).
+ * A hook's or MCP server's other files land at their stored paths at the plugin root, so none may sit
+ * here (lint `exec.path.reserved`), and an import never takes one for them. Folded (pathKey): an install
+ * disk may be case-insensitive, where `BIN/` is `bin/`.
+ */
+const COMPONENT_SEGMENTS = new Set(['skills', 'agents', 'commands', 'output-styles', 'hooks', 'monitors', 'themes', 'workflows', 'bin', '.claude-plugin', 'settings.json', '.lsp.json', '.mcp.json', 'skill.md']);
+/** The folded component segment `path` starts with, or undefined. */
+export function componentOf(path: string): string | undefined {
+  const first = pathKey(path.split('/')[0]);
+  return COMPONENT_SEGMENTS.has(first) ? first : undefined;
+}
+
+/** Missing references reported per version; the rest are counted. */
+const MAX_REF_LINTS = 20;
+
+/**
  * Lint one version (docs/research/formats.md 7.5, claude-code profile). Errors are the cases where
  * the client would silently ignore the file; writes with any error are rejected.
  */
@@ -121,8 +224,12 @@ export function lintVersion(
         add('warn', 'skill.path.hardcoded', 'hard-coded install path; use ${CLAUDE_SKILL_DIR}', f.path);
       }
     }
-    if (/!`[^`\n]+`/.test(body) || /^```!/m.test(body)) add('warn', 'skill.exec.inject', 'body runs shell commands (!`cmd` or ```!) before the model sees it');
-    if ('hooks' in d) add('warn', 'skill.hooks', 'frontmatter registers hooks that run on invocation');
+  }
+
+  // Commands take the same frontmatter and body as skills (versionExecutable).
+  if (kind === 'skill' || kind === 'command') {
+    if (injectsShell(body)) add('warn', `${kind}.exec.inject`, 'body runs shell commands (!`cmd` or ```!) before the model sees it');
+    if ('hooks' in d) add('warn', `${kind}.hooks`, 'frontmatter registers hooks that run on invocation');
   }
 
   if (kind === 'agent') {
@@ -149,6 +256,44 @@ export function lintVersion(
     if (r.invalid.length) add('warn', 'requires.invalid', `requires names must match ^[a-z0-9][a-z0-9._-]{0,63}$; ignored: ${r.invalid.slice(0, 10).join(', ')}`);
     if (r.dropped) add('warn', 'requires.max', `at most ${MAX_REQUIRES} required CLIs are kept; ${r.dropped} dropped`);
     if (r.topLevel) add('info', 'requires.toplevel', 'top-level requires is outside the portable key set; prefer metadata.requires');
+  }
+
+  // mc52: every output-style field is optional (the file name stands in for `name`), so these only warn.
+  if (kind === 'output-style' && fm && !fm.error) {
+    if (!str(d.description)?.trim()) add('warn', 'output-style.description.missing', 'no frontmatter description: the /output-style picker shows none');
+    const keep = d['keep-coding-instructions'];
+    if (keep !== undefined && typeof keep !== 'boolean') add('warn', 'output-style.keep-coding-instructions', 'keep-coding-instructions must be true or false; Claude Code ignores anything else');
+    if (d['force-for-plugin']) add('warn', 'output-style.force', "force-for-plugin replaces every installer's own output style while the plugin is enabled, without their choosing it");
+  }
+
+  if (isExecutable(kind) && entry) {
+    const key = kind === 'hook' ? 'hooks' : 'mcpServers';
+    const json = entryJson(entry.text);
+    const map = json?.[key];
+    if (!map || typeof map !== 'object' || Array.isArray(map)) {
+      add('error', kind === 'hook' ? 'hook.json.invalid' : 'mcp.json.invalid', `${entry.path} must be a JSON object with a top-level '${key}' object`);
+    } else {
+      // SCP's own plugin entry is scp-<group> (groups/bundle.ts buildPlugin): a member's server of that name would replace it.
+      const reserved = kind === 'mcp-server' ? Object.keys(map).filter((n) => /^scp-/i.test(n)) : [];
+      if (reserved.length) add('error', 'mcp.name.reserved', `MCP server names starting 'scp-' are SCP's own (its plugin's server is scp-<group>): ${reserved.slice(0, 10).join(', ')}`);
+      // groups/service.ts SERVER_NAMES reads the server names in SQLite, which must see the names Claude Code does.
+      const odd = kind === 'mcp-server' ? sqlJsonDivergence(entry.text) : null;
+      if (odd) add('error', 'mcp.json.invalid', `${entry.path} ${odd}`);
+      // A reference resolves against the plugin root, where the item's files land (plugin.zip); one that names none of them fails there.
+      const held = new Set<string>();
+      for (const f of files) for (let i = f.path.length; i > 0; i = f.path.lastIndexOf('/', i - 1)) held.add(f.path.slice(0, i));
+      const missing = pluginRootRefs(json).filter((p) => !held.has(relPath(p) ?? ''));
+      for (const p of missing.slice(0, MAX_REF_LINTS)) add('warn', 'exec.ref.missing', `'\${CLAUDE_PLUGIN_ROOT}/${p.slice(0, 200)}' names no file of this item, so it fails where the plugin is installed`);
+      if (missing.length > MAX_REF_LINTS) add('warn', 'exec.ref.missing', `${missing.length - MAX_REF_LINTS} more references name no file of this item`);
+    }
+    // One error per component. A hook's own hooks/ holds its scripts: the one file there Claude Code loads, hooks/hooks.json, is its entry.
+    const reserved = new Map<string, string>();
+    for (const f of files) {
+      const c = f.path === entry.path ? undefined : componentOf(f.path);
+      if (c && !(kind === 'hook' && c === 'hooks') && !reserved.has(c)) reserved.set(c, f.path);
+    }
+    for (const [c, path] of reserved) add('error', 'exec.path.reserved', `'${path.slice(0, 200)}' is where Claude Code loads another plugin component (${c}); ${aKind(kind)} cannot ship it`, path);
+    add('info', 'exec.runs_code', kind === 'hook' ? 'runs commands on Claude Code events on the installing machine, as part of a plugin' : 'starts MCP servers on the installing machine, as part of a plugin');
   }
 
   if (kind === 'instructions' && fm?.hasFrontmatter) {

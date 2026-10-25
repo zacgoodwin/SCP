@@ -5,7 +5,7 @@ import type { Db } from '../db.ts';
 import { sha256Hex } from '../lib/crypto.ts';
 import { notFound } from '../lib/http.ts';
 import { AUTH_LIMITS, rateLimited, take } from '../lib/ratelimit.ts';
-import { buildPlugin, pluginProblem, pluginVersion, type PluginBuild } from './bundle.ts';
+import { buildPlugin, executableOf, flaggedDescription, pluginProblem, pluginVersion, type PluginBuild } from './bundle.ts';
 import { listOwnGroups, loadReadableGroup, pluginMembers, resolvedMembers } from './service.ts';
 import type { AppEnv, GroupRow, Principal } from '../types.ts';
 
@@ -83,11 +83,14 @@ marketplaceRoutes.get('/m/:token/marketplace.json', (c) => {
     const { members, files } = pluginMembers(db, p, g);
     // A group whose plugin.zip would be refused (too many files, too large, two members at one path) is left out.
     if (pluginProblem(members, files)) continue;
+    // mc52: Claude Code ignores an entry key it does not know, so `executable` rides along for any other reader; the description says it to everyone.
+    const executable = executableOf(members);
     plugins.push({
       name: g.slug,
-      description: g.description,
+      description: flaggedDescription(executable, g.description),
       version: pluginVersion(g, members),
       source: { source: 'archive', url: `${config.publicUrl}/m/${token}/${g.slug}/plugin.zip` },
+      executable,
     });
   }
   return c.json(

@@ -291,6 +291,38 @@ test('pinned version is what gets bundled after a newer version exists', async (
   assert.equal(text((await unzip(t, h)).files.get('.claude/agents/reviewer.md')), v2);
 });
 
+const HOOKS_JSON = JSON.stringify({ hooks: { PostToolUse: [{ hooks: [{ type: 'command', command: '"${CLAUDE_PLUGIN_ROOT}"/scripts/format.sh' }] }] } });
+const MCP_JSON = JSON.stringify({ mcpServers: { db: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/servers/db.js'] } } });
+
+test('mc52: output styles, hooks and MCP servers install per target; hooks and MCP servers only as inert copies', async () => {
+  for (const [target, style, hook, mcp] of [
+    ['claude-code', '.claude/output-styles/terse.md', '.scp/hooks/fmt/', '.scp/mcp-servers/db/'],
+    ['codex', '.scp/output-styles/terse.md', '.scp/hooks/fmt/', '.scp/mcp-servers/db/'],
+    ['generic', 'output-styles/terse.md', 'hooks/fmt/', 'mcp-servers/db/'],
+  ] as const) {
+    for (const scope of ['project', 'user'] as const) {
+      assert.equal(installPath('output-style', 'terse', 'terse.md', { target, scope }), style, `${target} ${scope}`);
+      assert.equal(installPath('hook', 'fmt', 'hooks/hooks.json', { target, scope, installAs: 'X.md' }), hook, 'installAs never applies');
+      assert.equal(installPath('mcp-server', 'db', '.mcp.json', { target, scope }), mcp);
+    }
+  }
+  const t = makeTestCtx();
+  const h = t.key(t.createUser({ username: 'alice' })).headers;
+  const hook = await item(t, h, { kind: 'hook', name: 'fmt', files: [{ path: 'hooks/hooks.json', content: HOOKS_JSON }, { path: 'scripts/format.sh', content: '#!/bin/sh\n', mode: 493 }] });
+  const mcp = await item(t, h, { kind: 'mcp-server', name: 'db', files: [{ path: '.mcp.json', content: MCP_JSON }, { path: 'servers/db.js', content: '1' }] });
+  const style = await item(t, h, { kind: 'output-style', name: 'terse', content: '---\ndescription: Short.\n---\nBe brief.\n' });
+  assert.equal((await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'kit', name: 'Kit' } })).status, 201);
+  for (const it of [hook, mcp, style]) assert.equal((await t.req('POST', `${API}/groups/kit/members`, { headers: h, json: { itemId: it.id, ...(it === hook && { installAs: 'x.md' }) } })).status, it === hook ? 400 : 201);
+  assert.equal((await t.req('POST', `${API}/groups/kit/members`, { headers: h, json: { itemId: hook.id } })).status, 201);
+  const files = (await unzip(t, h)).files;
+  assert.deepEqual([...files.keys()].sort(), ['.claude/output-styles/terse.md', '.scp/hooks/fmt/hooks/hooks.json', '.scp/hooks/fmt/scripts/format.sh', '.scp/mcp-servers/db/.mcp.json', '.scp/mcp-servers/db/servers/db.js', 'scp.lock.json']);
+  assert.equal(files.get('.scp/hooks/fmt/scripts/format.sh')!.mode, 493);
+  const gen = (await unzip(t, h, '?target=generic')).files;
+  assert.ok(gen.has('hooks/fmt/hooks/hooks.json') && gen.has('mcp-servers/db/servers/db.js') && gen.has('output-styles/terse.md'));
+  const m = (await t.req('GET', `${API}/groups/kit/manifest`, { headers: h })).json;
+  assert.deepEqual(m.executable, { kinds: ['hook', 'mcp-server'], items: [{ id: mcp.id, kind: 'mcp-server', name: 'db' }, { id: hook.id, kind: 'hook', name: 'fmt' }] });
+});
+
 test('catalog.md: one row per member, pipes and newlines escaped, full text', async () => {
   const { t, h } = await fixture();
   const r = await t.req('GET', `${API}/groups/kit/catalog.md`, { headers: h });

@@ -50,6 +50,17 @@ export function segmentProblem(s: string): string | null {
   return null;
 }
 
+/** A `./`-style relative path with `.` and `..` resolved, or null when it climbs above where it starts. */
+export function relPath(p: string): string | null {
+  const segs: string[] = [];
+  for (const s of p.split('/')) {
+    if (s === '..') {
+      if (segs.pop() === undefined) return null;
+    } else if (s && s !== '.') segs.push(s);
+  }
+  return segs.join('/');
+}
+
 const JUNK_DIRS = new Set(['__pycache__', 'node_modules', '.git', '__macosx']);
 
 /** Build/OS litter that package_skill.py also drops. Dropped silently (reported as info lint). Case-insensitive. */

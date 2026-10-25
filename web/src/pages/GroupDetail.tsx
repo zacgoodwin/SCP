@@ -452,7 +452,7 @@ function MemberRow({ m, installPath, target, canEdit, viaOpenable, editorColumns
           <Link to={`/items/${m.item.id}`} className="item-card-title">
             {label}
           </Link>
-          <KindBadges item={m.item} />
+          <KindBadges item={{ ...m.item, executable: m.executable }} />
         </span>
         <span className="cell-sub">
           {m.item.owner.username}
@@ -1129,12 +1129,31 @@ function withTarget(url: string, target: api.BundleTarget): string {
   return u.toString();
 }
 
-/** What to do about a download the server refuses, by the manifest's problem code. */
-function fixFor(code: string | null | undefined, what: 'bundle' | 'plugin'): string {
+/** SCP's own files in every plugin.zip (server groups/bundle.ts PLUGIN_OWN). */
+const PLUGIN_OWN = ['.claude-plugin/plugin.json', '.mcp.json'];
+
+/** Whether `path` is where a member named `name` lands in the plugin layout (server groups/bundle.ts pluginPath), which a rename moves. */
+const isPluginPath = (path: string, name: string) =>
+  [`skills/${name}/`, `agents/${name}.md`, `commands/${name}.md`, `output-styles/${name}.md`, `hooks/${name}.json`, `mcp/${name}.json`].includes(path) ||
+  (path.startsWith('docs/') && path.endsWith(`/${name}/`) && path.split('/').length === 4);
+
+/** What to do about a download the server refuses, by the manifest's problem code (and, for a conflict, its path). */
+function fixFor({ code, conflict }: Pick<api.BuildProblem, 'code' | 'conflict'>, what: 'bundle' | 'plugin'): string {
   if (code === 'path_conflict') {
-    return what === 'plugin'
-      ? 'The plugin layout has no "Install as" override, so remove or rename one of the two before this group can be a plugin.'
-      : 'Set "Install as" on one of the two members, or remove one.';
+    if (what === 'bundle') return 'Set "Install as" on one of the two members, or remove one.';
+    // mc52: a server name, SCP's own file or a hook's or MCP server's stored file stays whatever the item is named.
+    if (conflict?.path.startsWith('mcpServers:')) {
+      return `Change the server name '${decodeURIComponent(conflict.path.slice('mcpServers:'.length))}' in one member's .mcp.json, or remove one of them; renaming the item does not change it.`;
+    }
+    if (conflict?.path.startsWith('outputStyle:')) {
+      return `Two output styles are named '${decodeURIComponent(conflict.path.slice('outputStyle:'.length))}' in Claude Code: change the frontmatter name of one, or remove one of them.`;
+    }
+    if (conflict && PLUGIN_OWN.includes(conflict.path)) return `SCP writes ${conflict.path} itself: move or remove that file in the hook or MCP server item that stores it.`;
+    // Not two same-named members at their plugin path: a hook's or MCP server's stored file.
+    if (conflict && !(conflict.items.length === 1 && isPluginPath(conflict.path, conflict.items[0]))) {
+      return `A hook or MCP server keeps its files at their stored paths whatever it is named: move ${conflict.path} in one of the items, or remove one.`;
+    }
+    return 'The plugin layout has no "Install as" override, so remove or rename one of the two before this group can be a plugin.';
   }
   if (code === 'bundle_too_large') return 'Remove members or pin smaller versions until the group is under 100 MB.';
   return 'Remove members or pin smaller versions until the group holds fewer files.';
@@ -1151,6 +1170,35 @@ function DisabledDownload({ id, label, problem }: { id: string; label: string; p
         Cannot be built: {problem}
       </span>
     </span>
+  );
+}
+
+/** What each flagged kind does there (server groups/bundle.ts executableOf). */
+const FLAGGED: Partial<Record<api.Kind, string>> = {
+  hook: 'hooks',
+  'mcp-server': 'MCP servers',
+  skill: 'skills that run commands',
+  command: 'commands that run commands',
+  'output-style': "an output style that replaces the user's own",
+};
+
+/** mc52: above the install options whenever a member would act on the installing machine as part of the group's plugin. */
+function ExecutableBanner({ flag }: { flag: api.ExecutableFlag }) {
+  const what = flag.kinds.map((k) => FLAGGED[k] ?? k).join(', ');
+  return (
+    <div className="error-box" role="note">
+      <strong>This group runs code on the machine that installs it</strong>
+      <p>
+        Installed as a Claude Code plugin (Plugin marketplace, plugin.zip), it acts there without asking ({what}):{' '}
+        {(flag.items ?? []).map((i, n) => (
+          <span key={i.id}>
+            {n > 0 && ', '}
+            <Link to={`/items/${i.id}`}>{i.name}</Link>
+          </span>
+        ))}
+        . A bundle carries hooks and MCP servers only as inert copies. Install the plugin only if you trust what these items run.
+      </p>
+    </div>
   );
 }
 
@@ -1190,7 +1238,7 @@ function ConnectSection({
   const blocked = manifestError instanceof api.ApiError && manifestError.code === 'group_full' ? { problem: manifestError.message, code: manifestError.code } : null;
   const pluginProblem = blocked ?? (manifest?.plugin && !manifest.plugin.ok ? manifest.plugin : null);
   const bundleProblem = blocked ?? (manifest?.bundle && !manifest.bundle.ok ? manifest.bundle : null);
-  const bundleHint = (ok: string) => (bundleProblem ? `bundle.zip cannot be built: ${bundleProblem.problem}. ${fixFor(bundleProblem.code, 'bundle')}` : ok);
+  const bundleHint = (ok: string) => (bundleProblem ? `bundle.zip cannot be built: ${bundleProblem.problem}. ${fixFor(bundleProblem, 'bundle')}` : ok);
 
   const snippet: Record<ConnectTab, string> = {
     claude: `claude mcp add --transport http ${name} ${mcpUrl} --header "Authorization: Bearer <YOUR_KEY>"`,
@@ -1205,9 +1253,9 @@ function ConnectSection({
     claude: 'Run in a terminal; replace <YOUR_KEY> with an API key.',
     json: 'Add to .mcp.json (or your client\'s MCP config); replace <YOUR_KEY> with an API key.',
     plugin: pluginProblem
-      ? `Not in the marketplace: ${pluginProblem.problem}. ${fixFor(pluginProblem.code, 'plugin')}`
+      ? `Not in the marketplace: ${pluginProblem.problem}. ${fixFor(pluginProblem, 'plugin')}`
       : listed
-        ? `Your groups and the ones shared with you by name become plugins (skills, agents, commands, plus this MCP server), in a marketplace named after the key's owner, scp-${user.username}. Claude Code only installs archives over https, so a localhost SCP needs the plugin.zip download below instead.`
+        ? `Your groups and the ones shared with you by name become plugins (skills, agents, commands, output styles, hooks and MCP servers, plus this group's MCP server), in a marketplace named after the key's owner, scp-${user.username}. Claude Code only installs archives over https, so a localhost SCP needs the plugin.zip download below instead.`
         : `Another user's public group is not listed in your marketplace (anyone can create any number of them), so claude plugin install cannot find it by name: download its plugin.zip with your key and unpack it where Claude Code loads plugins from.`,
     bash: bundleHint('Export SCP_KEY first, then run from the project root.'),
     ps: bundleHint('Set $env:SCP_KEY first, then run from the project root.'),
@@ -1235,6 +1283,19 @@ function ConnectSection({
           New key for this group
         </Link>
       </header>
+      {group.executable && <ExecutableBanner flag={group.executable} />}
+      {!!manifest?.withheld?.length && (
+        <p className="muted" role="note">
+          Not served here, as they run code that another owner added to a group this one includes:{' '}
+          {manifest.withheld.map((w, n) => (
+            <span key={w.id}>
+              {n > 0 && ', '}
+              <Link to={`/items/${w.id}`}>{w.name}</Link> (in {w.via})
+            </span>
+          ))}
+          . Add one to this group directly to serve it.
+        </p>
+      )}
       <p className="muted">
         Agents use this group as an MCP server or as a bundle installed into a project. Both need an API key:{' '}
         <Link to={`/keys?group=${encodeURIComponent(slug)}`}>create a key restricted to this group</Link>.

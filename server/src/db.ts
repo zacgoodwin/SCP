@@ -2,6 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { versionExecutable } from './items/lint.ts';
+import { parseFrontmatter } from './lib/frontmatter.ts';
+import type { Kind } from './types.ts';
 
 export type Db = DatabaseSync;
 
@@ -19,8 +22,38 @@ export const UNDOUBLE_SOURCE_PATHS = `UPDATE items SET source_path = d.file FROM
   ) AS d
   WHERE items.id = d.id AND (d.file = d.base OR substr(d.file, -length(d.base) - 1) = '/' || d.base);`;
 
+/** items' columns as of migration 17, in table order: what the mc52 rebuild copies. Frozen, like the migration that reads it. */
+const ITEM_COLUMNS =
+  'id, owner_id, kind, name, title, description, category, tags, visibility, format, latest_seq, source_repo, source_ref, source_path, forked_from, created_at, updated_at, ' +
+  'source_kind, source_commit, source_tree_sha256, source_scope, source_carve, lint_waived, source_prefix, supplied_frontmatter, upstream_frontmatter, source_tooling';
+
+/**
+ * A table rebuild (fkOff): the foreign_keys pragma is a no-op inside a transaction, so migrate() turns it
+ * off around this one, and PRAGMA foreign_key_check must find nothing before it commits. `then`: a backfill
+ * that needs a rule only the application holds, run after `sql` in the same transaction.
+ */
+type Migration = string | { fkOff?: true; sql: string; then?: (db: Db) => void };
+
+/**
+ * Review (exec-flag): item_versions.executable for every version written before it was stored, by the rule
+ * new versions are written with (items/lint.ts versionExecutable), read from each entry file once at upgrade.
+ */
+function backfillExecutable(db: Db): void {
+  const rows = db.prepare(
+    `SELECT v.id, i.kind, CAST(b.data AS TEXT) AS text FROM item_versions v JOIN items i ON i.id = v.item_id
+     LEFT JOIN version_files vf ON vf.version_id = v.id AND vf.path = v.entry_path LEFT JOIN blobs b ON b.sha256 = vf.sha256
+     WHERE i.kind IN ('hook', 'mcp-server', 'skill', 'command', 'output-style')`,
+  );
+  const ids: string[] = [];
+  for (const r of rows.iterate() as Iterable<{ id: string; kind: Kind; text: string | null }>) {
+    if (versionExecutable(r.kind, parseFrontmatter(r.text ?? ''), r.text ?? '')) ids.push(r.id);
+  }
+  const set = db.prepare('UPDATE item_versions SET executable = 1 WHERE id = ?');
+  for (const id of ids) set.run(id);
+}
+
 // Append-only. Each entry runs once, in order, tracked by PRAGMA user_version.
-const MIGRATIONS: string[] = [
+const MIGRATIONS: Migration[] = [
   `
   CREATE TABLE users (
     id TEXT PRIMARY KEY,
@@ -317,6 +350,55 @@ const MIGRATIONS: string[] = [
   );`,
   // v4 nenk: an item imported with includeRepoTooling (4ky8); its source updates re-detect with it (imports/pack.ts updateTree).
   `ALTER TABLE items ADD COLUMN source_tooling INTEGER NOT NULL DEFAULT 0;`,
+  // v4 mc52: the kind CHECK gains hook, mcp-server and output-style. SQLite cannot alter a CHECK, so items is
+  // rebuilt (sqlite.org/lang_altertable.html, "other kinds of table schema changes"): created anew, copied,
+  // the old one dropped and the new one renamed into place, so every REFERENCES items(id) elsewhere names it
+  // again. Its index and trigger go with the old table and are made again (FTS rows live in items_fts,
+  // untouched). migrate() runs this with foreign_keys off and checks them before commit (fkOff).
+  {
+    fkOff: true,
+    sql: `CREATE TABLE items_new (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('skill','agent','command','instructions','prompt','design','package','artifact','hook','mcp-server','output-style')),
+    name TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','public')),
+    format TEXT CHECK (format IS NULL OR format IN ('html','markdown','svg','mermaid','react','code')),
+    latest_seq INTEGER NOT NULL DEFAULT 0,
+    source_repo TEXT,
+    source_ref TEXT,
+    source_path TEXT,
+    forked_from TEXT REFERENCES items(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    source_kind TEXT CHECK (source_kind IS NULL OR source_kind IN ('github','zip')),
+    source_commit TEXT,
+    source_tree_sha256 TEXT,
+    source_scope TEXT CHECK (source_scope IS NULL OR source_scope IN ('tree','root')),
+    source_carve TEXT,
+    lint_waived INTEGER NOT NULL DEFAULT 0,
+    source_prefix TEXT,
+    supplied_frontmatter TEXT,
+    upstream_frontmatter INTEGER NOT NULL DEFAULT 0,
+    source_tooling INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (owner_id, kind, name)
+  );
+  INSERT INTO items_new (${ITEM_COLUMNS}) SELECT ${ITEM_COLUMNS} FROM items;
+  DROP TABLE items;
+  ALTER TABLE items_new RENAME TO items;
+  CREATE INDEX items_owner ON items(owner_id);
+  CREATE TRIGGER items_fts_after_delete AFTER DELETE ON items BEGIN DELETE FROM items_fts WHERE item_id = old.id; END;`,
+  },
+  // v4 mc52: a hook's or MCP server's upstream entry and those its plugin root made before it, which a source
+  // update re-makes (imports/pack.ts execTree): a marketplace entry's hooks file is in no manifest of the plugin folder.
+  `ALTER TABLE items ADD COLUMN source_entries TEXT;`,
+  // Review (exec-flag): whether a version acts on the installing machine as a plugin member: a hook or MCP server,
+  // a skill or command with frontmatter hooks or shell injection, a forced output style (items/lint.ts versionExecutable).
+  { sql: `ALTER TABLE item_versions ADD COLUMN executable INTEGER NOT NULL DEFAULT 0;`, then: backfillExecutable },
 ];
 
 export function openDb(path: string): Db {
@@ -327,13 +409,24 @@ export function openDb(path: string): Db {
   return db;
 }
 
-export function migrate(db: Db): void {
+/** Run the migrations past the database's user_version, up to `to` (all of them by default; tests stop early to hold an older schema). */
+export function migrate(db: Db, to = MIGRATIONS.length): void {
   const { user_version } = db.prepare('PRAGMA user_version').get() as { user_version: number };
-  for (let v = user_version; v < MIGRATIONS.length; v++) {
-    tx(db, () => {
-      db.exec(MIGRATIONS[v]);
-      db.exec(`PRAGMA user_version = ${v + 1}`);
-    });
+  for (let v = user_version; v < to; v++) {
+    const m = MIGRATIONS[v];
+    const fkOff = typeof m !== 'string' && !!m.fkOff;
+    const { foreign_keys } = db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number };
+    if (fkOff) db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      tx(db, () => {
+        db.exec(typeof m === 'string' ? m : m.sql);
+        if (typeof m !== 'string') m.then?.(db);
+        if (fkOff && db.prepare('PRAGMA foreign_key_check').all().length) throw new Error(`migration ${v + 1} left foreign key violations`);
+        db.exec(`PRAGMA user_version = ${v + 1}`);
+      });
+    } finally {
+      if (fkOff) db.exec(`PRAGMA foreign_keys = ${foreign_keys ? 'ON' : 'OFF'}`);
+    }
   }
 }
 

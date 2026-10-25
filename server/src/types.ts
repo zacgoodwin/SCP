@@ -32,11 +32,23 @@ export type AppEnv = {
   };
 };
 
-export const KINDS = ['skill', 'agent', 'command', 'instructions', 'prompt', 'design', 'package', 'artifact'] as const;
+export const KINDS = ['skill', 'agent', 'command', 'instructions', 'prompt', 'design', 'package', 'artifact', 'hook', 'mcp-server', 'output-style'] as const;
 export type Kind = (typeof KINDS)[number];
-/** A kind with its article, for messages: 'an agent', 'an instructions item', 'a skill'. */
-export const aKind = (kind: Kind): string => (kind === 'instructions' ? 'an instructions item' : `${/^[aeiou]/.test(kind) ? 'an' : 'a'} ${kind}`);
-export const MD_KINDS = ['agent', 'command', 'instructions', 'prompt', 'design', 'package'] as const;
+/** A kind with its article, for messages: 'an agent', 'an instructions item', 'a skill', 'an mcp-server'. */
+export const aKind = (kind: Kind): string => (kind === 'instructions' ? 'an instructions item' : `${/^([aeiou]|mcp)/.test(kind) ? 'an' : 'a'} ${kind}`);
+export const MD_KINDS = ['agent', 'command', 'instructions', 'prompt', 'design', 'package', 'hook', 'mcp-server', 'output-style'] as const;
+/**
+ * mc52 (docs/PLAN-v4.md): kinds that run commands on the installing machine as part of a Claude Code plugin,
+ * and lay their files out at the plugin root. Another owner's include withholds these kinds alone
+ * (groups/service.ts withheldExec); the flag and its warnings read the per-version `executable`
+ * (items/lint.ts versionExecutable), which these kinds always set.
+ */
+export const EXECUTABLE_KINDS = ['hook', 'mcp-server'] as const;
+export type ExecutableKind = (typeof EXECUTABLE_KINDS)[number];
+export const isExecutable = (kind: Kind): kind is ExecutableKind => (EXECUTABLE_KINDS as readonly string[]).includes(kind);
+/** mc52: kinds read from a plugin's components only; an import's kind override (jwz6, folderKinds) does not offer them. */
+export const PLUGIN_KINDS = ['hook', 'mcp-server', 'output-style'] as const;
+export const isPluginKind = (kind: Kind) => (PLUGIN_KINDS as readonly string[]).includes(kind);
 export type Plane = 'skill' | 'md' | 'artifact';
 export const planeOf = (kind: Kind): Plane => (kind === 'skill' ? 'skill' : kind === 'artifact' ? 'artifact' : 'md');
 export const FORMATS = ['html', 'markdown', 'svg', 'mermaid', 'react', 'code'] as const;
@@ -104,6 +116,8 @@ export interface ItemRow {
   upstream_frontmatter: number;
   /** nenk: 1 when the import kept the repository's own tooling (includeRepoTooling, 4ky8); source updates carve the tree the same way. */
   source_tooling: number;
+  /** mc52: JSON list of [kind, plugin-relative path] of the hook and MCP server entries its import made in its plugin root up to this item's own, last (imports/pack.ts execTree). */
+  source_entries: string | null;
   forked_from: string | null;
   created_at: string;
   updated_at: string;
@@ -124,6 +138,8 @@ export interface VersionRow {
   /** The OAuth client the version was written through (MCP create/update_artifact); null for sessions and keys. */
   created_by_client: string | null;
   created_at: string;
+  /** 1 when the version acts on the installing machine as a plugin member (items/lint.ts versionExecutable). */
+  executable: number;
 }
 
 export interface GroupRow {

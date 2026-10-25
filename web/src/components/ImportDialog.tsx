@@ -10,7 +10,8 @@ import { Tabs } from './Tabs.tsx';
 
 // Every extension the server's importUpload takes (items/import.ts).
 const ACCEPT = '.md,.markdown,.zip,.skill,.html,.htm,.svg,.mmd,.jsx,.tsx';
-const ALL_KINDS = Object.values(api.KINDS_BY_PLANE).flat();
+/** The kinds an import may be told to take: never a plugin's hooks, MCP servers or output styles (mc52), which come from its own files. */
+const importKinds = (plane?: api.Plane) => (plane ? api.KINDS_BY_PLANE[plane] : Object.values(api.KINDS_BY_PLANE).flat()).filter((k) => !api.PLUGIN_KINDS.includes(k));
 
 type Tab = 'file' | 'pack' | 'github';
 const TABS: [Tab, string][] = [
@@ -323,7 +324,7 @@ function GroupFields({ value, onChange }: { value: GroupChoice; onChange: (g: Gr
 function FileForm({ plane, limits, onCancel }: { plane?: api.Plane; limits: imp.ImportLimits | null; onCancel: () => void }) {
   const nav = useNavigate();
   const [file, setFile] = useState<File | null>(null);
-  const kinds = plane ? api.KINDS_BY_PLANE[plane] : ALL_KINDS;
+  const kinds = importKinds(plane);
   // A one-kind plane (Skills, Artifacts) imports as that kind: detection never yields 'artifact' for
   // a .md, which would land an Artifacts-page import in Prompts & MDs.
   const [kind, setKind] = useState<api.Kind | ''>(kinds.length === 1 ? kinds[0] : '');
@@ -366,7 +367,7 @@ function PackForm({ plane, limits, intoGroup, onCancel, onRun }: { plane?: api.P
   const [group, setGroup] = useState(() => initialGroup(intoGroup));
   const [description, setDescription] = useState('');
   // No artifact: a tree has no format, so the server refuses kind: artifact for a pack.
-  const kinds = (plane ? api.KINDS_BY_PLANE[plane] : ALL_KINDS).filter((k) => k !== 'artifact');
+  const kinds = importKinds(plane).filter((k) => k !== 'artifact');
   const [kind, setKind] = useState<api.Kind | ''>('');
   const [tooling, setTooling] = useState(false);
   const { busy, error, submit } = useSubmit();
@@ -410,7 +411,7 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
   const [ref, setRef] = useState('');
   const [path, setPath] = useState('');
   // No artifact: a tree has no format, so the server refuses kind: artifact for a repository.
-  const kinds = (plane ? api.KINDS_BY_PLANE[plane] : ALL_KINDS).filter((k) => k !== 'artifact');
+  const kinds = importKinds(plane).filter((k) => k !== 'artifact');
   const [kind, setKind] = useState<api.Kind | ''>('');
   const [visibility, setVisibility] = useState<api.Visibility>('private');
   const [group, setGroup] = useState(() => initialGroup(intoGroup));

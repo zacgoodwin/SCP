@@ -1831,45 +1831,381 @@ test('5w3w: a bad marketplace.json is reported once when no detection pass reads
   assert.deepEqual((await github(t3.t, t3.h, { repo: 'acme/bad-market', kind: 'skill' })).json.skipped, []);
 });
 
-test('dnxq: a plugin\'s hooks, MCP servers, output styles, settings, LSP and monitors are reported in skipped, once each; nothing else changes', async () => {
-  const HOOKED: Files = {
-    '.claude-plugin/plugin.json': '{"name":"hooked"}',
-    'skills/h/SKILL.md': skill('h'),
-    'hooks/hooks.json': '{"hooks":{}}',
-    'hooks/run.sh': '#!/bin/sh\necho pwned\n',
-    '.mcp.json': '{"mcpServers":{"evil":{"command":"sh"}}}',
-    'output-styles/terse.md': '# Terse\n',
-    'output-styles/loud.md': '# Loud\n',
-    'plugins/n/.claude-plugin/plugin.json': '{"name":"n"}',
-    'plugins/n/commands/go.md': 'Go.\n',
-    'plugins/n/settings.json': '{}',
-    'plugins/n/.lsp.json': '{}',
-    'plugins/n/monitors/m.json': '{}',
-  };
-  const reason = (c: string) => `plugin ${c} is not supported by SCP; it was not imported`;
-  const expected = [
-    { path: '.mcp.json', reason: reason('.mcp.json') },
-    { path: 'hooks', reason: reason('hooks/') },
-    { path: 'output-styles', reason: reason('output-styles/') },
-    { path: 'plugins/n/.lsp.json', reason: reason('.lsp.json') },
-    { path: 'plugins/n/monitors', reason: reason('monitors/') },
-    { path: 'plugins/n/settings.json', reason: reason('settings.json') },
-  ];
-  const byPath = (a: { path: string }, b: { path: string }) => a.path.localeCompare(b.path);
-  assert.deepEqual(detectUnits(tree(HOOKED), 'hooked').skipped.sort(byPath), expected);
+const FORMAT_HOOK = JSON.stringify({ hooks: { PostToolUse: [{ matcher: 'Write|Edit', hooks: [{ type: 'command', command: '"${CLAUDE_PLUGIN_ROOT}"/scripts/format.sh' }] }] } });
+const DB_MCP = JSON.stringify({ mcpServers: { db: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/servers/db.js'] }, github: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-github'] } } });
+const TERSE = '---\nname: terse\ndescription: Answer in as few words as possible\nkeep-coding-instructions: true\n---\nKeep every reply short.\n';
+/** A plugin with one of each executable component, plus the components SCP still only reports. */
+const HOOKED: Files = {
+  '.claude-plugin/plugin.json': '{"name":"fmt"}',
+  'skills/h/SKILL.md': skill('h'),
+  'hooks/hooks.json': FORMAT_HOOK,
+  'hooks/lib.sh': '#!/bin/sh\n',
+  'scripts/format.sh': '#!/bin/sh\nprettier --write .\n',
+  'scripts/util/common.sh': '#!/bin/sh\n',
+  '.mcp.json': DB_MCP,
+  'servers/db.js': 'console.log(1)\n',
+  'output-styles/terse.md': TERSE,
+  'output-styles/loud.md': '# Loud\n',
+  'docs/notes.txt': 'not referenced',
+  'plugins/n/.claude-plugin/plugin.json': '{"name":"n"}',
+  'plugins/n/commands/go.md': 'Go.\n',
+  'plugins/n/settings.json': '{}',
+  'plugins/n/.lsp.json': '{}',
+  'plugins/n/monitors/m.json': '{}',
+  'plugins/n/themes/dark.json': '{}',
+  'plugins/n/workflows/w.js': 'export {}',
+  'plugins/n/bin/tool': '#!/bin/sh\n',
+  'plugins/n/skills/s/SKILL.md': skill('s'),
+  'plugins/n/skills/s/bin/own': '#!/bin/sh\n',
+};
+const componentSkip = (path: string, c: string) => ({ path, reason: `plugin ${c} is not supported by SCP; it was not imported` });
+const HOOKED_SKIPPED = [
+  componentSkip('plugins/n/.lsp.json', '.lsp.json'),
+  componentSkip('plugins/n/bin', 'bin/'),
+  componentSkip('plugins/n/monitors', 'monitors/'),
+  componentSkip('plugins/n/settings.json', 'settings.json'),
+  componentSkip('plugins/n/themes', 'themes/'),
+  componentSkip('plugins/n/workflows', 'workflows/'),
+];
+const byPath = (a: { path: string }, b: { path: string }) => (a.path < b.path ? -1 : 1);
+const filesOf = (u: { tree: { path: string }[] }) => u.tree.map((f) => f.path).sort();
+const kindPaths = (d: { units: { kind: string; path: string }[] }) => d.units.map((u) => [u.kind, u.path]);
+
+test('mc52: a plugin\'s hooks, MCP servers and output styles become items with the files their entries reference; snqk: bin/, settings, LSP, monitors, themes and workflows are reported once each', async () => {
+  const d = detectUnits(tree(HOOKED), 'repo');
+  assert.deepEqual(kindPaths(d), [
+    ['skill', 'plugins/n/skills/s'],
+    ['command', 'plugins/n/commands/go.md'],
+    ['skill', 'skills/h'],
+    ['hook', ''],
+    ['mcp-server', ''],
+    ['output-style', 'output-styles/terse.md'],
+    ['output-style', 'output-styles/loud.md'],
+  ]);
+  const unit = (kind: string) => d.units.find((u) => u.kind === kind)!;
+  // A hook takes its entry, every other file under hooks/, and what ${CLAUDE_PLUGIN_ROOT} references (the whole first folder); paths stay plugin-relative.
+  assert.deepEqual([unit('hook').name, unit('hook').entry, filesOf(unit('hook'))], ['fmt-hooks', 'hooks/hooks.json', ['hooks/hooks.json', 'hooks/lib.sh', 'scripts/format.sh', 'scripts/util/common.sh']]);
+  // An npx server references nothing; the bundled one brings its folder.
+  assert.deepEqual([unit('mcp-server').name, filesOf(unit('mcp-server'))], ['fmt-mcp', ['.mcp.json', 'servers/db.js']]);
+  assert.deepEqual(d.units.filter((u) => u.kind === 'output-style').map((u) => [u.name, filesOf(u)]), [['terse', ['terse.md']], ['loud', ['loud.md']]]);
+  // A skill folder's own bin/ stays the skill's; the plugin's bin/ is reported, never taken.
+  assert.deepEqual(filesOf(d.units[0]), ['SKILL.md', 'bin/own']);
+  assert.deepEqual([...d.skipped].sort(byPath), HOOKED_SKIPPED);
+
   const { t, h } = setup();
-  const r = await pack(t, h, 'hooked.zip', HOOKED, { group: 'hooked' });
+  const r = await pack(t, h, 'fmt.zip', HOOKED, { group: 'fmt' });
   assert.equal(r.status, 201, r.text);
-  assert.deepEqual(names(r.json.items), ['command:go', 'skill:h']);
-  assert.deepEqual(r.json.items.find((i: { name: string }) => i.name === 'h').version.files.map((f: { path: string }) => f.path), ['SKILL.md']);
-  assert.deepEqual([...r.json.skipped].sort(byPath), expected);
-  // Served: SCP's own .mcp.json only, no hooks or output styles.
-  const served = await servedPluginJson(t, h, 'hooked');
-  assert.deepEqual(served.files, ['.claude-plugin/plugin.json', '.mcp.json', 'commands/go.md', 'skills/h/SKILL.md']);
-  assert.deepEqual(Object.keys(served.mcp.mcpServers), ['scp-hooked']);
-  // Outside a plugin these are ordinary files: an .mcp.json or settings.json is not reported, an .md is told as before.
-  const plain = detectUnits(tree({ 'skills/p/SKILL.md': skill('p'), '.mcp.json': '{}', 'settings.json': '{}', 'output-styles/x.md': '# x' }), 'plain');
+  assert.deepEqual(names(r.json.items), ['command:go', 'hook:fmt-hooks', 'mcp-server:fmt-mcp', 'output-style:loud', 'output-style:terse', 'skill:h', 'skill:s']);
+  const item = (name: string) => r.json.items.find((i: { name: string }) => i.name === name);
+  assert.equal(item('fmt-hooks').version.entryPath, 'hooks/hooks.json');
+  assert.equal(item('fmt-hooks').source.path, null, 'the plugin root is its source path, so a source update re-detects it');
+  assert.equal(item('fmt-mcp').version.entryPath, '.mcp.json');
+  assert.equal(item('terse').version.entryPath, 'terse.md');
+  assert.equal(item('terse').source.path, 'output-styles/terse.md');
+  assert.ok(item('fmt-hooks').version.lint.some((l: { code: string }) => l.code === 'exec.runs_code'));
+  assert.ok(!item('fmt-hooks').version.lint.some((l: { code: string }) => l.code === 'exec.ref.missing'), 'the quoted "${CLAUDE_PLUGIN_ROOT}"/scripts form resolves');
+  assert.deepEqual(item('loud').version.lint.map((l: { code: string }) => l.code), ['output-style.description.missing']);
+  assert.deepEqual(item('h').version.files.map((f: { path: string }) => f.path), ['SKILL.md']);
+  assert.deepEqual([...r.json.skipped].sort(byPath), HOOKED_SKIPPED);
+  const bytes = await t.req('GET', `${API}/items/${item('fmt-hooks').id}/files/hooks/hooks.json`, { headers: h });
+  assert.equal(bytes.text, FORMAT_HOOK);
+
+  // A plugin root that is a skill itself (bppq) leaves the hook's files to the hook, on import and on its source update.
+  const SELF: Files = { 'p/.claude-plugin/plugin.json': '{"name":"p"}', 'p/SKILL.md': skill('p'), 'p/hooks/hooks.json': FORMAT_HOOK, 'p/scripts/format.sh': '', 'p/notes.md': 'n' };
+  const self = detectUnits(tree(SELF), 'repo');
+  assert.deepEqual(self.units.map((u) => [u.kind, u.path, filesOf(u)]), [
+    ['hook', 'p', ['hooks/hooks.json', 'scripts/format.sh']],
+    ['skill', 'p', ['.claude-plugin/plugin.json', 'SKILL.md', 'notes.md']],
+  ]);
+  assert.deepEqual([self.units[1].scope, self.units[1].carve], ['root', ['hooks/hooks.json', 'scripts/format.sh']]);
+  const updated = detectUnits(subtree(tree(SELF), 'p'), 'p', { pluginFolder: true });
+  assert.deepEqual(filesOf(updated.units.find((u) => u.kind === 'skill' && u.path === '')!), ['.claude-plugin/plugin.json', 'SKILL.md', 'notes.md']);
+
+  // Outside a plugin these are repository tooling: no item, nothing reported, and an .md is told as before.
+  const plain = detectUnits(tree({ 'skills/p/SKILL.md': skill('p'), '.mcp.json': DB_MCP, 'hooks/hooks.json': FORMAT_HOOK, 'settings.json': '{}', 'bin/x': '', 'output-styles/x.md': '# x' }), 'plain');
+  assert.deepEqual(kindPaths(plain), [['skill', 'skills/p']]);
   assert.deepEqual(plain.skipped, [{ path: 'output-styles/x.md', reason: 'not inside a recognised layout folder' }]);
+});
+
+test('mc52: manifest hooks, mcpServers and outputStyles paths make units in order (-hooks, -hooks-2); snqk: inline objects, MCP bundles and URLs are reported', () => {
+  const manifest = {
+    name: 'Multi Tool',
+    hooks: ['./config/extra-hooks.json', { PreToolUse: [] }, './hooks/hooks.json', './nope.json', '../out.json', './config/notes.txt'],
+    mcpServers: ['./mcp/servers.json', './bundle.mcpb', 'https://example.com/server.dxt', { inline: { command: 'x' } }],
+    lspServers: { go: { command: 'gopls', extensionToLanguage: { '.go': 'go' } } },
+    outputStyles: './styles/',
+  };
+  const d = detectUnits(
+    tree({
+      '.claude-plugin/plugin.json': JSON.stringify(manifest),
+      'hooks/hooks.json': '{"hooks":{}}',
+      'config/extra-hooks.json': JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: '$CLAUDE_PLUGIN_ROOT/scripts/check.sh "$1"' }] }] } }),
+      'config/notes.txt': 'x',
+      'scripts/check.sh': '#!/bin/sh\n',
+      'mcp/servers.json': JSON.stringify({ mcpServers: { api: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/dist/index.js'] } } }),
+      'dist/index.js': '',
+      'dist/lib/x.js': '',
+      'bundle.mcpb': 'zip',
+      'styles/loud.md': '# Loud\n',
+      'styles/README.md': '# Styles\n',
+    }),
+    'repo',
+  );
+  assert.deepEqual(d.units.map((u) => [u.kind, u.name, u.entry ?? u.path]), [
+    ['output-style', 'loud', 'styles/loud.md'],
+    ['hook', 'multi-tool-hooks', 'hooks/hooks.json'],
+    ['hook', 'multi-tool-hooks-2', 'config/extra-hooks.json'],
+    ['mcp-server', 'multi-tool-mcp', 'mcp/servers.json'],
+  ]);
+  // A manifest's file is stored as the kind's entry, beside what it references.
+  assert.deepEqual(filesOf(d.units[2]), ['hooks/hooks.json', 'scripts/check.sh']);
+  assert.match(new TextDecoder().decode(d.units[2].tree.find((f) => f.path === 'hooks/hooks.json')!.bytes), /check\.sh/);
+  assert.deepEqual(filesOf(d.units[3]), ['.mcp.json', 'dist/index.js', 'dist/lib/x.js']);
+  const P = '.claude-plugin/plugin.json';
+  assert.deepEqual([...d.skipped].sort((a, b) => (a.reason < b.reason ? -1 : 1)), [
+    { path: P, reason: "MCP bundle './bundle.mcpb' is not supported by SCP; it was not imported" },
+    { path: P, reason: "MCP bundle 'https://example.com/server.dxt' is not supported by SCP; it was not imported" },
+    { path: P, reason: "hooks path '../out.json' escapes the plugin; not followed" },
+    { path: P, reason: "hooks path './config/notes.txt' names no .json file; not imported" },
+    { path: P, reason: "hooks path './nope.json' names no .json file; not imported" },
+    { path: P, reason: "inline 'hooks' in the manifest is not supported by SCP; it was not imported" },
+    { path: P, reason: "inline 'lspServers' in the manifest is not supported by SCP; it was not imported" },
+    { path: P, reason: "inline 'mcpServers' in the manifest is not supported by SCP; it was not imported" },
+    { path: 'styles/README.md', reason: 'repository documentation, not an item' },
+  ]);
+  // snqk: a whole inline map is one report; a marketplace entry says which plugin.
+  const inline = detectUnits(
+    tree({
+      '.claude-plugin/marketplace.json': marketplace([{ name: 'm', source: './p', hooks: { Stop: [] }, mcpServers: { a: { command: 'a' }, b: { command: 'b' } } }]),
+      'p/agents/a.md': agentMd('a'),
+    }),
+    'repo',
+  );
+  assert.deepEqual(kindPaths(inline), [['agent', 'p/agents/a.md']]);
+  assert.deepEqual(inline.skipped, [
+    { path: '.claude-plugin/marketplace.json', reason: "plugin 'm': inline 'hooks' in the manifest is not supported by SCP; it was not imported" },
+    { path: '.claude-plugin/marketplace.json', reason: "plugin 'm': inline 'mcpServers' in the manifest is not supported by SCP; it was not imported" },
+  ]);
+});
+
+test('mc52: an invalid entry, a reserved scp- server name and a missing reference: lint decides, per unit', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'lint.zip', {
+    'plugins/a/.claude-plugin/plugin.json': '{"name":"a"}',
+    'plugins/a/hooks/hooks.json': JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/gone.sh' }] }] } }),
+    'plugins/a/.mcp.json': JSON.stringify({ mcpServers: { 'scp-kit': { type: 'http', url: 'https://evil.example/mcp' } } }),
+    'plugins/b/.claude-plugin/plugin.json': '{"name":"b"}',
+    'plugins/b/hooks/hooks.json': '{"Stop":[]}',
+    'plugins/b/agents/x.md': agentMd('x'),
+    'README.md': '# Lint\n',
+  });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['agent:x', 'hook:a-hooks']);
+  const hook = r.json.items.find((i: { name: string }) => i.name === 'a-hooks');
+  assert.deepEqual(
+    hook.version.lint.filter((l: { level: string }) => l.level === 'warn').map((l: { code: string; message: string }) => [l.code, l.message]),
+    [['exec.ref.missing', "'${CLAUDE_PLUGIN_ROOT}/scripts/gone.sh' names no file of this item, so it fails where the plugin is installed"]],
+  );
+  assert.deepEqual(r.json.skipped, [
+    { path: 'plugins/a/.mcp.json', reason: "MCP server names starting 'scp-' are SCP's own (its plugin's server is scp-<group>): scp-kit" },
+    { path: 'plugins/b/hooks/hooks.json', reason: "hooks/hooks.json must be a JSON object with a top-level 'hooks' object" },
+  ]);
+});
+
+test('mc52: the kind override does not offer the new kinds (pack, GitHub, file); the items API creates them at their entry paths', async () => {
+  const { t, h } = setup();
+  assert.equal((await pack(t, h, 'p.zip', HOOKED, { kind: 'hook' })).status, 400);
+  assert.equal((await github(t, h, { repo: 'acme/whatever', kind: 'output-style' })).status, 400);
+  const fd = new FormData();
+  fd.set('file', new File(['# Loud\n'], 'loud.md'));
+  fd.set('kind', 'output-style');
+  assert.equal((await t.req('POST', `${API}/items/import`, { headers: h, body: fd })).status, 400);
+  // Unwrapped like any upload, but a tree whose only folder holds the entry is not a wrapper.
+  const hook = await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'hook', name: 'fmt', files: [{ path: 'hooks/hooks.json', content: FORMAT_HOOK }, { path: 'hooks/x.sh', content: '' }] } });
+  assert.equal(hook.status, 201, hook.text);
+  assert.deepEqual(hook.json.item.version.files.map((f: { path: string }) => f.path), ['hooks/hooks.json', 'hooks/x.sh']);
+  assert.deepEqual(hook.json.item.version.lint.map((l: { code: string }) => l.code), ['exec.ref.missing', 'exec.runs_code']);
+  const wrapped = await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'mcp-server', name: 'db', files: [{ path: 'pkg/.mcp.json', content: DB_MCP }, { path: 'pkg/servers/db.js', content: '' }] } });
+  assert.equal(wrapped.status, 201, wrapped.text);
+  assert.deepEqual(wrapped.json.item.version.files.map((f: { path: string }) => f.path), ['.mcp.json', 'servers/db.js']);
+  const style = await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'output-style', content: TERSE } });
+  assert.equal(style.status, 201, style.text);
+  assert.deepEqual([style.json.item.name, style.json.item.version.entryPath], ['terse', 'terse.md']);
+  const none = await t.req('POST', `${API}/items`, { headers: h, json: { kind: 'hook', name: 'x', files: [{ path: 'run.sh', content: '' }] } });
+  assert.equal(none.status, 400);
+  assert.match(none.json.error.message, /a hook needs hooks\/hooks\.json at the root/);
+});
+
+test('mc52: source/update and re-import of a hook or MCP server re-carve it from its plugin root', async () => {
+  const P = Object.fromEntries(Object.entries(HOOKED).filter(([k]) => !k.startsWith('plugins/')).map(([k, v]) => [`plugins/fmt/${k}`, v]));
+  const next = { ...P, 'plugins/fmt/scripts/format.sh': '#!/bin/sh\nprettier --check .\n', 'plugins/fmt/servers/db.js': 'console.log(2)\n', 'plugins/fmt/skills/h/SKILL.md': skill('h', 'Better.') };
+  gh.repos['acme/fmt'] = { default_branch: 'main', refs: { main: sha2('c1') }, trees: { [sha2('c1')]: P, [sha2('c2')]: next } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo: 'acme/fmt' });
+  assert.equal(imp.status, 201, imp.text);
+  const item = (name: string) => imp.json.items.find((i: { name: string }) => i.name === name);
+  assert.equal(item('fmt-hooks').source.path, 'plugins/fmt');
+  gh.repos['acme/fmt'].refs.main = sha2('c2');
+  for (const [name, path, body] of [['fmt-hooks', 'scripts/format.sh', next['plugins/fmt/scripts/format.sh']], ['fmt-mcp', 'servers/db.js', next['plugins/fmt/servers/db.js']]]) {
+    const up = await t.req('POST', `${API}/items/${item(name).id}/source/update`, { headers: h });
+    assert.equal(up.status, 200, `${name}: ${up.text}`);
+    assert.deepEqual(up.json.item.version.files.map((f: { path: string }) => f.path), item(name).version.files.map((f: { path: string }) => f.path), name);
+    assert.equal((await t.req('GET', `${API}/items/${item(name).id}/files/${path}`, { headers: h })).text, body, name);
+  }
+  assert.equal((await t.req('POST', `${API}/items/${item('h').id}/source/update`, { headers: h })).status, 200);
+  // Re-importing finds the same items by kind, source path and name; nothing is duplicated.
+  const again = await github(t, h, { repo: 'acme/fmt' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(names(again.json.items), names(imp.json.items));
+  assert.ok(again.json.items.every((i: { op: string }) => i.op === 'unchanged'), JSON.stringify(again.json.items.map((i: { name: string; op: string }) => [i.name, i.op])));
+  // Gone upstream: the update says so instead of writing the plugin root into the item.
+  gh.repos['acme/fmt'].trees[sha2('c3')] = Object.fromEntries(Object.entries(next).filter(([k]) => !k.includes('hooks/hooks.json')));
+  gh.repos['acme/fmt'].refs.main = sha2('c3');
+  const gone = await t.req('POST', `${API}/items/${item('fmt-hooks').id}/source/update`, { headers: h });
+  assert.equal(gone.status, 400, gone.text);
+  assert.match(gone.json.error.message, /no longer in its plugin/);
+});
+
+test('mc52: a root skill imported before v4 keeps its hooks, MCP server and output style on source/update; a re-import makes their items and the skill carved, and later updates carve', async () => {
+  const LEGACY = (desc: string): Files => ({
+    '.claude-plugin/plugin.json': '{"name":"kit"}',
+    'SKILL.md': skill('kit', desc),
+    'hooks/hooks.json': JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/fmt.sh' }] }] } }),
+    'scripts/fmt.sh': '#!/bin/sh\n',
+    '.mcp.json': JSON.stringify({ mcpServers: { db: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server/index.js'] } } }),
+    'server/index.js': 'console.log(1)\n',
+    'output-styles/terse.md': '---\ndescription: Terse.\n---\nBe terse.\n',
+  });
+  const [v1, v2, v3, v4] = [sha2('ab'), sha2('ac'), sha2('ad'), sha2('ae')];
+  gh.repos['acme/legacy-kit'] = { default_branch: 'main', refs: { main: v2 }, trees: { [v1]: LEGACY('v1'), [v2]: LEGACY('v2'), [v3]: LEGACY('v3'), [v4]: LEGACY('v4') } };
+  const { t, u, h } = setup();
+  const p: Principal = { userId: u.id, username: u.username, isAdmin: false, via: 'key', scopes: ['read', 'write'], groupIds: null };
+  // The row v0.1.3 left: the root skill took every file, scope 'root', no recorded entries.
+  const row = createItemTx(t.ctx, p, { kind: 'skill', tree: tree(LEGACY('v1')), source: { kind: 'github', repo: 'acme/legacy-kit', ref: 'main', path: null, commit: v1 }, sourceScope: 'root', note: 'n' });
+  const paths = (it: { version: { files: { path: string }[] } }) => filePaths(it).sort();
+  const update = async () => {
+    const up = await t.req('POST', `${API}/items/${row.id}/source/update`, { headers: h });
+    assert.equal(up.status, 200, up.text);
+    return up.json.item;
+  };
+  assert.deepEqual(paths(await update()), Object.keys(LEGACY('v2')).sort(), 'nothing dropped unreported');
+  gh.repos['acme/legacy-kit'].refs.main = v3;
+  const again = await github(t, h, { repo: 'acme/legacy-kit' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(names(again.json.items), ['hook:kit-hooks', 'mcp-server:kit-mcp', 'output-style:terse', 'skill:kit']);
+  const carved = ['.claude-plugin/plugin.json', 'SKILL.md'];
+  assert.deepEqual(paths(again.json.items.find((i: { id: string }) => i.id === row.id)), carved);
+  gh.repos['acme/legacy-kit'].refs.main = v4;
+  assert.deepEqual(paths(await update()), carved);
+});
+
+test("mc52: source/update of the hooks and MCP servers files a marketplace entry names finds each by its recorded entry, the import's order re-made", async () => {
+  const hookA = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/scripts/a.sh' }] }] } });
+  // Its scripts/ reference finds nothing left: the hook, made first, took the folder.
+  const mcpM = JSON.stringify({ mcpServers: { api: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/servers/api.js', '${CLAUDE_PLUGIN_ROOT}/scripts/env.sh'] } } });
+  const M: Files = {
+    '.claude-plugin/marketplace.json': marketplace([{ name: 'mk', source: './p', hooks: ['./a.json'], mcpServers: ['./m.json'] }]),
+    'p/a.json': hookA,
+    'p/m.json': mcpM,
+    'p/scripts/a.sh': '#!/bin/sh\necho a\n',
+    'p/scripts/env.sh': '#!/bin/sh\n',
+    'p/servers/api.js': 'console.log(1)\n',
+    'p/agents/x.md': agentMd('x'),
+  };
+  const next = { ...M, 'p/scripts/a.sh': '#!/bin/sh\necho a2\n', 'p/servers/api.js': 'console.log(2)\n' };
+  gh.repos['acme/market-exec'] = { default_branch: 'main', refs: { main: sha2('e1') }, trees: { [sha2('e1')]: M, [sha2('e2')]: next } };
+  const { t, h } = setup();
+  const imp = await github(t, h, { repo: 'acme/market-exec' });
+  assert.equal(imp.status, 201, imp.text);
+  assert.deepEqual(names(imp.json.items), ['agent:x', 'hook:mk-hooks', 'mcp-server:mk-mcp']);
+  const item = (name: string) => imp.json.items.find((i: { name: string }) => i.name === name);
+  const paths = (i: { version: { files: { path: string }[] } }) => i.version.files.map((f) => f.path);
+  assert.deepEqual(paths(item('mk-hooks')), ['hooks/hooks.json', 'scripts/a.sh', 'scripts/env.sh']);
+  assert.deepEqual(paths(item('mk-mcp')), ['.mcp.json', 'servers/api.js']);
+  const entries = (i: { id: string }) => (t.db.prepare('SELECT source_entries AS e FROM items WHERE id = ?').get(i.id) as { e: string }).e;
+  assert.deepEqual([entries(item('mk-hooks')), entries(item('mk-mcp'))], ['[["hook","a.json"]]', '[["hook","a.json"],["mcp-server","m.json"]]']);
+  // The plugin folder alone names neither file; the recorded entries do, and the hook is re-made before the server, so the server again takes no scripts/.
+  gh.repos['acme/market-exec'].refs.main = sha2('e2');
+  for (const [name, path, body] of [['mk-hooks', 'scripts/a.sh', next['p/scripts/a.sh']], ['mk-mcp', 'servers/api.js', next['p/servers/api.js']]]) {
+    const up = await t.req('POST', `${API}/items/${item(name).id}/source/update`, { headers: h });
+    assert.equal(up.status, 200, `${name}: ${up.text}`);
+    assert.deepEqual(paths(up.json.item), paths(item(name)), name);
+    assert.equal((await t.req('GET', `${API}/items/${item(name).id}/files/${path}`, { headers: h })).text, body, name);
+  }
+  // Its file gone upstream, the hook's update says so.
+  gh.repos['acme/market-exec'].trees[sha2('e3')] = Object.fromEntries(Object.entries(next).filter(([k]) => k !== 'p/a.json'));
+  gh.repos['acme/market-exec'].refs.main = sha2('e3');
+  const gone = await t.req('POST', `${API}/items/${item('mk-hooks').id}/source/update`, { headers: h });
+  assert.equal(gone.status, 400, gone.text);
+  assert.equal(gone.json.error.message, "the hooks file 'a.json' that 'mk-hooks' was imported from is no longer in its plugin");
+});
+
+test('mc52: a re-import finds each hook and MCP server item by its upstream entry, so an entry added, removed or reordered upstream never writes into another one', async () => {
+  const hook = (cmd: string) => JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: cmd }] }] } });
+  const mcp = (server: string) => JSON.stringify({ mcpServers: { [server]: { command: server } } });
+  const kit = (manifest: object, more: Files = {}): Files => ({
+    '.claude-plugin/plugin.json': JSON.stringify({ name: 'kit', ...manifest }),
+    'a.json': hook('lint-a'),
+    'b.json': hook('format'),
+    'm1.json': mcp('one'),
+    'm2.json': mcp('two'),
+    ...more,
+  });
+  const entry = async (t: TestCtx, h: H, i: Out) => fileText(t, h, i.id, i.kind === 'hook' ? 'hooks/hooks.json' : '.mcp.json');
+  const ops = async (t: TestCtx, h: H, r: { json: { items: Out[] } }) =>
+    Promise.all(r.json.items.filter((i) => i.kind !== 'skill').map(async (i) => [i.name, i.op, await entry(t, h, i)]));
+
+  // A default hooks/hooks.json added upstream before the manifest's file, then removed again.
+  const s1 = setup();
+  const first = await pack(s1.t, s1.h, 'kit.zip', kit({ hooks: ['./b.json'] }));
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(await ops(s1.t, s1.h, first), [['kit-hooks', 'create', hook('format')]]);
+  const added = await pack(s1.t, s1.h, 'kit.zip', kit({ hooks: ['./b.json'] }, { 'hooks/hooks.json': hook('lint') }));
+  assert.equal(added.status, 201, added.text);
+  assert.deepEqual((await ops(s1.t, s1.h, added)).sort(), [['kit-hooks', 'unchanged', hook('format')], ['kit-hooks-2', 'create', hook('lint')]]);
+  const removed = await pack(s1.t, s1.h, 'kit.zip', kit({ hooks: ['./b.json'] }));
+  assert.deepEqual(await ops(s1.t, s1.h, removed), [['kit-hooks', 'unchanged', hook('format')]]);
+
+  // A reordered manifest list, hooks and MCP servers alike: each item keeps its own entry.
+  const s2 = setup();
+  const both = await pack(s2.t, s2.h, 'kit.zip', kit({ hooks: ['./a.json', './b.json'], mcpServers: ['./m1.json', './m2.json'] }));
+  assert.equal(both.status, 201, both.text);
+  const before = (await ops(s2.t, s2.h, both)).map(([n, , e]) => [n, e]).sort();
+  assert.deepEqual(before, [['kit-hooks', hook('lint-a')], ['kit-hooks-2', hook('format')], ['kit-mcp', mcp('one')], ['kit-mcp-2', mcp('two')]]);
+  const swapped = await pack(s2.t, s2.h, 'kit.zip', kit({ hooks: ['./b.json', './a.json'], mcpServers: ['./m2.json', './m1.json'] }));
+  assert.equal(swapped.status, 201, swapped.text);
+  assert.deepEqual((await ops(s2.t, s2.h, swapped)).sort(), before.map(([n, e]) => [n, 'unchanged', e]));
+});
+
+test("mc52: a hook's reference takes no other component's files in any case (BIN/ is bin/ on a case-insensitive disk), and they are reported like bin/", () => {
+  const d = detectUnits(
+    tree({
+      'p/.claude-plugin/plugin.json': '{"name":"p"}',
+      'p/hooks/hooks.json': JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: '${CLAUDE_PLUGIN_ROOT}/BIN/t; ${CLAUDE_PLUGIN_ROOT}/Agents/a.md; ${CLAUDE_PLUGIN_ROOT}/SETTINGS.json; ${CLAUDE_PLUGIN_ROOT}/run.sh' }] }] } }),
+      'p/run.sh': '',
+      'p/BIN/t': '',
+      'p/SETTINGS.json': '{}',
+      'p/Agents/a.md': agentMd('a'),
+    }),
+    'repo',
+  );
+  assert.deepEqual(filesOf(d.units.find((u) => u.kind === 'hook')!), ['hooks/hooks.json', 'run.sh']);
+  assert.deepEqual([...d.skipped].sort(byPath), [
+    { path: 'p/Agents/a.md', reason: 'not inside a recognised layout folder' },
+    componentSkip('p/BIN', 'bin/'),
+    componentSkip('p/SETTINGS.json', 'settings.json'),
+  ]);
+  // Nor the plugin's root SKILL.md, which would load as a skill at the plugin root: the root skill keeps it.
+  const s = detectUnits(
+    tree({
+      'p/.claude-plugin/plugin.json': '{"name":"p"}',
+      'p/SKILL.md': skill('p'),
+      'p/hooks/hooks.json': JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'cat ${CLAUDE_PLUGIN_ROOT}/SKILL.md' }] }] } }),
+    }),
+    'repo',
+  );
+  assert.deepEqual(filesOf(s.units.find((u) => u.kind === 'hook')!), ['hooks/hooks.json']);
+  assert.ok(filesOf(s.units.find((u) => u.kind === 'skill')!).includes('SKILL.md'));
 });
 
 const unitsOf = (d: { units: { kind: string; path: string }[] }) => d.units.map((u) => [u.kind, u.path]);
@@ -4018,6 +4354,61 @@ test('en8v: the File route supplies a description as the frontmatter of a file w
   assert.equal(itemCount(t), before);
 });
 
+test("mc52: a description on a one-unit import of a hook or MCP server is a 400, never dropped without a word: its entry is JSON, which takes no frontmatter", async () => {
+  const { t, h } = setup();
+  const before = itemCount(t);
+  const plugins: [string, Files, string][] = [
+    ['fmt.zip', { 'fmt/.claude-plugin/plugin.json': '{"name":"fmt"}', 'fmt/hooks/hooks.json': FORMAT_HOOK, 'fmt/scripts/format.sh': '#!/bin/sh\n' }, 'hook:fmt-hooks'],
+    ['db.zip', { 'db/.claude-plugin/plugin.json': '{"name":"db"}', 'db/.mcp.json': DB_MCP, 'db/servers/db.js': '1\n' }, 'mcp-server:db-mcp'],
+  ];
+  for (const [zip, files] of plugins) {
+    const r = await pack(t, h, zip, files, { description: 'Formats files after edits' });
+    assert.equal(r.status, 400, `${zip}: ${r.text}`);
+    assert.match(r.json.error.message, /a hook's or MCP server's entry is JSON, which takes no frontmatter/);
+  }
+  assert.equal(itemCount(t), before, 'nothing written');
+  // Without the description each imports as its one unit.
+  for (const [zip, files, unit] of plugins) {
+    const r = await pack(t, h, zip, files);
+    assert.equal(r.status, 201, `${zip}: ${r.text}`);
+    assert.deepEqual(names(r.json.items), [unit]);
+  }
+});
+
+test("naming-8: a hook at antigravity/ as a plugin root is that tool's port (its path is the root itself): the real plugin's hook keeps the name, unprefixed", async () => {
+  const hooked = (root: string): Files => {
+    const at = (p: string) => (root ? `${root}/${p}` : p);
+    return { [at('.claude-plugin/plugin.json')]: '{"name":"kit"}', [at('hooks/hooks.json')]: FORMAT_HOOK, [at('scripts/format.sh')]: `# ${root || 'root'}\n` };
+  };
+  const cases: [Files, string | null][] = [
+    [{ ...hooked(''), ...hooked('antigravity') }, null],
+    [{ ...hooked('plugins/kit'), ...hooked('antigravity') }, 'plugins/kit'],
+  ];
+  for (const [files, at] of cases) {
+    const { t, h } = setup();
+    const r = await pack(t, h, 'multi.zip', files);
+    assert.equal(r.status, 201, r.text);
+    assert.deepEqual(r.json.items.map((i: Out) => [i.kind, i.name, i.source.path]), [['hook', 'kit-hooks', at]]);
+    assert.equal(await fileText(t, h, r.json.items[0].id, 'scripts/format.sh'), `# ${at ?? 'root'}\n`);
+    assert.deepEqual(r.json.skipped.map((s: { path: string }) => s.path), ['antigravity/hooks/hooks.json']);
+  }
+});
+
+test('mc52: a plugin whose .mcp.json and a manifest mcpServers file declare one server name imports both, and its group is a plugin conflict, not a silent pick', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'p.zip', {
+    'p/.claude-plugin/plugin.json': JSON.stringify({ name: 'p', mcpServers: ['./extra.json'] }),
+    'p/.mcp.json': JSON.stringify({ mcpServers: { db: { command: 'old' } } }),
+    'p/extra.json': JSON.stringify({ mcpServers: { db: { command: 'new' } } }),
+  }, { group: 'pp' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['mcp-server:p-mcp', 'mcp-server:p-mcp-2']);
+  const man = (await t.req('GET', `${API}/groups/pp/manifest`, { headers: h })).json;
+  assert.deepEqual([man.plugin.ok, man.plugin.code, man.plugin.problem], [false, 'path_conflict', "'p-mcp' and 'p-mcp-2' both install to 'mcpServers:db'"]);
+  // The path and names come apart too, so the group page can say a rename does not fix a server name.
+  assert.deepEqual(man.plugin.conflict, { path: 'mcpServers:db', items: ['p-mcp', 'p-mcp-2'] });
+});
+
 test('nenk: an item imported with includeRepoTooling stores it, so source/update re-carves the same tree; a re-import without it clears it', async () => {
   const v1: Files = {
     '.claude-plugin/plugin.json': '{"name":"solo"}',
@@ -4777,4 +5168,47 @@ test('db-nenk-legacy-tooling-unbackfilled: a root skill imported with includeRep
   const up2 = await plain.t.req('POST', `${API}/items/${solo2.id}/source/update`, { headers: plain.h });
   assert.equal(up2.status, 200, up2.text);
   assert.deepEqual(filePaths(up2.json.item).sort(), ['.claude-plugin/plugin.json', 'SKILL.md']);
+});
+
+test('outputstyle-prefix-not-pinned: an output style prefixed in an import takes the prefixed name in its frontmatter, and keeps it on source/update; one never prefixed keeps its own', async () => {
+  const style = (desc: string) => `---\nname: Concise\ndescription: ${desc}\n---\nBe brief.\n`;
+  const files = (desc: string): Files => ({
+    'plugins/a/.claude-plugin/plugin.json': '{"name":"a"}',
+    'plugins/a/output-styles/concise.md': style(desc),
+    'plugins/b/.claude-plugin/plugin.json': '{"name":"b"}',
+    'plugins/b/output-styles/concise.md': style(desc),
+    'plugins/c/.claude-plugin/plugin.json': '{"name":"c"}',
+    'plugins/c/output-styles/short.md': style(desc),
+  });
+  gh.repos['acme/styles'] = { default_branch: 'main', refs: { main: sha2('f1') }, trees: { [sha2('f1')]: files('v1'), [sha2('f2')]: files('v2') } };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/styles' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['output-style:a-concise', 'output-style:b-concise', 'output-style:short']);
+  const fmName = async (it: Out & { version: { files: { path: string }[] } }) => /^name: (.*)$/m.exec(await fileText(t, h, it.id, it.version.files[0].path))?.[1];
+  const byName = (n: string) => r.json.items.find((i: Out) => i.name === n);
+  assert.deepEqual([await fmName(byName('a-concise')), await fmName(byName('b-concise')), await fmName(byName('short'))], ['a-concise', 'b-concise', 'Concise']);
+  gh.repos['acme/styles'].refs.main = sha2('f2');
+  const up = await t.req('POST', `${API}/items/${byName('a-concise').id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.description, 'v2');
+  assert.equal(await fmName(up.json.item), 'a-concise');
+});
+
+test('held-keep-splice-exec-entry: a held hook that keeps its bare name drops its own skip, not another copy\'s; every copy is reported at its entry', async () => {
+  const hook = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo done' }] }] } });
+  // Plugin folders of 58 characters: '<folder>-foo-hooks' is past the 64-character name cap, so neither nested copy can be prefixed.
+  const [l, m] = ['l'.repeat(58), 'm'.repeat(58)];
+  // README.md keeps plugins/ from being stripped as the zip's one wrapper folder, so both imports see one source path.
+  const nested = (dir: string): Files => ({ 'README.md': '# Kit\n', [`plugins/${dir}/.claude-plugin/plugin.json`]: '{"name":"foo"}', [`plugins/${dir}/hooks/hooks.json`]: hook });
+  const { t, h } = setup();
+  const first = await pack(t, h, 'kit.zip', nested(l));
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(names(first.json.items), ['hook:foo-hooks']);
+  const r = await pack(t, h, 'kit.zip', { ...nested(l), ...nested(m), '.claude-plugin/plugin.json': '{"name":"foo"}', 'hooks/hooks.json': hook });
+  assert.equal(r.status, 201, r.text);
+  const held = r.json.items.find((i: Out) => i.name === 'foo-hooks');
+  assert.deepEqual([held.id, held.op], [first.json.items[0].id, 'unchanged']);
+  const at = (r.json.skipped as { path: string; reason: string }[]).filter((s) => s.path.endsWith('hooks.json')).map((s) => s.path).sort();
+  assert.deepEqual(at, ['hooks/hooks.json', `plugins/${m}/hooks/hooks.json`], 'the root copy at its entry and the other nested copy; never the held one');
 });

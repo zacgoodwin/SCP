@@ -1,7 +1,7 @@
 import type { FileIn, Format, Kind } from './api.ts';
 
 /** Kinds edited as a file tree; the rest are one entry file. */
-export const MULTI_FILE_KINDS: Kind[] = ['skill', 'package', 'design'];
+export const MULTI_FILE_KINDS: Kind[] = ['skill', 'package', 'design', 'hook', 'mcp-server'];
 
 const ARTIFACT_ENTRY: Record<Format, string> = {
   html: 'index.html',
@@ -25,6 +25,10 @@ export function entryPath(kind: Kind, format: Format, name: string): string {
       return 'README.md';
     case 'artifact':
       return ARTIFACT_ENTRY[format];
+    case 'hook':
+      return 'hooks/hooks.json';
+    case 'mcp-server':
+      return '.mcp.json';
     default:
       return `${name || kind}.md`;
   }
@@ -154,6 +158,39 @@ const PACKAGE = `# My package
 What this package contains and how to install it.
 `;
 
+// mc52: the Claude Code plugin layouts; ${CLAUDE_PLUGIN_ROOT} finds the item's other files once it is installed as a plugin.
+// The hook runs its script through bash: a file added in the web app is stored without the executable bit (FilesEditor sets no mode).
+const HOOK = `{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [{ "type": "command", "command": "bash \\"\${CLAUDE_PLUGIN_ROOT}/scripts/format.sh\\"" }]
+      }
+    ]
+  }
+}
+`;
+
+const MCP_SERVER = `{
+  "mcpServers": {
+    "my-server": {
+      "command": "node",
+      "args": ["\${CLAUDE_PLUGIN_ROOT}/servers/index.js"]
+    }
+  }
+}
+`;
+
+const OUTPUT_STYLE = `---
+name: My style
+description: One line shown in the /output-style picker
+keep-coding-instructions: true
+---
+
+Keep every reply short. Lead with the result.
+`;
+
 const ARTIFACT: Record<Format, string> = {
   html: `<!doctype html>
 <html lang="en">
@@ -193,6 +230,9 @@ export function templateFiles(kind: Kind, format: Format): FileIn[] {
     prompt: PROMPT,
     package: PACKAGE,
     artifact: ARTIFACT[format],
+    hook: HOOK,
+    'mcp-server': MCP_SERVER,
+    'output-style': OUTPUT_STYLE,
   };
   return [{ path: entryPath(kind, format, ''), content: content[kind] }];
 }
