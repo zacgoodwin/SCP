@@ -341,14 +341,29 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   is never cut to the 64-character cap (a cut one breaks `keepPrefix`, and two long names can cut to
   one): such a unit is skipped with the limit as its reason and no `prefixed` offer.
 - Frontmatter errors (v3 0rdh): `items/lint.ts FRONTMATTER_ERRORS` (`frontmatter.invalid`,
+  `skill.name.empty` (v4 rv5z: `name: ""` or blank, a missing name rather than a malformed one),
   `skill.description.missing`/`.len`, `agent.name.missing`, `agent.description.missing`) are the
-  errors an import may accept. `frontmatterErrors: 'ask' | 'import' | 'skip'` (default `ask`): with
+  errors an import may accept; a non-empty malformed name (`skill.name.format`) is not. `frontmatterErrors: 'ask' | 'import' | 'skip'` (default `ask`): with
   `ask`, units whose every lint error is one of those (and no earlier import of the same source
   took them) make the import 409 `frontmatter_errors`, `details: [{path, kind, errors}]`, before
   the transaction, so nothing exists, no group either. `skip` is the earlier behaviour. `import`
   stores the upstream bytes untouched; the errors stay on the version as `level: 'warn'`,
   `waived: true`; a skill or agent the frontmatter does not name takes its folder or file name
-  (never a heading), and a missing description the body's first non-heading paragraph. The item
+  (never a heading), and a missing description the body's first non-heading paragraph (v4 t1ge: for
+  a fence that never closes, the first one after its YAML, so never the YAML: the run of non-blank
+  lines after the opener whatever it holds (quoted keys too), up to a `---` with trailing whitespace
+  (no fence to the parser, so the closer the author meant); then up to the furthest paragraph end
+  (of at most 16, within 8 KB) whose text from the opener still parses with `lib/frontmatter.ts` as a
+  mapping that adds only known frontmatter keys (`FRONTMATTER_KEYS` in `items/lint.ts`), so YAML
+  holding blank lines (between keys, in a folded scalar, in a list) and comments stays YAML, while a
+  paragraph of `#` lines alone is a heading, not YAML. A `---` with trailing whitespace ends the YAML
+  wherever it comes and the body starts after it (a heading or list right after it is the body's);
+  past a blank line an unknown `Word: text` line is read as the body's first line, the likelier of
+  two readings. The title
+  heading is looked for in the same text, for every kind and not only with `import`. An item an
+  earlier import named from a heading anywhere in such a text, its YAML lines included
+  (`---\n# Project Guide\n...` was `project-guide`), is still that unit on re-import and keeps its
+  name: `importUnit` previews the pre-v4 name too, `previewItem(..., preV4)`). The item
   gets `lint_waived = 1` (migration 11), and every later source write (`versionFromSource`:
   source/update and re-imports) accepts the same errors without asking. A local edit is still
   gated. Any other lint error skips the unit in every mode.
@@ -380,9 +395,19 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   that file the skill's `SKILL.md` (`importTree`; `updateTree` re-homes it again on every update,
   matched by `source_path` naming that file). The name defaults to the file stem, or the
   repository name when the stem is generic (`skill(s)`, `agent(s)`, `readme`, `index`, `claude`,
-  `instructions`; `pack.ts fileSkillName`): `cesarferreira/stax` `skills.md` is `stax`. With a
+  `instructions`; `pack.ts fileRootName`): `cesarferreira/stax` `skills.md` is `stax`. With a
   `description` and no upstream frontmatter, SCP supplies `name` and `description` as above, so the
   skill passes lint and tracks the upstream file. Without `kind: skill` the file imports as before.
+  A `/blob/<ref>/<path>/<file>.md` URL with `kind: skill` is the same import of that file (v4 y15q);
+  a `SKILL.md` blob URL, or any blob URL without `kind: skill`, still names the file's folder.
+- One-file names of last resort (v4 y15q, `fileRootName`): any import whose `path` names a file
+  falls back to the file stem, never the file name (`agents/helper.md` with `kind: agent` and no
+  frontmatter name or heading is `helper`, not `helper-md`), and a `SKILL.md` to its folder's name
+  (`skills/foo/SKILL.md` is `foo`, with or without `kind: skill`; the repository's at its root).
+  An item an earlier import named by the old fallback (the file name, `go-md` or `skill-md`; for
+  `kind: skill` the stem, or the repository's for a generic one) is still that unit on re-import and
+  keeps its name (`pack.ts importUnit`, `preV4RootName`), unless upstream has named the unit since.
+  Not matched: such an old name that a clash also prefixed (`<repo>-go-md`), which comes back new.
 - Provenance: `source_kind`, `source_repo` (`owner/repo` as GitHub's `full_name` spells it, zip: the
   file name), `source_ref`, `source_path`, `source_commit` (zip: sha256 of the zip bytes),
   `source_tree_sha256` (the tree the source last wrote), `source_scope` (`root` for a root

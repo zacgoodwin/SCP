@@ -4,12 +4,12 @@ import { canEditItem, canReadItem, itemReadSql, servedByGroupSql, servingGroupsS
 import { requireScope } from '../auth/middleware.ts';
 import { isUniqueViolation, newId, now, tx, type Db } from '../db.ts';
 import { sha256Hex } from '../lib/crypto.ts';
-import { parseFrontmatter, type Frontmatter } from '../lib/frontmatter.ts';
+import { parseFrontmatter, UNCLOSED, type Frontmatter } from '../lib/frontmatter.ts';
 import { HttpError, badRequest, forbidden, notFound } from '../lib/http.ts';
 import { assertNoCollisions, isJunkPath, isTextPath, mediaTypeFor, normalizePath, segmentProblem } from '../lib/paths.ts';
 import { LIMITS, checkLimits, stripTopFolder, tooLarge, treeSha256, type TreeFile } from '../lib/tree.ts';
 import { sweepBlobs } from './gc.ts';
-import { FRONTMATTER_ERRORS, lintVersion, parseRequires, type Lint } from './lint.ts';
+import { FRONTMATTER_ERRORS, FRONTMATTER_KEYS, lintVersion, parseRequires, type Lint } from './lint.ts';
 import { touchGroupsOfItem } from '../groups/touch.ts';
 import { FORMATS, KINDS, aKind, planeOf, type Ctx, type Format, type ItemRow, type ItemSource, type Kind, type Plane, type Principal, type SuppliedFrontmatter, type VersionRow } from '../types.ts';
 
@@ -430,11 +430,64 @@ const fmString = (fm: Frontmatter | null, key: string) => {
   return typeof v === 'string' && v.trim() ? v.trim() : undefined;
 };
 
-function firstHeading(s: Shaped): string | undefined {
+/** `--- ` or `... `: the closer the author meant, which lib/frontmatter.ts does not take as a fence (trailing blanks). */
+const nearCloser = (line: string) => {
+  const t = line.trimEnd();
+  return (t === '---' || t === '...') && t.length < line.length;
+};
+
+/** t1ge: an unclosed fence's YAML is looked for in at most this many paragraph ends and bytes (a parse each). */
+// ponytail: YAML past 16 blank-separated paragraphs or 8 KB is read as body; parse incrementally if real entries ever need more.
+const UNCLOSED_CUTS = 16;
+const UNCLOSED_BYTES = 8 * 1024;
+
+/** The keys `text` parses to as frontmatter (lib/frontmatter.ts: no aliases, no custom tags), or null when it does not parse to a mapping. */
+function yamlKeys(text: string): string[] | null {
+  const fm = parseFrontmatter(`---\n${text}\n---\n`);
+  return fm.error ? null : Object.keys(fm.data);
+}
+
+/**
+ * The entry's body. t1ge: an unclosed fence's body is the whole text, so its YAML is skipped. The run of
+ * non-blank lines after the opener is YAML whatever it holds. Past it, the YAML runs to the furthest
+ * paragraph end whose text, from the opener, still parses as YAML that adds only known frontmatter keys
+ * (FRONTMATTER_KEYS): so blank lines between keys, inside a block scalar or a list, and comments are
+ * YAML, while `Note: text` past a blank line is the body (an unknown key there is the likelier body line).
+ * A near closer ends the YAML wherever it comes, and the body starts right after it.
+ * preV4: the whole text, as before v4, for the name an earlier import gave such an entry (importUnit).
+ */
+function bodyOf(s: Shaped, preV4 = false): string {
+  const body = s.fm?.body ?? s.entryText;
+  if (preV4 || s.fm?.error !== UNCLOSED) return body;
+  const raw = body.split('\n');
+  const lines = raw.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  const blank = (i: number) => !lines[i].trim();
+  let i = 1; // past the opening ---
+  while (i < lines.length && !blank(i)) if (nearCloser(lines[i++])) return raw.slice(i).join('\n');
+  const closer = lines.findIndex((l, j) => j > i && nearCloser(l));
+  const stop = closer === -1 ? lines.length : closer;
+  const own = new Set(yamlKeys(lines.slice(1, i).join('\n')) ?? []);
+  let cut = i;
+  let content = false; // the paragraph holds a line that is not a `#` comment: a heading alone never extends the YAML
+  for (let k = i + 1, cuts = 0, bytes = 0; k <= stop && cuts < UNCLOSED_CUTS; k++) {
+    if (k < stop) bytes += lines[k - 1].length + 1;
+    if (bytes > UNCLOSED_BYTES) break;
+    if (!blank(k - 1) && lines[k - 1][0] !== '#') content = true;
+    if ((k < stop && !blank(k)) || blank(k - 1)) continue; // a cut is a paragraph's end
+    if (!content) continue;
+    content = false;
+    cuts++;
+    const keys = yamlKeys(lines.slice(1, k).join('\n'));
+    if (keys && keys.every((key) => own.has(key) || FRONTMATTER_KEYS.has(key))) cut = k;
+  }
+  return raw.slice(cut === stop && closer !== -1 ? stop + 1 : cut).join('\n');
+}
+
+function firstHeading(s: Shaped, preV4 = false): string | undefined {
   if (!s.fm) return undefined;
   // Linear on purpose: a lazy group before a trailing [ \t#]* (or a /[ \t#]+$/ trim) backtracks
   // quadratically over a long run of spaces and blocks the event loop. `.` stops at \r and \n.
-  const line = /^#[ \t]+(.*)/m.exec(s.fm.body)?.[1] ?? '';
+  const line = /^#[ \t]+(.*)/m.exec(bodyOf(s, preV4))?.[1] ?? '';
   let end = line.length;
   while (end > 0 && ' \t#'.includes(line[end - 1])) end--;
   return line.slice(0, end) || undefined;
@@ -442,7 +495,7 @@ function firstHeading(s: Shaped): string | undefined {
 
 /** The body's first paragraph that is not a heading: Claude Code's description when frontmatter has none (0rdh). */
 function firstParagraph(s: Shaped): string {
-  for (const para of (s.fm?.body ?? s.entryText).replace(/^#.*$/gm, '').split(/\n[ \t\r]*\n/)) {
+  for (const para of bodyOf(s).replace(/^#.*$/gm, '').split(/\n[ \t\r]*\n/)) {
     const text = para.replace(/\s+/g, ' ').trim();
     if (text) return text.slice(0, 1024);
   }
@@ -545,14 +598,14 @@ function refreshFts(db: Db, itemId: string): void {
 }
 
 /** An input shaped, named and linted (not gated): everything createItemTx decides before it writes. */
-function prepareItem(input: CreateItemInput, waive: boolean) {
+function prepareItem(input: CreateItemInput, waive: boolean, preV4 = false) {
   if (!KINDS.includes(input.kind)) throw badRequest(`kind must be one of ${KINDS.join(', ')}`);
   checkVisibility(input.visibility);
   const kind = input.kind;
   const format = checkFormat(kind, input.format);
   // An internal tree (fork, import) is already stored or unwrapped; only fresh API files get unwrapped.
   const shaped = shapeTree(kind, format, inputTree(kind, format, input), input.tree ? 'entry' : 'always');
-  const title = input.title ?? fmString(shaped.fm, 'title') ?? fmString(shaped.fm, 'name') ?? firstHeading(shaped) ?? '';
+  const title = input.title ?? fmString(shaped.fm, 'title') ?? fmString(shaped.fm, 'name') ?? firstHeading(shaped, preV4) ?? '';
   // A skill installs as .claude/skills/<name>/, so its imported folder outranks its heading.
   const folder = kind === 'skill' && input.folderName ? slugify(input.folderName) : '';
   const fmName = fmString(shaped.fm, 'name');
@@ -568,10 +621,11 @@ function prepareItem(input: CreateItemInput, waive: boolean) {
 /**
  * The name and lint createItemTx would give input, without writing (an import names and classifies
  * its units before it writes any, 5ef6 and 0rdh); null when it would refuse the input before linting.
+ * preV4: the name an import before v4 gave it, its heading found anywhere in an unclosed fence's text (t1ge).
  */
-export function previewItem(input: CreateItemInput, waive = false): { name: string; lint: Lint[] } | null {
+export function previewItem(input: CreateItemInput, waive = false, preV4 = false): { name: string; lint: Lint[] } | null {
   try {
-    const { name, lint } = prepareItem(input, waive);
+    const { name, lint } = prepareItem(input, waive, preV4);
     return { name, lint };
   } catch (e) {
     if (e instanceof HttpError) return null;

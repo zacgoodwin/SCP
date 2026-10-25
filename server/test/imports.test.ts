@@ -3456,3 +3456,187 @@ test('mas4: one GitHub .md file as a skill: named for the repository when the fi
   assert.equal((own.json.item as Supplied).upstreamFrontmatter, true, 'the item shows the notice');
   assert.equal(own.json.item.description, 'Upstream describes stax itself.');
 });
+
+test("y15q: a one-file import's name of last resort is the file stem, a SKILL.md's its folder; a /blob/ URL with kind skill imports that file", async () => {
+  const FOO = '---\ndescription: Foo things.\n---\nBody.\n';
+  gh.repos['acme/y15q'] = {
+    default_branch: 'main',
+    refs: { main: sha2('f1') },
+    trees: { [sha2('f1')]: { 'agents/helper.md': 'You help.\n', 'commands/go.md': 'Go.\n', 'skills/foo/SKILL.md': FOO, 'skills/foo/ref.md': 'Ref.\n', 'skills/foo/run.py': 'print(1)\n', 'docs/guide.md': '# Guide\n\nUse it.\n', 'docs/other.md': 'Other.\n' } },
+  };
+  // A kind override with no frontmatter name and no heading: the stem, not 'helper-md' / 'go-md'.
+  const one = async (json: object) => {
+    const { t, h } = setup();
+    const r = await github(t, h, { repo: 'acme/y15q', ...json });
+    assert.equal(r.status, 201, r.text);
+    return r.json.items;
+  };
+  assert.deepEqual(names(await one({ path: 'agents/helper.md', kind: 'agent', frontmatterErrors: 'import' })), ['agent:helper']);
+  assert.deepEqual(names(await one({ path: 'commands/go.md', kind: 'command' })), ['command:go']);
+  // A SKILL.md lacking a name takes its folder's, with kind skill (not the repository's) or without (not 'skill-md').
+  for (const kind of ['skill', undefined]) assert.deepEqual(names(await one({ path: 'skills/foo/SKILL.md', kind })), ['skill:foo'], String(kind));
+
+  // mas4 through a /blob/ URL: the file is the skill's SKILL.md, not its folder (docs/, two files) as one skill.
+  const [guide] = await one({ url: 'https://github.com/acme/y15q/blob/main/docs/guide.md', kind: 'skill', description: 'Guides.' });
+  assert.deepEqual([guide.kind, guide.name, guide.source.path], ['skill', 'guide', 'docs/guide.md']);
+  assert.deepEqual(filePaths(guide), ['SKILL.md']);
+  // A SKILL.md /blob/ URL is still its folder's skill, as is any other file's that is not .md, and other kinds still read the file's folder.
+  const blob = (file: string, kind?: string) => parseGithubSource({ url: `https://github.com/o/r/blob/main/${file}`, kind }).path;
+  assert.deepEqual(
+    [blob('skills/pdf/SKILL.md', 'skill'), blob('skills/pdf/skill.md', 'skill'), blob('docs/guide.md', 'skill'), blob('skills/pdf/scripts/run.py', 'skill'), blob('agents/a.md', 'agent'), blob('docs/guide.md')],
+    ['skills/pdf', 'skills/pdf', 'docs/guide.md', 'skills/pdf/scripts', 'agents', 'docs'],
+  );
+  for (const file of ['SKILL.md', 'run.py']) {
+    const [foo] = await one({ url: `https://github.com/acme/y15q/blob/main/skills/foo/${file}`, kind: 'skill' });
+    assert.deepEqual([foo.name, foo.source.path, filePaths(foo).sort()], ['foo', 'skills/foo', ['SKILL.md', 'ref.md', 'run.py']], file);
+  }
+});
+
+test('y15q: an item a one-file import named before v4 (go-md, skill-md, the repository) is that unit on re-import and keeps its name', async () => {
+  const at = (body: string) => ({ 'commands/go.md': body, 'skills/foo/SKILL.md': `---\ndescription: Foo things.\n---\n${body}`, 'CLAUDE.md': body });
+  const named = { 'skills/foo/SKILL.md': '---\nname: foo\ndescription: Foo things.\n---\nGo.\n' };
+  gh.repos['acme/y15q-old'] = {
+    default_branch: 'main',
+    refs: { main: sha2('a1'), next: sha2('a2'), named: sha2('a3') },
+    trees: { [sha2('a1')]: at('Go.\n'), [sha2('a2')]: at('Go now.\n'), [sha2('a3')]: named },
+  };
+  const cases = [
+    ['commands/go.md', 'command', 'command:go', 'go-md'],
+    ['skills/foo/SKILL.md', 'skill', 'skill:foo', 'y15q-old'],
+    ['skills/foo/SKILL.md', undefined, 'skill:foo', 'skill-md'],
+    ['CLAUDE.md', undefined, 'instructions:claude', 'claude-md'],
+  ] as const;
+  for (const [path, kind, now, old] of cases) {
+    const { t, h } = setup();
+    const first = await github(t, h, { repo: 'acme/y15q-old', path, kind });
+    assert.equal(first.status, 201, first.text);
+    assert.deepEqual(names(first.json.items), [now], path);
+    const [item] = first.json.items;
+    // The row as a pre-v4 import named it.
+    t.db.prepare('UPDATE items SET name = ? WHERE id = ?').run(old, item.id);
+    const again = await github(t, h, { repo: 'acme/y15q-old', ref: 'next', path, kind });
+    assert.equal(again.status, 201, again.text);
+    assert.deepEqual(again.json.items.map((i: Out) => [i.id, i.name, i.op]), [[item.id, old, 'version']], `${path} ${kind}`);
+  }
+  // A unit upstream has named since is renamed, so a new unit as before v4: never written into the old item.
+  const { t, h } = setup();
+  const first = await github(t, h, { repo: 'acme/y15q-old', path: 'skills/foo/SKILL.md', kind: 'skill' });
+  t.db.prepare('UPDATE items SET name = ? WHERE id = ?').run('y15q-old', first.json.items[0].id);
+  const again = await github(t, h, { repo: 'acme/y15q-old', ref: 'named', path: 'skills/foo/SKILL.md', kind: 'skill' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]), [['foo', 'create']]);
+});
+
+test('t1ge: an unclosed fence an import named before v4 from its heading is that unit on re-import and keeps its name', async () => {
+  // A lone '---' opener, and a closing fence with a trailing space: both unclosed, both named from the heading before v4.
+  const at = (more: string) => ({ 'CLAUDE.md': `---\n# Project Guide\nUse pnpm.\n\n${more}`, 'DESIGN.md': `---\ndescription: d\n--- \n# Acme Look\n\n${more}` });
+  gh.repos['acme/t1ge-old'] = { default_branch: 'main', refs: { main: sha2('b1'), next: sha2('b2') }, trees: { [sha2('b1')]: at('More.\n'), [sha2('b2')]: at('More now.\n') } };
+  // After a near closer the body starts, so DESIGN.md's heading names it as before v4: no alias needed.
+  {
+    const { t, h } = setup();
+    const first = await github(t, h, { repo: 'acme/t1ge-old' });
+    assert.equal(first.status, 201, first.text);
+    assert.equal(first.json.items.find((i: Out) => i.source.path === 'DESIGN.md')?.name, 'acme-look');
+  }
+  for (const [path, old] of [['CLAUDE.md', 'project-guide']]) {
+    const { t, h } = setup();
+    const first = await github(t, h, { repo: 'acme/t1ge-old' });
+    assert.equal(first.status, 201, first.text);
+    const item = first.json.items.find((i: Out) => i.source.path === path);
+    assert.ok(item && item.name !== old, path);
+    // The row as a pre-v4 import named it.
+    t.db.prepare('UPDATE items SET name = ? WHERE id = ?').run(old, item.id);
+    const again = await github(t, h, { repo: 'acme/t1ge-old', ref: 'next' });
+    assert.equal(again.status, 201, again.text);
+    assert.deepEqual(again.json.items.filter((i: Out) => i.source.path === path).map((i: Out) => [i.id, i.name, i.op]), [[item.id, old, 'version']], path);
+  }
+});
+
+test("t1ge: an unclosed fence imported with 'import' takes its description from the body after the YAML; the stored bytes stay upstream's", async () => {
+  // The YAML comment would leave a blank line once headings are stripped, splitting the YAML in two.
+  const OPEN = '---\nname: open\n# a YAML comment\ndescription: never closed\n\n# Open\n\nFirst real paragraph\nof the body.\n\nSecond.\n';
+  const files: Files = { 'skills/open/SKILL.md': OPEN, 'skills/yaml-only/SKILL.md': '---\nname: yaml-only\ndescription: d\n' };
+  const { t, h } = setup();
+  const ask = await pack(t, h, 'open.zip', files);
+  assert.equal(ask.status, 409, ask.text);
+  assert.deepEqual(ask.json.error.details.map((d: { path: string; errors: string[] }) => [d.path, d.errors]), [
+    ['skills/open', ['frontmatter: frontmatter is not closed', 'frontmatter description is required']],
+    ['skills/yaml-only', ['frontmatter: frontmatter is not closed', 'frontmatter description is required']],
+  ]);
+  const r = await pack(t, h, 'open.zip', files, { frontmatterErrors: 'import' });
+  assert.equal(r.status, 201, r.text);
+  const open = byName(r.json.items, 'open') as Out & { description: string };
+  assert.equal(open.description, 'First real paragraph of the body.');
+  // The title too: the '# a YAML comment' line is YAML, not the body's heading.
+  assert.equal((await t.req('GET', `${API}/items/${open.id}`, { headers: h })).json.item.title, 'Open');
+  assert.equal((byName(r.json.items, 'yaml-only') as Out & { description: string }).description, '', 'no body: no description, never the YAML');
+  assert.equal(await fileText(t, h, open.id, 'SKILL.md'), OPEN, 'the upstream bytes, untouched');
+
+  // The YAML may hold blank lines: between keys, inside a folded scalar. A '--- ' (trailing space) does not
+  // close the fence for lib/frontmatter.ts, so its 'd' is no description; it is one more YAML line.
+  const gaps: Files = {
+    'skills/a/SKILL.md': '---\nname: a\n\ndescription: never closed\n\nReal body paragraph.\n',
+    'skills/b/SKILL.md': '---\nname: b\ndescription: >\n  Folded line one\n\n  folded line two\n\nReal body paragraph.\n',
+    'skills/c/SKILL.md': '---\nname: c\ndescription: d\n--- \nOnly real paragraph.\n',
+  };
+  // After a near closer the body starts at once: its list is the first paragraph, its heading the title.
+  const near: Files = {
+    'skills/l1/SKILL.md': '---\nname: l1\ndescription: d\n--- \n- First step.\n- Second step.\n\nAfter.\n',
+    'skills/l2/SKILL.md': '---\nname: l2\ndescription: d\n--- \n# Real Title\n\nBody para.\n',
+  };
+  // Every documented key resumes the YAML past a blank line, not only the common ones.
+  near['agents/r1.md'] = '---\nname: r1\ndescription: Reviews.\n\ndisallowedTools: Bash\n\nYou review code.\n';
+  near['skills/s1/SKILL.md'] = '---\nname: s1\n\npaths: src/**\n\nReal body.\n';
+  // A list may hold blank lines too, under its key or between items: whatever parses as the YAML is the YAML.
+  near['skills/lst/SKILL.md'] = '---\nname: lst\nallowed-tools:\n\n- Bash\n- Read\n\nReal body.\n';
+  near['skills/trg/SKILL.md'] = '---\nname: trg\ntriggers:\n- one\n\n- two\n\nReal body.\n';
+  const nr = await pack(t, h, 'near.zip', near, { frontmatterErrors: 'import' });
+  for (const n of ['s1', 'lst', 'trg']) assert.equal((byName(nr.json.items, n) as Out & { description: string }).description, 'Real body.', n);
+  assert.equal((byName(nr.json.items, 'r1') as Out & { description: string }).description, 'You review code.');
+  assert.equal(nr.status, 201, nr.text);
+  assert.equal((byName(nr.json.items, 'l1') as Out & { description: string }).description, '- First step. - Second step.');
+  const l2 = byName(nr.json.items, 'l2') as Out & { description: string };
+  assert.equal(l2.description, 'Body para.');
+  assert.equal((await t.req('GET', `${API}/items/${l2.id}`, { headers: h })).json.item.title, 'Real Title');
+  const g = await pack(t, h, 'gaps.zip', gaps, { frontmatterErrors: 'import' });
+  assert.equal(g.status, 201, g.text);
+  assert.deepEqual(['a', 'b', 'c'].map((n) => (byName(g.json.items, n) as Out & { description: string }).description), ['Real body paragraph.', 'Real body paragraph.', 'Only real paragraph.']);
+  for (const n of ['a', 'b', 'c']) assert.equal(await fileText(t, h, byName(g.json.items, n).id, 'SKILL.md'), gaps[`skills/${n}/SKILL.md`], n);
+
+  // The first run of lines is YAML whatever it holds (quoted keys); past a blank line, a known key (after a
+  // comment run, too) resumes it, and any other line, key-shaped or not, is the body.
+  const keys: Files = {
+    'skills/p1/SKILL.md': '---\nname: p1\n\n# tools\ndescription: never closed\n\nFirst real paragraph.\n',
+    'skills/p2/SKILL.md': '---\n"name": p2\n"description": never closed\n\nFirst real paragraph.\n',
+    'skills/p3/SKILL.md': '---\nname: p3\n\nNote: this is the body.\n\nSecond.\n',
+  };
+  const k = await pack(t, h, 'keys.zip', keys, { frontmatterErrors: 'import' });
+  assert.equal(k.status, 201, k.text);
+  assert.deepEqual(['p1', 'p2', 'p3'].map((n) => (byName(k.json.items, n) as Out & { description: string }).description), ['First real paragraph.', 'First real paragraph.', 'Note: this is the body.']);
+  for (const n of ['p1', 'p2', 'p3']) assert.equal(await fileText(t, h, byName(k.json.items, n).id, 'SKILL.md'), keys[`skills/${n}/SKILL.md`], n);
+});
+
+test("rv5z: name: \"\" is a frontmatter error: asked about, imported with 'import' under its folder's name; a malformed name is skipped in every mode", async () => {
+  const EMPTY = '---\nname: ""\ndescription: Its name is empty.\n---\nBody.\n';
+  const files: Files = { 'skills/good/SKILL.md': skill('good'), 'skills/empty/SKILL.md': EMPTY };
+  const { t, h } = setup();
+  const ask = await pack(t, h, 'empty.zip', files);
+  assert.equal(ask.status, 409, ask.text);
+  assert.deepEqual(ask.json.error.details, [{ path: 'skills/empty', kind: 'skill', errors: ['frontmatter name is empty'] }]);
+  const r = await pack(t, h, 'empty.zip', files, { frontmatterErrors: 'import' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['skill:empty', 'skill:good']);
+  const empty = byName(r.json.items, 'empty');
+  assert.deepEqual((empty.version.lint as { code: string; waived?: boolean }[]).filter((l) => l.waived).map((l) => l.code), ['skill.name.empty']);
+  assert.equal(await fileText(t, h, empty.id, 'SKILL.md'), EMPTY, 'the upstream bytes, untouched');
+
+  const BAD = '---\nname: "Bad Name!"\ndescription: d\n---\n';
+  for (const mode of [undefined, 'ask', 'import', 'skip']) {
+    const s = setup();
+    const b = await pack(s.t, s.h, 'bad.zip', { 'skills/good/SKILL.md': skill('good'), 'skills/bad/SKILL.md': BAD }, mode ? { frontmatterErrors: mode } : {});
+    assert.equal(b.status, 201, `${mode}: ${b.text}`);
+    assert.deepEqual(names(b.json.items), ['skill:good']);
+    assert.deepEqual(b.json.skipped.map((x: { path: string }) => x.path), ['skills/bad']);
+    assert.match(b.json.skipped[0].reason, /must match/);
+  }
+});

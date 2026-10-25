@@ -2,6 +2,12 @@
 
 What went wrong, why, and what now prevents it. Newest first.
 
+## 2026-10-24: a rate-limit test that raced the refill
+
+| Test | What happened | Root cause | Prevention |
+|---|---|---|---|
+| `hardening3.test.ts` per-IP login limit | PR #33's gate failed once: the 21st login got 401, not 429, and register was not 429 | The per-IP bucket (`AUTH_LIMITS.ip`, burst 20, 0.5/s) refills a token after 2 s, and the test assumed 21 sequential logins (one scrypt each) finish sooner; a slow runner took 2.4 s. The per-name test assumed the same of 100 logins against a 6 s refill | Both tests freeze `Date` (`t.mock.timers.enable({ apis: ['Date'] })`), the limiter's only clock, so they check the bucket and not the runner's speed |
+
 ## 2026-10-23: four flaky gate tests found while shipping the v3 batch
 
 | Test | What happened | Root cause | Prevention |

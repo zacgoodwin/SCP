@@ -2,6 +2,8 @@ import { isScalar, parseDocument, stringify, visit } from 'yaml';
 
 /** Larger fenced blocks are a lint error, not parsed: a parse is ~1 ms per KB and runs on reads too. */
 export const MAX_FRONTMATTER = 64 * 1024;
+/** The error of a fence that never closes; its `body` is then the whole text, the YAML included. */
+export const UNCLOSED = 'frontmatter is not closed';
 
 export interface Frontmatter {
   data: Record<string, unknown>;
@@ -28,7 +30,7 @@ export function parseFrontmatter(src: string): Frontmatter {
       if (pos - open[0].length > MAX_FRONTMATTER) return { data: {}, body, hasFrontmatter: true, error: 'frontmatter is over 64 KB' };
       return parseYaml(text.slice(open[0].length, pos), body);
     }
-    if (nl === -1) return { data: {}, body: text, hasFrontmatter: true, error: 'frontmatter is not closed' };
+    if (nl === -1) return { data: {}, body: text, hasFrontmatter: true, error: UNCLOSED };
     pos = nl + 1;
   }
 }
