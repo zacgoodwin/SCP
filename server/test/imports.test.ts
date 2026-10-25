@@ -1718,7 +1718,7 @@ test('bppq: nested plugins (their own plugin.json, or a marketplace source) impo
   assert.ok(performance.now() - start < 1000, `took ${Math.round(performance.now() - start)} ms`);
 });
 
-test('bppq: a marketplace repository imports every nested plugin through the pack and GitHub routes; a name clash between plugins is reported as such', async () => {
+test('bppq: a marketplace repository imports every nested plugin through the pack and GitHub routes; two plugins shipping one agent name both import, prefixed (7k2p)', async () => {
   const { t, h } = setup();
   const r = await pack(t, h, 'market.zip', MARKET);
   assert.equal(r.status, 201, r.text);
@@ -1733,7 +1733,7 @@ test('bppq: a marketplace repository imports every nested plugin through the pac
   assert.deepEqual(names(g.json.items), MARKET_ITEMS);
   assert.deepEqual(g.json.skipped, MARKET_SKIPPED);
 
-  // claude-plugins-official ships the same agent name in two plugins: the second is a clash, not a silent drop.
+  // claude-plugins-official ships the same agent name in two plugins: each takes its plugin folder as prefix, as skills do.
   const t3 = setup();
   const clash = await pack(t3.t, t3.h, 'clash.zip', {
     'plugins/a/.claude-plugin/plugin.json': '{}',
@@ -1744,14 +1744,15 @@ test('bppq: a marketplace repository imports every nested plugin through the pac
     'README.md': '# Clash\n',
   });
   assert.equal(clash.status, 201, clash.text);
-  assert.deepEqual(names(clash.json.items), ['agent:reviewer', 'command:go']);
+  assert.deepEqual(names(clash.json.items), ['agent:a-reviewer', 'agent:b-reviewer', 'command:go']);
   assert.equal(clash.json.items[0].source.path, 'plugins/a/agents/reviewer.md');
-  assert.deepEqual(clash.json.skipped, [{ path: 'plugins/b/agents/reviewer.md', reason: "you already have an agent named 'reviewer', imported from plugins/a/agents/reviewer.md of clash.zip" }]);
-  // GitHub alike. A clash with another source keeps its own reason (the tools.zip case above).
+  assert.deepEqual(clash.json.skipped, []);
+  // GitHub alike.
   gh.repos['acme/clash'] = { default_branch: 'main', refs: { main: sha2('3f') }, trees: { [sha2('3f')]: { 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/agents/rev.md': agentMd('rev'), 'plugins/b/.claude-plugin/plugin.json': '{}', 'plugins/b/agents/rev.md': agentMd('rev'), 'README.md': '#\n' } } };
   const gc = await github(t3.t, t3.h, { repo: 'acme/clash' });
   assert.equal(gc.status, 201, gc.text);
-  assert.deepEqual(gc.json.skipped, [{ path: 'plugins/b/agents/rev.md', reason: "you already have an agent named 'rev', imported from plugins/a/agents/rev.md of acme/clash" }]);
+  assert.deepEqual(names(gc.json.items), ['agent:a-rev', 'agent:b-rev']);
+  assert.deepEqual(gc.json.skipped, []);
 });
 
 test('bppq: source/update of a nested-plugin agent and command re-carves them the same way', async () => {
@@ -2007,10 +2008,11 @@ const RTK_ALL = [
   ['agent', '.claude/agents/code-simplifier.md'],
   ['command', '.claude/commands/release.md'],
   ['skill', '.agents/skills/rust-rtk'],
-  ['skill', '.gemini/skills/gem'],
-  ['skill', '.opencode/skills/oc'],
   ['instructions', 'AGENTS.md'],
   ['instructions', 'CLAUDE.md'],
+  // Another tool's ports come after every other unit (ypmn, eg9k).
+  ['skill', '.gemini/skills/gem'],
+  ['skill', '.opencode/skills/oc'],
 ];
 
 test('4ky8 part 2: a repository that ships a plugin or a skills/ folder skips its maintainer tooling, listed in skipped; includeRepoTooling imports it all', async () => {
@@ -2587,7 +2589,7 @@ test('5ef6: skills sharing a name inside one import each take their plugin (or s
   assert.ok(!ports.json.items.some((i: Out) => i.name === 'access'));
   assert.deepEqual(ports.json.skipped, [{ path: '.codex/skills/access', reason: portReason('plugins/a/skills/access', '.codex') }]);
   // One non-port copy keeps the bare name: the ports give way to it as before.
-  assert.deepEqual(detectUnits(tree(files), 'x').units.filter((u) => u.path.endsWith('/access')).map((u) => u.prefix), ['a', 'b']);
+  assert.deepEqual(detectUnits(tree(files), 'x').units.filter((u) => u.path.endsWith('/access')).map((u) => u.prefixes), [['a', 'plugins-a'], ['b', 'plugins-b']]);
 
   // A copy an earlier import of this source holds under the bare name keeps it (re-import = update), so a
   // plugin added upstream with the same skill name neither duplicates nor strands the existing item.
@@ -2602,7 +2604,7 @@ test('5ef6: skills sharing a name inside one import each take their plugin (or s
   assert.equal(count(t3.t, 'SELECT COUNT(*) AS n FROM items'), 2);
 });
 
-test("5ef6: a prefixed name another skill of the import already carries is never taken: that copy is skipped, the repository's own skill imports", async () => {
+test("5ef6, 5vz2: a prefixed name another skill of the import already carries is never taken: that copy lengthens its prefix, else is skipped; the repository's own skill imports", async () => {
   const { t, h } = setup();
   const files: Files = {
     'plugins/a/.claude-plugin/plugin.json': '{}',
@@ -2613,9 +2615,223 @@ test("5ef6: a prefixed name another skill of the import already carries is never
   };
   const r = await pack(t, h, 'taken.zip', files);
   assert.equal(r.status, 201, r.text);
-  assert.deepEqual(names(r.json.items), ['skill:a-access', 'skill:b-access']);
+  assert.deepEqual(names(r.json.items), ['skill:a-access', 'skill:b-access', 'skill:plugins-a-access']);
   assert.equal(byName(r.json.items, 'a-access').source.path, 'skills/a-access');
-  assert.deepEqual(r.json.skipped, [{ path: 'plugins/a/skills/access', reason: "another skill of this import is named 'access', and 'a-access' is the name of another skill of this import" }]);
+  assert.equal(byName(r.json.items, 'plugins-a-access').source.path, 'plugins/a/skills/access');
+  assert.deepEqual(r.json.skipped, []);
+  // naming-1: the repository's own skill added upstream after a first import named the copies a-access and
+  // b-access. The re-import names them as the fresh import above does: the copy's item takes the longer
+  // prefix (in the same group, one new version), so the repository's own skill is not refused on its name.
+  const t3 = setup();
+  const { 'skills/a-access/SKILL.md': own, ...rest } = files;
+  const copies = { ...rest, LICENSE: 'MIT' }; // a root file, so the first zip's one top folder is not unwrapped
+  const first = await pack(t3.t, t3.h, 'taken.zip', copies, { group: 'taken' });
+  assert.deepEqual(names(first.json.items), ['skill:a-access', 'skill:b-access']);
+  const grown = await pack(t3.t, t3.h, 'taken.zip', { ...copies, 'skills/a-access/SKILL.md': own }, { intoGroup: 'taken' });
+  assert.equal(grown.status, 201, grown.text);
+  assert.deepEqual(grown.json.skipped, []);
+  assert.deepEqual(grown.json.items.map((i: Out) => [i.name, i.op, i.source.path]).sort(), [
+    ['a-access', 'create', 'skills/a-access'],
+    ['b-access', 'unchanged', 'plugins/b/skills/access'],
+    ['plugins-a-access', 'version', 'plugins/a/skills/access'],
+  ]);
+  const moved = byName(grown.json.items, 'plugins-a-access');
+  assert.equal(moved.id, byName(first.json.items, 'a-access').id, 'the same item, renamed');
+  assert.match(await fileText(t3.t, t3.h, moved.id, 'SKILL.md'), /^---\nname: plugins-a-access\n/);
+  assert.ok((await bundleFiles(t3.t, t3.h, 'taken')).has('.claude/skills/plugins-a-access/SKILL.md'));
+  const again = await pack(t3.t, t3.h, 'taken.zip', { ...copies, 'skills/a-access/SKILL.md': own }, { intoGroup: 'taken' });
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['a-access', 'unchanged'], ['b-access', 'unchanged'], ['plugins-a-access', 'unchanged']]);
+  // The same when the new skill's unit comes first in the import (a/ sorts before z/).
+  const t5 = setup();
+  const zs: Files = { LICENSE: 'MIT', 'z/a/skills/access/SKILL.md': skill('access'), 'z/b/skills/access/SKILL.md': skill('access') };
+  assert.deepEqual(names((await pack(t5.t, t5.h, 'z.zip', zs)).json.items), ['skill:a-access', 'skill:b-access']);
+  const zGrown = await pack(t5.t, t5.h, 'z.zip', { ...zs, 'a/skills/a-access/SKILL.md': skill('a-access') });
+  assert.equal(zGrown.status, 201, zGrown.text);
+  assert.deepEqual(zGrown.json.skipped, []);
+  assert.deepEqual(zGrown.json.items.map((i: Out) => [i.name, i.op]).sort(), [['a-access', 'create'], ['b-access', 'unchanged'], ['z-a-access', 'version']]);
+  // No folder above a/ to lengthen with: that copy is skipped.
+  const t2 = setup();
+  const top = await pack(t2.t, t2.h, 'top.zip', { 'a/skills/access/SKILL.md': skill('access'), 'b/skills/access/SKILL.md': skill('access'), 'skills/a-access/SKILL.md': skill('a-access') });
+  assert.equal(top.status, 201, top.text);
+  assert.deepEqual(names(top.json.items), ['skill:a-access', 'skill:b-access']);
+  assert.deepEqual(top.json.skipped, [{ path: 'a/skills/access', reason: "another skill of this import is named 'access', and 'a-access' is the name of another skill of this import" }]);
+  // Twins that both run out of folders on one name (a dot folder above, or a case twin): the first keeps
+  // it and the other is skipped, never both, so a tree of only those twins still imports.
+  for (const [twin, other] of [['.x/a/skills/access', 'a/skills/access'], ['A/skills/access', 'a/skills/access']]) {
+    const t4 = setup();
+    const r4 = await pack(t4.t, t4.h, 'twins.zip', { [`${other}/SKILL.md`]: skill('access'), [`${twin}/SKILL.md`]: skill('access') });
+    assert.equal(r4.status, 201, r4.text);
+    assert.deepEqual(names(r4.json.items), ['skill:a-access']);
+    assert.equal(r4.json.skipped.length, 1, r4.text);
+    assert.match(r4.json.skipped[0].reason, /'a-access' is the name of another skill of this import/);
+  }
+});
+
+test("naming-6: the naming-1 rename at the same commit (the same zip with includeRepoTooling toggled on) writes a version whose SKILL.md names the new name", async () => {
+  const { t, h } = setup();
+  const zip = zipSync(
+    Object.fromEntries(
+      Object.entries({
+        LICENSE: 'MIT',
+        'plugins/a/.claude-plugin/plugin.json': '{}',
+        'plugins/a/skills/access/SKILL.md': skill('access', 'Discord access.'),
+        'plugins/b/.claude-plugin/plugin.json': '{}',
+        'plugins/b/skills/access/SKILL.md': skill('access', 'iMessage access.'),
+        '.claude/skills/a-access/SKILL.md': skill('a-access', "The repository's own."),
+      }).map(([k, v]) => [k, strToU8(v)]),
+    ),
+  );
+  const first = await pack(t, h, 'tool.zip', zip, { group: 'tool' });
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(names(first.json.items), ['skill:a-access', 'skill:b-access']);
+  assert.deepEqual(first.json.skipped.map((s: { path: string }) => s.path), ['.claude/skills']);
+  const again = await pack(t, h, 'tool.zip', zip, { intoGroup: 'tool', includeRepoTooling: 'true' });
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op, i.source.path]).sort(), [
+    ['a-access', 'create', '.claude/skills/a-access'],
+    ['b-access', 'unchanged', 'plugins/b/skills/access'],
+    ['plugins-a-access', 'version', 'plugins/a/skills/access'],
+  ]);
+  const moved = byName(again.json.items, 'plugins-a-access');
+  assert.equal(moved.id, byName(first.json.items, 'a-access').id, 'the same item, renamed');
+  assert.match(await fileText(t, h, moved.id, 'SKILL.md'), /^---\nname: plugins-a-access\n/);
+  // One SKILL.md per install folder, each naming its own folder.
+  const bundle = await bundleFiles(t, h, 'tool');
+  const skillMds = [...bundle].filter(([p]) => p.endsWith('/SKILL.md')).map(([p, text]) => [p, /^---\nname: (\S+)\n/.exec(text)![1]]);
+  assert.deepEqual(skillMds.sort(), [
+    ['.claude/skills/a-access/SKILL.md', 'a-access'],
+    ['.claude/skills/b-access/SKILL.md', 'b-access'],
+    ['.claude/skills/plugins-a-access/SKILL.md', 'plugins-a-access'],
+  ]);
+  // The same bytes once more: nothing left to write.
+  const third = await pack(t, h, 'tool.zip', zip, { intoGroup: 'tool', includeRepoTooling: 'true' });
+  assert.deepEqual(third.json.items.map((i: Out) => i.op), ['unchanged', 'unchanged', 'unchanged']);
+});
+
+/** 5vz2: two plugin folders named a (plugins/a, other/a) and a third plugin b, all shipping skill access and agent reviewer. */
+const SAME_FOLDER = (desc: string): Files => {
+  const files: Files = {};
+  for (const p of ['plugins/a', 'other/a', 'plugins/b']) {
+    Object.assign(files, { [`${p}/.claude-plugin/plugin.json`]: '{}', [`${p}/skills/access/SKILL.md`]: skill('access', `${p} ${desc}`), [`${p}/agents/reviewer.md`]: AGENT });
+  }
+  return files;
+};
+
+test('5vz2: copies whose plugin folders share a name lengthen the prefix with the folder above; re-import and source/update keep each name', async () => {
+  gh.repos['acme/twins'] = { default_branch: 'main', refs: { main: sha2('a1') }, trees: { [sha2('a1')]: SAME_FOLDER('v1.'), [sha2('a2')]: SAME_FOLDER('v2.') } };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/twins' });
+  assert.equal(r.status, 201, r.text);
+  const expected = ['agent:b-reviewer', 'agent:other-a-reviewer', 'agent:plugins-a-reviewer', 'skill:b-access', 'skill:other-a-access', 'skill:plugins-a-access'];
+  assert.deepEqual(names(r.json.items), expected);
+  assert.deepEqual(r.json.skipped, []);
+  const other = byName(r.json.items, 'other-a-access');
+  assert.equal(other.source.path, 'other/a/skills/access');
+  assert.equal(await fileText(t, h, other.id, 'SKILL.md'), skill('access', 'other/a v1.').replace('name: access', 'name: other-a-access'));
+  const prefixes = t.db.prepare("SELECT name, source_prefix AS p FROM items WHERE kind = 'skill' ORDER BY name").all() as { name: string; p: string }[];
+  assert.deepEqual(prefixes.map((x) => [x.name, x.p]), [['b-access', 'b'], ['other-a-access', 'other-a'], ['plugins-a-access', 'plugins-a']]);
+  // The same commit again: every unit is the item it created.
+  const again = await github(t, h, { repo: 'acme/twins' });
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), expected.map((n) => [n.split(':')[1], 'unchanged']).sort());
+  // A new commit: source/update keeps the longer prefix, and a re-import versions the same items.
+  gh.repos['acme/twins'].refs.main = sha2('a2');
+  const up = await t.req('POST', `${API}/items/${other.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.name, 'other-a-access');
+  assert.equal(await fileText(t, h, other.id, 'SKILL.md'), skill('access', 'other/a v2.').replace('name: access', 'name: other-a-access'));
+  const re = await github(t, h, { repo: 'acme/twins' });
+  assert.equal(re.status, 201, re.text);
+  assert.deepEqual(re.json.items.map((i: Out) => [i.name, i.op]).sort(), [
+    ['b-access', 'version'], ['b-reviewer', 'unchanged'], ['other-a-access', 'unchanged'], ['other-a-reviewer', 'unchanged'], ['plugins-a-access', 'version'], ['plugins-a-reviewer', 'unchanged'],
+  ]);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 6);
+  // One of the twins leaves upstream: the other a/ copy still finds its item under the longer prefix.
+  gh.repos['acme/twins'].trees[sha2('a3')] = Object.fromEntries(Object.entries(SAME_FOLDER('v3.')).filter(([p]) => !p.startsWith('plugins/a/')));
+  gh.repos['acme/twins'].refs.main = sha2('a3');
+  const gone = await github(t, h, { repo: 'acme/twins' });
+  assert.equal(gone.status, 201, gone.text);
+  assert.deepEqual(gone.json.items.map((i: Out) => [i.name, i.op]).sort(), [['b-access', 'version'], ['b-reviewer', 'unchanged'], ['other-a-access', 'version'], ['other-a-reviewer', 'unchanged']]);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 6);
+});
+
+test('7k2p: commands of two plugins sharing a file name import prefixed and install so; source/update and a re-import once the clash is gone keep the prefix', async () => {
+  const cmds = (v: string, both = true): Files => ({
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    'plugins/a/commands/go.md': `Go a ${v}.\n`,
+    ...(both && { 'plugins/b/.claude-plugin/plugin.json': '{}', 'plugins/b/commands/go.md': `Go b ${v}.\n` }),
+  });
+  gh.repos['acme/cmds'] = { default_branch: 'main', refs: { main: sha2('c1') }, trees: { [sha2('c1')]: cmds('v1'), [sha2('c2')]: cmds('v2'), [sha2('c3')]: cmds('v3', false) } };
+  const { t, h } = setup();
+  const r = await github(t, h, { repo: 'acme/cmds', group: 'cmds' });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['command:a-go', 'command:b-go']);
+  assert.deepEqual(r.json.skipped, []);
+  const bundle = await bundleFiles(t, h, 'cmds');
+  assert.equal(bundle.get('.claude/commands/a-go.md'), 'Go a v1.\n');
+  assert.equal(bundle.get('.claude/commands/b-go.md'), 'Go b v1.\n');
+  const a = byName(r.json.items, 'a-go');
+  gh.repos['acme/cmds'].refs.main = sha2('c2');
+  const up = await t.req('POST', `${API}/items/${a.id}/source/update`, { headers: h });
+  assert.equal(up.status, 200, up.text);
+  assert.equal(up.json.item.name, 'a-go');
+  assert.equal(up.json.item.latestSeq, 2);
+  gh.repos['acme/cmds'].refs.main = sha2('c3');
+  const gone = await github(t, h, { repo: 'acme/cmds', intoGroup: 'cmds' });
+  assert.equal(gone.status, 201, gone.text);
+  assert.deepEqual(gone.json.items.map((i: Out) => [i.name, i.op, i.id]), [['a-go', 'version', a.id]]);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items'), 2);
+  assert.equal((await bundleFiles(t, h, 'cmds')).get('.claude/commands/a-go.md'), 'Go a v3.\n');
+});
+
+test("eg9k: a port folder holding its own plugin.json loses to any other copy: that copy imports and the port is skipped as one, by convention or by manifest path", async () => {
+  const s = (dir: string): Files => ({ [`${dir}/SKILL.md`]: skill('s', `${dir} copy.`) });
+  const plugin = (root: string, declared = false): Files => ({ [`${root}/.claude-plugin/plugin.json`]: declared ? '{"skills":"./src"}' : '{}', ...s(`${root}/${declared ? 'src' : 'skills'}/s`) });
+  const cases: [Files, string, string][] = [
+    [{ ...plugin('antigravity/x'), ...plugin('plugins/x') }, 'plugins/x/skills/s', 'antigravity/x/skills/s'],
+    [{ ...plugin('antigravity/x', true), ...plugin('plugins/x', true) }, 'plugins/x/src/s', 'antigravity/x/src/s'],
+    // Manifest paths are read before convention folders, yet the port still comes last.
+    [{ ...plugin('antigravity/x', true), ...plugin('plugins/x') }, 'plugins/x/skills/s', 'antigravity/x/src/s'],
+    [{ ...plugin('antigravity/x'), ...plugin('plugins/x', true) }, 'plugins/x/src/s', 'antigravity/x/skills/s'],
+    // The port folder as the plugin root itself; a port plugin against a root skills/ copy and a neutral folder's.
+    [{ ...plugin('antigravity'), ...plugin('x') }, 'x/skills/s', 'antigravity/skills/s'],
+    [{ ...plugin('antigravity/x'), ...s('skills/s') }, 'skills/s', 'antigravity/x/skills/s'],
+    [{ ...plugin('antigravity/x'), ...s('tools/s') }, 'tools/s', 'antigravity/x/skills/s'],
+    // naming-8: plugin roots that are skills themselves, the port folder one of the roots: its skill's path is the root itself, still a port.
+    [{ 'antigravity/.claude-plugin/plugin.json': '{}', ...s('antigravity'), 'plugins/x/.claude-plugin/plugin.json': '{}', ...s('plugins/x') }, 'plugins/x', 'antigravity'],
+  ];
+  for (const [files, at, port] of cases) {
+    const { t, h } = setup();
+    const r = await pack(t, h, 'multi.zip', files);
+    assert.equal(r.status, 201, r.text);
+    const kept = byName(r.json.items, 's');
+    assert.equal(kept.source.path, at);
+    assert.equal(await fileText(t, h, kept.id, 'SKILL.md'), skill('s', `${at} copy.`));
+    assert.deepEqual(r.json.skipped.find((k: { path: string }) => k.path === port), { path: port, reason: portReason(at, 'antigravity') });
+  }
+  // Agents too: the plugins/ copy holds the name, also against a port whose manifest declares its agents.
+  const { t, h } = setup();
+  const r = await pack(t, h, 'multi.zip', {
+    'antigravity/x/.claude-plugin/plugin.json': '{"agents":"./src"}',
+    'antigravity/x/src/r.md': agentMd('r'),
+    'plugins/x/.claude-plugin/plugin.json': '{}',
+    'plugins/x/agents/r.md': agentMd('r'),
+  });
+  assert.equal(r.status, 201, r.text);
+  assert.equal(byName(r.json.items, 'r').source.path, 'plugins/x/agents/r.md');
+});
+
+test("7k2p: prompts keep the bppq rule: of two plugins' prompts/x.md the first imports, the second is name_taken", async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'prompts.zip', {
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    'plugins/a/prompts/x.md': 'Prompt a.\n',
+    'plugins/b/.claude-plugin/plugin.json': '{}',
+    'plugins/b/prompts/x.md': 'Prompt b.\n',
+  });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(names(r.json.items), ['prompt:x']);
+  // The zip's one top folder (plugins/) is stripped.
+  assert.deepEqual(r.json.skipped, [{ path: 'b/prompts/x.md', reason: "you already have a prompt named 'x', imported from a/prompts/x.md of prompts.zip" }]);
 });
 
 test('5ef6: a twin its lint refuses forces no prefix: the clean copy keeps its bare name; when both import, both take their prefix', async () => {
@@ -2938,6 +3154,19 @@ test('5ef6: a unit whose <prefix>-<name> would pass the 64-character name limit 
   assert.deepEqual(names(r.json.items), [`skill:a-${one}`]);
   // The zip's one top folder (plugins/) is stripped.
   assert.deepEqual(r.json.skipped, [{ path: `${plugin}/skills/${one}`, reason: `another skill of this import is named '${one}', and '${plugin}-${one}' would exceed the 64-character name limit` }]);
+
+  // A plugin folder whose name alone passes the limit (5vz2): skipped the same way, never imported bare.
+  const t3 = setup();
+  const huge = 'l'.repeat(70);
+  const r3 = await pack(t3.t, t3.h, 'official.zip', {
+    'plugins/b/.claude-plugin/plugin.json': '{}',
+    'plugins/b/skills/access/SKILL.md': skill('access'),
+    [`plugins/${huge}/.claude-plugin/plugin.json`]: '{}',
+    [`plugins/${huge}/skills/access/SKILL.md`]: skill('access'),
+  });
+  assert.equal(r3.status, 201, r3.text);
+  assert.deepEqual(names(r3.json.items), ['skill:b-access']);
+  assert.deepEqual(r3.json.skipped, [{ path: `${huge}/skills/access`, reason: `another skill of this import is named 'access', and '${huge}-access' would exceed the 64-character name limit` }]);
 });
 
 test("5ef6: a one-file GitHub import's clash is reported at the file's path, not the root of its one-file tree", async () => {
@@ -3639,4 +3868,89 @@ test("rv5z: name: \"\" is a frontmatter error: asked about, imported with 'impor
     assert.deepEqual(b.json.skipped.map((x: { path: string }) => x.path), ['skills/bad']);
     assert.match(b.json.skipped[0].reason, /must match/);
   }
+});
+
+const REV_NO_NAME = (who: string) => `---\ndescription: ${who} reviews code.\n---\n# Code Reviewer\nYou review.\n`;
+
+test("0rdh, 5ef6: an ask-mode re-import names a unit an earlier import took with its frontmatter errors as that import did, so a new twin is prefixed, not dropped", async () => {
+  const { t, h } = setup();
+  const a: Files = { LICENSE: 'MIT', 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/agents/rev.md': REV_NO_NAME('A') };
+  const first = await pack(t, h, 'k.zip', a, { frontmatterErrors: 'import' });
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(names(first.json.items), ['agent:rev'], 'named by its file, not its heading (code-reviewer)');
+  const grown = await pack(t, h, 'k.zip', { ...a, 'plugins/b/.claude-plugin/plugin.json': '{}', 'plugins/b/agents/rev.md': agentMd('rev') });
+  assert.equal(grown.status, 201, grown.text);
+  assert.deepEqual(grown.json.skipped, []);
+  assert.deepEqual(grown.json.items.map((i: Out) => [i.name, i.op, i.source.path]).sort(), [['b-rev', 'create', 'plugins/b/agents/rev.md'], ['rev', 'unchanged', 'plugins/a/agents/rev.md']]);
+});
+
+test('0rdh, 5ef6: units whose missing name an in-import prefix wrote keep their accepted frontmatter errors: an ask-mode re-import does not ask again', async () => {
+  const { t, h } = setup();
+  const two: Files = { LICENSE: 'MIT', 'plugins/a/.claude-plugin/plugin.json': '{}', 'plugins/a/agents/rev.md': REV_NO_NAME('A'), 'plugins/b/.claude-plugin/plugin.json': '{}', 'plugins/b/agents/rev.md': REV_NO_NAME('B') };
+  const first = await pack(t, h, 'two.zip', two, { frontmatterErrors: 'import' });
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(names(first.json.items), ['agent:a-rev', 'agent:b-rev']);
+  assert.equal(count(t, 'SELECT COUNT(*) AS n FROM items WHERE lint_waived = 1'), 2);
+  const again = await pack(t, h, 'two.zip', two);
+  assert.equal(again.status, 201, again.text);
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['a-rev', 'unchanged'], ['b-rev', 'unchanged']]);
+});
+
+test("5ef6, naming-1: a copy with no prefix keeps the bare name on re-import too; the held prefixed copy's item takes its prefixed name, as a fresh import names them", async () => {
+  const files = (rootAgent: string): Files => ({
+    '.claude-plugin/plugin.json': '{"name":"k"}',
+    'agents/rev.md': rootAgent,
+    'plugins/a/.claude-plugin/plugin.json': '{}',
+    'plugins/a/agents/rev.md': agentMd('rev'),
+  });
+  const { t, h } = setup();
+  const first = await pack(t, h, 'k.zip', files('---\nname: rev\n---\nNo description.\n'), { frontmatterErrors: 'skip', group: 'kit' });
+  assert.equal(first.status, 201, first.text);
+  assert.deepEqual(first.json.items.map((i: Out) => [i.name, i.source.path]), [['rev', 'plugins/a/agents/rev.md']]);
+  const fixed = await pack(t, h, 'k.zip', files(agentMd('rev')), { intoGroup: 'kit' });
+  assert.equal(fixed.status, 201, fixed.text);
+  assert.deepEqual(fixed.json.skipped.filter((s: { path: string }) => s.path.includes('rev')), []);
+  assert.deepEqual(fixed.json.items.map((i: Out) => [i.name, i.op, i.source.path]).sort(), [
+    ['a-rev', 'version', 'plugins/a/agents/rev.md'],
+    ['rev', 'create', 'agents/rev.md'],
+  ]);
+  const moved = byName(fixed.json.items, 'a-rev');
+  assert.equal(moved.id, byName(first.json.items, 'rev').id, 'the same item, renamed');
+  assert.match(await fileText(t, h, moved.id, filePaths(moved as Out & { version: { files: { path: string }[] } })[0]), /^---\nname: a-rev\n/);
+  // A fresh import of the same tree names them the same way.
+  const s = setup();
+  assert.deepEqual(names((await pack(s.t, s.h, 'k.zip', files(agentMd('rev')))).json.items), ['agent:a-rev', 'agent:rev']);
+  // Once more: nothing left to write.
+  const again = await pack(t, h, 'k.zip', files(agentMd('rev')), { intoGroup: 'kit' });
+  assert.deepEqual(again.json.items.map((i: Out) => [i.name, i.op]).sort(), [['a-rev', 'unchanged'], ['rev', 'unchanged']]);
+});
+
+test("5ef6: a held copy with no free prefixed name keeps the bare name on re-import; the repository's own skill added upstream gives way", async () => {
+  const long = 'x'.repeat(60);
+  // b-access is another skill's name, and the long folder's prefixed name is over the name cap.
+  for (const [copy, other] of [['b/skills/access', { 'skills/b-access/SKILL.md': skill('b-access') }], [`${long}/skills/access`, {}]] as const) {
+    const { t, h } = setup();
+    const v1: Files = { LICENSE: 'MIT', [`${copy}/SKILL.md`]: skill('access'), ...other };
+    const first = await pack(t, h, 'held.zip', v1, { group: 'held' });
+    assert.equal(first.status, 201, first.text);
+    const item = byName(first.json.items, 'access');
+    assert.equal(item.source.path, copy);
+    const grown = await pack(t, h, 'held.zip', { ...v1, 'skills/access/SKILL.md': skill('access', "The repository's own.") }, { intoGroup: 'held' });
+    assert.equal(grown.status, 201, grown.text);
+    assert.deepEqual(grown.json.items.filter((i: Out) => i.name === 'access').map((i: Out) => [i.id, i.op, i.source.path]), [[item.id, 'unchanged', copy]], copy);
+    assert.deepEqual(grown.json.skipped.map((s: { path: string }) => s.path), ['skills/access'], grown.text);
+    assert.match(grown.json.skipped[0].reason, new RegExp(`another skill of this import \\(${copy}\\) is named 'access'`));
+  }
+});
+
+test('eg9k: an agent of a port plugin root that loses its name is reported as the port, like a skill', async () => {
+  const { t, h } = setup();
+  const r = await pack(t, h, 'multi.zip', {
+    'antigravity/x/.claude-plugin/plugin.json': '{}',
+    'antigravity/x/agents/r.md': agentMd('r'),
+    'plugins/x/.claude-plugin/plugin.json': '{}',
+    'plugins/x/agents/r.md': agentMd('r'),
+  });
+  assert.equal(r.status, 201, r.text);
+  assert.deepEqual(r.json.skipped, [{ path: 'antigravity/x/agents/r.md', reason: 'another copy of this agent (plugins/x/agents/r.md) was imported; this one is the antigravity port' }]);
 });

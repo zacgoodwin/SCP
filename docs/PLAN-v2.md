@@ -214,8 +214,9 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   tree is never followed and lands in `skipped` against `marketplace.json`; so does a marketplace
   file that is not a JSON object. An `.md` at any depth in an `agents/` or `commands/` folder outside every plugin
   root and below the repository root (`antigravity/x/agents/<name>/agent.md`) is told it is imported only inside a plugin. Two plugins of one
-  source shipping the same name: the second is skipped as `name_taken`, naming the path that holds
-  it. `updateTree` runs the same detection, so a nested plugin's agent updates like a root one.
+  source shipping the same skill, agent or command name both import, prefixed (5ef6 below; agents and
+  commands since v4 7k2p); a same-source clash nothing prefixes is skipped as `name_taken`, naming the
+  path that holds it. `updateTree` runs the same detection, so a nested plugin's agent updates like a root one.
 - Unsupported plugin components (v3 dnxq part 1): inside a plugin root, `hooks/`, `.mcp.json`,
   `output-styles/`, `settings.json`, `.lsp.json` and `monitors/` are never stored or served; each
   lands in `skipped` once (`plugin <component> is not supported by SCP; it was not imported`), not
@@ -247,9 +248,14 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   or a `.claude` folder first, then under a `skills` folder, then neutral, and last under a folder
   named for another tool (`.openclaw`, `.opencode`, `.gemini`, `.cursor`, `.kiro`, `.windsurf`,
   `.codex`, `antigravity`, `codex`, `openclaw`, `opencode`, `cursor`, `gemini`; a skill's own folder
-  name never counts); depth, then path, within a rank. A port that loses its name to a better copy of
+  name never counts, but a plugin root's does, so a unit at `antigravity/` as the plugin root, its
+  root skill, is that port, v4 naming-8); depth, then path, within a rank. Whichever pass found it, a unit under such a
+  folder imports after every other unit of the import (v4 eg9k, the last step of `detectUnits`), so a
+  port with its own `plugin.json` (`antigravity/x/`, or `antigravity/` as the plugin root), read by
+  convention or by manifest path, still gives way to `plugins/x/`, a root `skills/` or a neutral
+  folder's copy. A port that loses its name to a better copy of
   the same import is skipped as `another copy of this skill (<path>) was imported; this one is the
-  <tool> port`. Re-import and `updateTree` detect the same way, so the kept copy stays the same.
+  <tool> port` (an agent's or command's says `this agent`, `this command`). Re-import and `updateTree` detect the same way, so the kept copy stays the same.
 - Reuse `items/import.ts importUpload` / `items/service.ts createItemTx` for each unit; pass
   `source` on every item. An existing item of that kind with the unit's `source_repo`+`source_path`
   is the unit's item whatever its name (`importUnit`, checked before creating): add a new version to
@@ -301,11 +307,17 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   the same way), or `package` the whole folder's remaining files one item. A key that fails
   `normalizePath` (`../x`, `/abs`, `C:/x`) is 400 before anything is fetched; a folder with nothing
   left lands in `skipped` as `folderKinds: no unrecognised files in this folder; ignored`.
-- Name clashes (v3 5ef6). Inside one import, skills sharing a name (`previewItem` names every unit
-  before the transaction) are all imported: each non-port copy takes `Unit.prefix`, its plugin
-  root's folder name, else for `<x>/skills/<name>` the `<x>` (never a dot folder or a port), as
-  `<prefix>-<name>`; ports of a name every copy was prefixed away from are skipped as ports. Agents
-  and other kinds keep the bppq rule (the second is `name_taken`). Across sources: a name an item
+- Name clashes (v3 5ef6). Inside one import, units sharing a kind and name (`previewItem` names every
+  unit before the transaction): skills, and since v4 7k2p agents and commands, are all imported: each
+  non-port copy takes its prefix (`Unit.prefixes`), its plugin root's folder name, else for a skill's
+  `<x>/skills/<name>` the `<x>` (never a dot folder or a port), as `<prefix>-<name>`; ports of a name
+  every copy was prefixed away from are skipped as ports. Copies whose prefixed names still meet each
+  other (`plugins/a` and `other/a` both give `a-access`), or meet a name another unit of the import
+  carries, lengthen the prefix with the folder above (`plugins-a-access`, `other-a-access`; v4 5vz2),
+  again until the names part or a copy runs out of folders (the root, or a dot folder), when it is
+  skipped as `'<n>' is the name of another <kind> of this import`; of copies out of folders on the
+  same name (`a/` and `.x/a/`, or `A/` and `a/`), the first keeps it and only the rest are skipped. Other kinds, prompts among them, keep the bppq rule
+  (the second is `name_taken`). Across sources: a name an item
   from another source (or a local one) holds is skipped, the `skipped` entry carrying
   `prefixed: '<repo>-<name>'`; `onNameClash: 'prefix'` (pack form field too) imports it under that
   name, `<repo>` the repository name or the zip's file name less `.zip`. Same-repository clashes
@@ -318,7 +330,18 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   discord and imessage both ship `access`). `versionFromSource` re-applies the name (`keepPrefix`:
   the item name is `<source_prefix>-<upstream name>`), and a re-import, with or without the option
   and after the clash is gone, versions the prefixed item of that source path (found by source and
-  the name the unit takes, or `<source_prefix>-<bare name>`). Rows from before the column infer
+  the name the unit takes, or `<source_prefix>-<bare name>`). Such an item keeps its name, unless
+  another unit of this import now takes that name (upstream added `skills/a-access` beside the
+  `a-access` copy): then the item takes the name this import gives its unit (`plugins-a-access`, a
+  new version whose entry names it, even at the same commit, e.g. the same zip re-uploaded with
+  `includeRepoTooling`, v4 naming-6), as a fresh import would name it, so the other unit is not refused on it; that unit
+  imports first, and a name held by another item keeps the old one. The same holds for an item under
+  the unit's bare name: a copy with no prefix (a root plugin's own `agents/rev.md`) keeps the bare
+  name on re-import too, as a fresh import names it, so the `plugins/a` copy an earlier import held
+  as `rev` (the root's was skipped then) takes `a-rev` instead of refusing the root's. A held copy
+  with no free prefixed name (it is another unit's, `b-access` beside `b/skills/access`, or over the
+  name cap) keeps the bare name as before v4 and the unprefixed copies are skipped, naming it, so
+  its item keeps updating instead of both being lost. Rows from before the column infer
   the prefix (`wasPrefixed`: the repository or zip name, or one folder above the unit), which
   misses an item that took both. A unit imported with `frontmatterErrors: 'import'` that is also
   prefixed has its `SKILL.md` `name:` rewritten to the prefixed item name all the same (a skill's
@@ -364,8 +387,11 @@ ItemSource = {kind:'github'|'zip', repo: string|null, ref: string|null, path: st
   earlier import named from a heading anywhere in such a text, its YAML lines included
   (`---\n# Project Guide\n...` was `project-guide`), is still that unit on re-import and keeps its
   name: `importUnit` previews the pre-v4 name too, `previewItem(..., preV4)`). The item
-  gets `lint_waived = 1` (migration 11), and every later source write (`versionFromSource`:
-  source/update and re-imports) accepts the same errors without asking. A local edit is still
+  gets `lint_waived = 1` (migration 11), also when an in-import prefix wrote the missing name (so no
+  waived lint is left on the version), and every later source write (`versionFromSource`:
+  source/update and re-imports) accepts the same errors without asking. A re-import names such a
+  unit the way it was taken (waived, so by its folder or file, never its heading) before the clash
+  pass, whatever `frontmatterErrors` it sends. A local edit is still
   gated. Any other lint error skips the unit in every mode.
 - Supplied frontmatter (v3 jcfm, `pack.ts supply`, `lib/frontmatter.ts prependFrontmatter`):
   `description` (trimmed, at most 1024 characters, lint's cap; blank is none) applies to an import

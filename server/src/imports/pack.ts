@@ -4,7 +4,7 @@ import { tx, type Db } from '../db.ts';
 import { canEditGroup } from '../access.ts';
 import { addMemberTx, createGroup, getGroupRow, isMember } from '../groups/service.ts';
 import { FRONTMATTER_ERRORS } from '../items/lint.ts';
-import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewItem, readTree, renameFrontmatter, resolveVersion, slugify, suppliedOf, versionSha, type CreateItemInput, type Lint } from '../items/service.ts';
+import { SINGLE_FILE, addVersion, createItemTx, getItemRow, listFiles, previewItem, readTree, refreshFts, renameFrontmatter, resolveVersion, slugify, suppliedOf, versionSha, type CreateItemInput, type Lint } from '../items/service.ts';
 import { sha256Hex } from '../lib/crypto.ts';
 import { UNCLOSED, parseFrontmatter, prependFrontmatter } from '../lib/frontmatter.ts';
 import { HttpError, MB, badRequest, notFound } from '../lib/http.ts';
@@ -29,12 +29,18 @@ export interface Unit {
   scope?: 'tree' | 'root';
   /** A folder unit's paths (relative to it) that another unit or skip took first: a source update leaves them out (updateTree). */
   carve?: string[];
-  /** A skill's plugin folder (or the folder holding its skills/ folder): its prefix when another skill of the import shares its name (5ef6). */
-  prefix?: string;
+  /**
+   * A skill's plugin folder (or the folder holding its skills/ folder), an agent's or command's plugin
+   * folder (7k2p): its prefix when another unit of the import shares its kind and name (5ef6). Each
+   * next entry adds the folder above (`plugins-a` after `a`, 5vz2), for when two copies' folders share a name.
+   */
+  prefixes?: string[];
   /** 5ef6: the name the unit took before it was renamed (renamed); its item records what was put in front (source_prefix). */
   bare?: string;
   /** jcfm: frontmatter put in front of the unit's entry, which has none upstream (supply). `tree` stays upstream's. */
   supplied?: SuppliedFrontmatter;
+  /** naming-8: the tool a unit at a plugin root is a port for (`antigravity/` as the plugin), set by detectUnits; else unitPort reads its path. */
+  port?: string;
 }
 
 export interface Skipped {
@@ -181,8 +187,13 @@ const TOOLING_DIRS = ['.claude/skills', '.claude/agents', '.claude/commands', '.
 const TOOLING_FILES = ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md'];
 /** Folders named for another agent tool (ypmn): a skill under one is that tool's port, ranked after every other copy. */
 const PORT_DIRS = new Set(['.openclaw', '.opencode', '.gemini', '.cursor', '.kiro', '.windsurf', '.codex', 'antigravity', 'codex', 'openclaw', 'opencode', 'cursor', 'gemini']);
-/** The tool a skill folder is a port for: the first folder above it named for one (its own name never counts). */
-const portOf = (dir: string) => dirOf(dir).split('/').find((s) => PORT_DIRS.has(s.toLowerCase()));
+/**
+ * The tool a skill folder is a port for: the first folder above it named for one (its own name never
+ * counts), but a plugin root's own folders count (naming-8): `antigravity/` as a plugin root is the port.
+ */
+const portOf = (dir: string, pluginRoot = false) => (pluginRoot ? dir : dirOf(dir)).split('/').find((s) => PORT_DIRS.has(s.toLowerCase()));
+/** A unit's port: what detectUnits recorded (a plugin root's own folder), else read off its path. */
+const unitPort = (u: Unit) => u.port ?? portOf(u.path);
 /** Manifest problems listed per import: a 1 MB manifest can name half a million bad paths, each one a skipped entry. */
 const MAX_MANIFEST_SKIPS = 500;
 
@@ -404,20 +415,20 @@ export function detectUnits(
     for (const f of files) claimed.set(f.path, dir);
     // A plugin root's skill with components carved out of it (bppq) is re-detected on update too (updateTree), for components added upstream.
     const scope = carve && pluginSet.has(dir) ? 'root' : undefined;
-    const prefix = prefixOf(dir);
-    units.push({ path: dir, kind: 'skill', tree: skillTree(subtree(files, dir)), fallbackName: baseOf(dir), folderName: baseOf(dir), scope, carve, ...(prefix && { prefix }) });
+    const prefixes = prefixesOf(dir);
+    units.push({ path: dir, kind: 'skill', tree: skillTree(subtree(files, dir)), fallbackName: baseOf(dir), folderName: baseOf(dir), scope, carve, ...(prefixes && { prefixes }) });
   };
-  const fileUnit = (f: TreeFile, kind: Kind, opts: { name?: string; fallbackName?: string; path?: string } = {}) => {
+  const fileUnit = (f: TreeFile, kind: Kind, opts: { name?: string; fallbackName?: string; path?: string; prefixes?: string[] } = {}) => {
     claimed.set(f.path, f.path);
     const file = baseOf(f.path);
-    units.push({ path: f.path, kind, tree: [{ ...f, path: opts.path ?? file }], name: opts.name, fallbackName: opts.fallbackName ?? stem(file) });
+    units.push({ path: f.path, kind, tree: [{ ...f, path: opts.path ?? file }], name: opts.name, fallbackName: opts.fallbackName ?? stem(file), ...(opts.prefixes && { prefixes: opts.prefixes }) });
   };
   // A README inside agents/, commands/ or prompts/ would otherwise ship as a slash command named 'readme'.
   const fileDirUnit = (f: TreeFile, file: string, kind: Kind, byFile: boolean) => {
     if (REPO_DOCS.test(file)) {
       claimed.set(f.path, f.path);
       skipped.push({ path: f.path, reason: NOT_AN_ITEM });
-    } else fileUnit(f, kind, { name: byFile ? slugify(stem(file)) || undefined : undefined });
+    } else fileUnit(f, kind, { name: byFile ? slugify(stem(file)) || undefined : undefined, prefixes: kind === 'agent' || kind === 'command' ? prefixesOf(f.path) : undefined });
   };
 
   // Manifest problems are listed up to MAX_MANIFEST_SKIPS; the rest are counted in one entry.
@@ -433,12 +444,27 @@ export function detectUnits(
     }
     return ['', path];
   };
-  /** 5ef6 (Unit.prefix): the plugin's folder, else the folder holding skills/; none for a port (ypmn) or under a dot folder (.claude). */
-  const prefixOf = (dir: string) => {
-    const [r] = rootOf(dir);
-    const segs = dirOf(dir).split('/');
-    const parent = r ? baseOf(r) : segs.at(-1) === 'skills' ? segs.at(-2) : undefined;
-    return parent && !parent.startsWith('.') && !portOf(dir) ? slugify(parent) || undefined : undefined;
+  /**
+   * 5ef6 (Unit.prefixes): the plugin's folder, else the folder holding skills/, then each with the folders
+   * above it (5vz2) up to a dot folder or the root; none for a port (ypmn) or under a dot folder (.claude).
+   */
+  const prefixesOf = (path: string) => {
+    if (portOf(path)) return undefined;
+    const [r] = rootOf(path);
+    const segs = dirOf(path).split('/');
+    const folder = r ? r.split('/') : segs.at(-1) === 'skills' ? segs.slice(0, -1) : [];
+    const out: string[] = [];
+    // Past 64 characters no prefixed name fits (prefixed), so the chain stops there; a first prefix that
+    // long is kept, so the copy is skipped on the name limit (prefixClashes), not taken as having none.
+    for (let i = folder.length - 1; i >= 0 && folder[i] && !folder[i].startsWith('.'); i--) {
+      const px = slugify(folder.slice(i).join('-'), Infinity);
+      if (px.length > 64) {
+        if (!out.length) out.push(px);
+        break;
+      }
+      if (px && px !== out.at(-1)) out.push(px);
+    }
+    return out.length ? out : undefined;
   };
   const filesIn = (dir: string) => (dir ? (byDir.get(dir) ?? []) : tree);
   // The paths a manifest declares come first (4ky8), so a component outside SCP's folder conventions
@@ -543,7 +569,7 @@ export function detectUnits(
   };
   const rank = (dir: string) => {
     const segs = dirOf(dir).split('/');
-    if (portOf(dir)) return 3;
+    if (portOf(dir, pluginSet.has(dir))) return 3;
     if (rootOf(dir)[0] || segs.includes('.claude')) return 0;
     return segs.includes('skills') ? 1 : 2;
   };
@@ -620,6 +646,11 @@ export function detectUnits(
     for (const folder of folders) skipped.push({ path: folder, reason: 'no SKILL.md in this folder' });
     for (const [path, c] of components) skipped.push({ path, reason: `plugin ${c} is not supported by SCP; it was not imported` });
   }
+  // ypmn, eg9k: units import in this order and the first takes a name, so another tool's port goes after
+  // every other unit, whichever pass found it (its own plugin.json, a manifest path, antigravity/ as a plugin,
+  // whose root skill sits at the root itself, naming-8).
+  for (const u of units) if (pluginSet.has(u.path)) u.port = portOf(u.path, true);
+  units.sort((a, b) => +!!unitPort(a) - +!!unitPort(b));
   return { units, skipped, skippedFolders: [...looseMd].map(([path, count]) => ({ path, count })) };
 }
 
@@ -801,7 +832,7 @@ const isPrefixed = (item: ItemRow, bare: string) => (item.source_prefix ? item.n
 /**
  * 5ef6, for an item with no recorded source_prefix: the item is its source's unit `bare` under a prefix an
  * import of that source gives: the repository (or zip) name for a clash across sources (clashPrefix), or a
- * folder above the unit for one inside the import (Unit.prefix). One candidate only, so an item that took
+ * folder above the unit for one inside the import (Unit.prefixes). One candidate only, so an item that took
  * both (fork-discord-access) is not recognised. ponytail: inferred, so an unprefixed `pdf-tools` under a
  * `pdf/` folder (or from a repository named pdf) still reads as prefixed. It serves rows from before the
  * source_prefix column; an unprefixed row since also records null, so it is inferred the same way.
@@ -875,8 +906,11 @@ function unitInput(u: Unit, opts: ImportOpts): CreateItemInput & { source: ItemS
   };
 }
 
-/** waive: accept the unit's frontmatter errors (0rdh). retried: this is the `<repo>-` prefixed attempt, of the name that was taken (5ef6). */
-function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: boolean, retried?: string): UnitResult {
+/**
+ * waive: accept the unit's frontmatter errors (0rdh). retried: this is the `<repo>-` prefixed attempt, of the name that was taken (5ef6).
+ * carried: `kind:name` of every name this import's units take (naming-1).
+ */
+function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: boolean, retried?: string, carried?: Set<string>): UnitResult {
   const input = unitInput(u, opts);
   const { source } = input;
   // Re-import = update: the item of this kind from this very unit (same repo and path) under the name the
@@ -899,14 +933,28 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
   // Upstream's entry: a supplied block (input.tree) goes only where there was none, so never on an unclosed one.
   const entry = entryOf(u.kind, u.tree);
   const headed = entry && parseFrontmatter(utf8.decode(entry.bytes)).error === UNCLOSED ? previewItem(input, waive, true)?.name : undefined;
-  const own = takes
+  let own = takes
     ? (ctx.db.prepare('SELECT * FROM items WHERE owner_id = ? AND kind = ? AND source_path IS ? AND source_repo IS NOT NULL ORDER BY created_at, rowid').all(p.userId, u.kind, source.path) as unknown as ItemRow[])
       .find(
         (h) =>
           sameRepo(h.source_repo, source.repo) &&
-          (h.name === takes || h.name === legacy || h.name === headed || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes)) || suppliedOf(h)?.name !== undefined),
+          (h.name === takes || h.name === legacy || h.name === headed || h.name === u.bare || (h.source_prefix ? h.name === `${h.source_prefix}-${bare}` : wasPrefixed(h, takes)) || suppliedOf(h)?.name !== undefined),
       )
     : undefined;
+  // naming-1: found under its recorded prefix, or under its bare name (an unprefixed copy of this import takes
+  // that now, prefixClashes), while another unit of this import now carries that name (so prefixClashes gave
+  // this one a longer prefix, or none): the item takes the name this import gives the unit, as a fresh import
+  // names it, so the other unit is not refused on it. A name held elsewhere keeps the old one.
+  let renamedNow = false;
+  const underOld = !!own && (own.name === bare || (!!own.source_prefix && own.name === `${own.source_prefix}-${bare}`));
+  if (own && takes && own.name !== takes && underOld && carried?.has(`${u.kind}:${own.name}`)) {
+    if (!ctx.db.prepare('SELECT 1 FROM items WHERE owner_id = ? AND kind = ? AND name = ?').get(p.userId, u.kind, takes)) {
+      ctx.db.prepare('UPDATE items SET name = ?, source_prefix = ? WHERE id = ?').run(takes, prefixOfName(u) ?? null, own.id);
+      own = getItemRow(ctx.db, own.id)!;
+      refreshFts(ctx.db, own.id);
+      renamedNow = true;
+    }
+  }
   if (own) {
     // Found under its prefix: the unit's tree names it takes (or bare), and the item keeps its own name.
     const tree = own.name === takes || own.name === legacy || own.name === headed ? u.tree : pinName(u.kind, u.tree, own.name);
@@ -917,8 +965,11 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
     // The ref and commit still follow the ones named (a tag, then the branch at the same commit).
     // jcfm: frontmatter supplied that the item does not store yet is news of its own, but only the block
     // changes (swapSupplied, as the item page's edit): the rest of the latest version stays.
+    // naming-6: never after a rename just now, even at the same commit (the same zip with includeRepoTooling
+    // toggled): the stored entry still says the old `name:`, and a skill's name is its install folder, so the
+    // unit's tree is written under the new name, as a different commit writes it.
     const stored = suppliedOf(own);
-    const untouched = own.source_commit === source.commit || (!!own.source_tree_sha256 && versionSha(own, sourceTree(own, tree, stored && suppliedFor(own, stored))) === own.source_tree_sha256);
+    const untouched = !renamedNow && (own.source_commit === source.commit || (!!own.source_tree_sha256 && versionSha(own, sourceTree(own, tree, stored && suppliedFor(own, stored))) === own.source_tree_sha256));
     if (untouched) {
       ctx.db.prepare('UPDATE items SET source_ref = ?, source_commit = ? WHERE id = ?').run(source.ref, source.commit, own.id);
       const fm = u.supplied && suppliedFor(own, u.supplied);
@@ -937,9 +988,10 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
     // Two units of one source with the same name (two marketplace plugins shipping agents/code-reviewer.md): say which one holds it.
     // A skill under another tool's folder lost to a better-ranked copy (ypmn, detectUnits): say it is that tool's port.
     if (holder && sameRepo(holder.source_repo, source.repo)) {
-      const port = u.kind === 'skill' ? portOf(u.path) : undefined;
+      // Any kind: eg9k ranks a port plugin root's agents and commands last too.
+      const port = unitPort(u);
       const at = holder.source_path ?? 'the root';
-      throw new HttpError(409, 'name_taken', port ? `another copy of this skill (${at}) was imported; this one is the ${port} port` : `${e.message}, imported from ${at} of ${holder.source_repo}`, e.details);
+      throw new HttpError(409, 'name_taken', port ? `another copy of this ${u.kind} (${at}) was imported; this one is the ${port} port` : `${e.message}, imported from ${at} of ${holder.source_repo}`, e.details);
     }
     // 5ef6: another source's item (or a local one) holds the name. With onNameClash 'prefix' the unit
     // takes `<repo>-<name>`; otherwise the skip offers that name.
@@ -958,50 +1010,83 @@ function importUnit(ctx: Ctx, p: Principal, u: Unit, opts: ImportOpts, waive: bo
 }
 
 /**
- * 5ef6: skills of one import sharing a name each take their prefix (Unit.prefix), so a repository never
- * drops its own; a copy an earlier import of this source holds under the bare name (held) keeps it, so a
- * re-import updates that item instead of stranding it. Ports (ypmn) still give way, and are skipped when
- * every other copy was prefixed away from the bare name. A copy whose prefixed name would pass the name
- * cap is skipped (prefixed). Returns the indexes of the units skipped.
+ * 5ef6: units of one import sharing a kind and name (skills, and 7k2p agents and commands) each take their
+ * prefix (Unit.prefixes), so a repository never drops its own; a copy an earlier import of this source
+ * holds under the bare name (held) keeps it, so a re-import updates that item instead of stranding it.
+ * Copies whose prefixed names still meet (plugins/a and other/a, 5vz2), or meet a name another unit of
+ * the import carries, lengthen the prefix a folder at a time; a copy that runs out of folders, or whose
+ * prefixed name would pass the name cap, is skipped (of copies out of folders on one name, the first keeps
+ * it). Ports (ypmn) still give way, and are skipped when
+ * every other copy was prefixed away from the bare name. Returns the indexes of the units skipped.
  */
 function prefixClashes(units: Unit[], names: (string | undefined)[], opts: ImportOpts, skipped: Skipped[], held: (i: number, name: string) => boolean): Set<number> {
   const byName = new Map<string, number[]>();
   units.forEach((u, i) => {
     const n = names[i];
-    if (u.kind !== 'skill' || !n) return;
-    const list = byName.get(n);
+    if (!n) return;
+    const list = byName.get(`${u.kind}:${n}`);
     if (list) list.push(i);
-    else byName.set(n, [i]);
+    else byName.set(`${u.kind}:${n}`, [i]);
   });
   const dropped = new Set<number>();
-  // A generated name another skill of this import already carries would make that skill the clash's loser.
+  // A generated name another unit of this import already carries would make that unit the clash's loser.
   const used = new Set(byName.keys());
-  for (const [name, idx] of byName) {
-    const copies = idx.filter((i) => !portOf(units[i].path));
+  for (const idx of byName.values()) {
+    const { kind } = units[idx[0]];
+    const name = names[idx[0]]!;
+    const copies = idx.filter((i) => !unitPort(units[i]));
     if (copies.length < 2) continue;
-    const bare = copies.filter((i) => !units[i].prefix || held(i, name));
-    for (const i of copies) {
-      if (bare.includes(i)) continue;
-      const n = prefixed(units[i].prefix!, name);
-      let why = n ? `'${n}' is the name of another skill of this import` : `'${units[i].prefix}-${name}' ${TOO_LONG}`;
-      if (n && !used.has(n)) {
-        try {
-          units[i] = renamed(units[i], name, n);
-          used.add(n);
-          continue;
-        } catch (e) {
-          if (!(e instanceof HttpError)) throw e;
-          why = e.message;
-        }
+    // A copy with no prefixes keeps the bare name, as a fresh import names it, and a held copy with prefixes
+    // takes its prefixed name (importUnit renames its item); with none, a copy an earlier import holds keeps it.
+    const unprefixed = copies.filter((i) => !units[i].prefixes);
+    const bare = unprefixed.length ? unprefixed : copies.filter((i) => held(i, name));
+    // Each copy's prefixed names, shortest first, up to the name cap (a longer prefix only gets longer).
+    const tries = new Map<number, string[]>();
+    for (const i of copies) if (!bare.includes(i)) tries.set(i, units[i].prefixes!.map((px) => prefixed(px, name)).filter((n) => n !== undefined));
+    for (let level = 0; tries.size; level++) {
+      // A copy out of longer prefixes keeps offering its longest, which a copy still lengthening may free.
+      const at = (i: number) => tries.get(i)!.at(Math.min(level, tries.get(i)!.length - 1));
+      const stuck = [...tries.values()].every((c) => level >= c.length - 1);
+      const meets = new Map<string | undefined, number>();
+      for (const i of tries.keys()) meets.set(at(i), (meets.get(at(i)) ?? 0) + 1);
+      for (const i of [...tries.keys()]) {
+        const n = at(i);
+        let why = n ? `'${n}' is the name of another ${kind} of this import` : `'${units[i].prefixes![0]}-${name}' ${TOO_LONG}`;
+        // Once every copy is at its last prefix nothing can free a name, so the first of those meeting takes it.
+        if (n && (meets.get(n) === 1 || stuck) && !used.has(`${kind}:${n}`)) {
+          try {
+            units[i] = renamed(units[i], name, n);
+            used.add(`${kind}:${n}`);
+            tries.delete(i);
+            continue;
+          } catch (e) {
+            if (!(e instanceof HttpError)) throw e;
+            why = e.message;
+          }
+        } else if (n && !stuck) continue;
+        tries.delete(i);
+        dropped.add(i);
+        skipped.push({ path: units[i].path, reason: `another ${kind} of this import is named '${name}', and ${why}` });
       }
-      dropped.add(i);
-      skipped.push({ path: units[i].path, reason: `another skill of this import is named '${name}', and ${why}` });
+    }
+    // A held copy that found no free prefixed name keeps the bare name after all, as before v4: its item keeps
+    // updating, and the unprefixed copies give way, where they would only be refused on its name (importUnit).
+    const keep = unprefixed.length ? copies.find((i) => dropped.has(i) && held(i, name)) : undefined;
+    if (keep !== undefined) {
+      dropped.delete(keep);
+      skipped.splice(skipped.findLastIndex((s) => s.path === units[keep].path), 1);
+      const at = unitInput(units[keep], opts).source.path ?? 'the root';
+      for (const i of unprefixed) {
+        dropped.add(i);
+        skipped.push({ path: units[i].path, reason: `another ${kind} of this import (${at}) is named '${name}', which an earlier import of this source gave it, and it has no free prefixed name to give way with` });
+      }
+      continue;
     }
     if (bare.length) continue;
     const at = unitInput(units[copies[0]], opts).source.path ?? 'the root';
-    for (const i of idx.filter((i) => portOf(units[i].path))) {
+    for (const i of idx.filter((i) => unitPort(units[i]))) {
       dropped.add(i);
-      skipped.push({ path: units[i].path, reason: `another copy of this skill (${at}) was imported; this one is the ${portOf(units[i].path)} port` });
+      skipped.push({ path: units[i].path, reason: `another copy of this ${kind} (${at}) was imported; this one is the ${unitPort(units[i])} port` });
     }
   }
   return dropped;
@@ -1089,14 +1174,29 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
       throw new HttpError(409, 'frontmatter_errors', `${asked.length} of ${units.length} units have frontmatter errors: send frontmatterErrors 'import' to import them anyway or 'skip' to skip them`, asked);
     }
   }
+  // Each unit named as importUnit names it, with its own waive: a unit an earlier import took with its errors is
+  // waived now too, and a waived skill or agent takes no name from its heading (prepareItem). The unwaived
+  // previews above only classify the errors.
+  const named = units.map((u, i) => (waive[i] === (mode === 'import') ? previews[i] : previewItem(unitInput(u, opts), waive[i])));
   const holds = db.prepare('SELECT 1 FROM items WHERE owner_id = ? AND kind = ? AND name = ? AND lower(source_repo) = lower(?) AND source_path IS ?');
   const held = (i: number, name: string) => !!holds.get(p.userId, units[i].kind, name, opts.source.repo, unitInput(units[i], opts).source.path);
   // A unit its lint will refuse never imports, so its name forces no prefix on a twin that does.
   const imports = (i: number) => {
-    const errs = previews[i]?.lint.filter((l) => l.level === 'error' && !l.waived) ?? [];
+    const errs = named[i]?.lint.filter((l) => l.level === 'error' && !l.waived) ?? [];
     return !errs.length || (waive[i] && errs.every((l) => FRONTMATTER_ERRORS.has(l.code)));
   };
-  const dropped = prefixClashes(units, previews.map((pv, i) => (imports(i) ? pv?.name : undefined)), opts, skipped, held);
+  const dropped = prefixClashes(units, named.map((pv, i) => (imports(i) ? pv?.name : undefined)), opts, skipped, held);
+  // naming-1: the names this import's units take. A unit whose item holds, under its recorded prefix or its bare
+  // name, a name another unit now takes imports first: importUnit renames that item before the other unit asks for the name.
+  const final = (i: number) => units[i].name ?? named[i]?.name;
+  const carried = new Set(units.flatMap((u, i) => (dropped.has(i) || !final(i) ? [] : [`${u.kind}:${final(i)}`])));
+  const prefixedAt = db.prepare('SELECT name FROM items WHERE owner_id = ? AND kind = ? AND lower(source_repo) = lower(?) AND source_path IS ? AND (source_prefix IS NOT NULL OR name = ?)');
+  const yields = units.map(
+    (u, i) =>
+      !dropped.has(i) &&
+      (prefixedAt.all(p.userId, u.kind, opts.source.repo, unitInput(u, opts).source.path, u.bare ?? null) as { name: string }[]).some((r) => r.name !== final(i) && carried.has(`${u.kind}:${r.name}`)),
+  );
+  const order = [...units.keys()].sort((a, b) => +!yields[a] - +!yields[b]);
   return tx(db, () => {
     // intoGroup is re-read here: the route resolved it before a GitHub download that can take a minute,
     // and a group deleted meanwhile would fail every member insert on its foreign key (a 500).
@@ -1107,11 +1207,15 @@ export function importTree(ctx: Ctx, p: Principal, tree: TreeFile[], opts: Impor
       : (into || null);
     const results: UnitResult[] = [];
     let added = 0;
-    for (const [i, u] of units.entries()) {
+    for (const i of order) {
       if (dropped.has(i)) continue;
+      const u = units[i];
       db.exec('SAVEPOINT unit');
       try {
-        const r = importUnit(ctx, p, u, opts, waive[i]);
+        const r = importUnit(ctx, p, u, opts, waive[i], undefined, carried);
+        // 0rdh: the unit's upstream frontmatter errors were accepted, also when an in-import prefix wrote the
+        // missing name (pinName) so no waived lint is left: a later ask-mode import takes it without asking (waivedBefore).
+        if (named[i]?.lint.some((l) => l.waived) && !r.item.lint_waived) db.prepare('UPDATE items SET lint_waived = 1 WHERE id = ?').run(r.item.id);
         // A re-import into the same group versions its members; they stay members once (p2wf).
         if (group && !isMember(db, group.id, r.item.id)) {
           addMemberTx(ctx, p, group, { itemId: r.item.id });

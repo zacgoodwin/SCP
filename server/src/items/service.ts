@@ -581,7 +581,7 @@ function insertVersion(db: Db, p: Principal, itemId: string, seq: number, s: Sha
 }
 
 // ponytail: FTS rows are found by an UNINDEXED column (full scan per write); key by a stable rowid if items grow past ~100k.
-function refreshFts(db: Db, itemId: string): void {
+export function refreshFts(db: Db, itemId: string): void {
   db.prepare('DELETE FROM items_fts WHERE item_id = ?').run(itemId);
   const item = getItemRow(db, itemId)!;
   const v = resolveVersion(db, item);
