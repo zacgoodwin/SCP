@@ -315,6 +315,8 @@ const MIGRATIONS: string[] = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );`,
+  // v4 nenk: an item imported with includeRepoTooling (4ky8); its source updates re-detect with it (imports/pack.ts updateTree).
+  `ALTER TABLE items ADD COLUMN source_tooling INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export function openDb(path: string): Db {

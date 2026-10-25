@@ -4,21 +4,26 @@ import { fileImportMb, importLimit } from '../admin/settings.ts';
 import { audit } from '../audit.ts';
 import { reauthenticate, requireScope, requireUser } from '../auth/middleware.ts';
 import { groupDetail, loadEditableGroupOr404 } from '../groups/service.ts';
-import { itemDetail, itemSource, loadEditableItem } from '../items/service.ts';
+import { itemDetail, itemSource, listFiles, loadEditableItem, resolveVersion } from '../items/service.ts';
 import { sha256Hex } from '../lib/crypto.ts';
 import { HttpError, MB, badRequest, limitBody as limit, notFound, parseJson } from '../lib/http.ts';
 import { normalizePath } from '../lib/paths.ts';
 import { AUTH_LIMITS, rateLimited, spend, take } from '../lib/ratelimit.ts';
 import type { TreeFile } from '../lib/tree.ts';
+import type { ZipLink } from '../lib/zip.ts';
 import { KINDS, type AppEnv, type GroupRow, type ItemRow, type ItemSource, type Principal } from '../types.ts';
-import { SHA_REF, archiveTooLarge, badSource, fetchFolder, fetchZipball, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
+import { SHA_REF, archiveTooLarge, badSource, fetchFolder, fetchZipball, freshSpent, parseGithubSource, resolveCommit, withZipballSlot } from './github.ts';
 import {
   ARTIFACT_FROM_TREE,
   FOLDER_KINDS,
+  MAX_OUTSIDE_TARGETS,
   editSupplied,
   fileRootName,
+  hopSkip,
   importTree,
-  linkSkips,
+  linkCopies,
+  linkTarget,
+  outsideTargets,
   packLimits,
   subtree,
   underPath,
@@ -109,21 +114,96 @@ function limitGithub(c: Context<AppEnv>, p: Principal): void {
 }
 
 /**
- * repo@sha at or under `path`: repository-relative files, and what was passed over (links, submodules)
- * re-rooted at `path`. The zipball, inflating only the folder; over the archive cap, a whole repository
- * is a 413 and a folder is fetched file by file instead (a4q8, github.ts fetchFolder).
+ * repo@sha at or under `path`: repository-relative files, with the links in it copied (jv9q,
+ * linkCopies: their targets elsewhere in the repository fetched too, one hop), the links copied and
+ * what was passed over (links it could not copy, submodules) re-rooted at `path`. The zipball,
+ * inflating only the folder and those targets; over the archive cap, a whole repository is a 413 and
+ * a folder is fetched file by file instead (a4q8, github.ts fetchFolder). A target refused on its own
+ * (over a cap, or more GitHub requests than are left) is left out and its links say why: the folder
+ * imported before links were followed, so a target must never fail it. Either way the targets share
+ * the folder's caps (I3-3). `retry`: the links (re-rooted) whose target only the a4q8 quota refused,
+ * which a later attempt fetches. `refused`: when `path` is itself a link whose target was refused, the
+ * answer naming why, for a caller left with no files (D1: such a path is the copy as a whole).
  */
-async function download(c: Context<AppEnv>, p: Principal, repo: string, sha: string, path: string | null): Promise<{ files: TreeFile[]; skipped: Skipped[] }> {
+async function download(c: Context<AppEnv>, p: Principal, repo: string, sha: string, path: string | null): Promise<{ files: TreeFile[]; copied: ZipLink[]; skipped: Skipped[]; retry: string[]; refused?: HttpError }> {
   const ctx = c.var.ctx;
+  const limits = packLimits(ctx);
   const zip = await fetchZipball(ctx, repo, sha);
+  let files: TreeFile[];
+  let links: ZipLink[];
+  let subs: Skipped[] = [];
+  let fetchTarget: (t: string) => Promise<{ files: TreeFile[]; links: ZipLink[] }>;
   if (zip) {
-    const { files, links } = unpack(zip, underPath(path), packLimits(ctx));
-    return { files, skipped: linkSkips(subtree(links, path)) };
+    ({ files, links } = unpack(zip, underPath(path, true), limits));
+    // The targets share one pack's caps, so twenty of them never inflate more than one pack.
+    let count = 0;
+    let bytes = 0;
+    fetchTarget = async (t) => {
+      const got = unpack(zip, underPath(t), { ...limits, files: limits.files - count, totalBytes: limits.totalBytes - bytes });
+      count += got.files.length;
+      bytes += got.files.reduce((n, f) => n + f.bytes.length, 0);
+      return got;
+    };
+  } else {
+    if (path === null) throw archiveTooLarge(ctx);
+    const charge = (calls: number) => spend(c, `github:${p.userId}`, AUTH_LIMITS.github, calls);
+    const spent = freshSpent();
+    const folder = await fetchFolder(ctx, repo, sha, path, charge, spent);
+    ({ files, links } = folder);
+    subs = subtree(folder.submodules, path).map((s) => ({ path: s.path, reason: `submodule at ${short(s.sha)}, not imported` }));
+    fetchTarget = (t) => fetchFolder(ctx, repo, sha, t, charge, spent);
   }
-  if (path === null) throw archiveTooLarge(ctx);
-  const { files, links, submodules } = await fetchFolder(ctx, repo, sha, path, (calls) => spend(c, `github:${p.userId}`, AUTH_LIMITS.github, calls));
-  const subs = subtree(submodules, path).map((s) => ({ path: s.path, reason: `submodule at ${short(s.sha)}, not imported` }));
-  return { files, skipped: [...linkSkips(subtree(links, path)), ...subs] };
+  // I3-1: nothing at or under `path`, but a link at a folder above it (`plugins/kit/skills -> ../../skills`
+  // for plugins/kit/skills/x): the import copied the item through that link (jv9q), so it is followed the
+  // same way, one hop (a link met on the way to the target is not, nor one in the target: listed), the
+  // target's files re-rooted at `path`. A link to a folder holding it is refused, as linkCopies refuses it.
+  let hopped: Skipped[] = [];
+  if (path !== null && !files.length && !links.some((l) => l.path === path || l.path.startsWith(path + '/'))) {
+    const hop = links.find((l) => path.startsWith(l.path + '/'));
+    const to = hop && linkTarget(hop);
+    if (hop && to && to !== hop.path && !hop.path.startsWith(to + '/')) {
+      const target = to + path.slice(hop.path.length);
+      const got = await fetchTarget(target);
+      files = got.files.map((f) => ({ ...f, path: path + f.path.slice(target.length) }));
+      hopped = got.links.filter((l) => l.path.startsWith(target + '/')).map((l) => hopSkip(l, path + l.path.slice(target.length)));
+      links = [];
+    }
+  }
+  // I3-4: a whole-repository import copies every link; a folder fetches at most MAX_OUTSIDE_TARGETS targets, and says so for the rest.
+  const targets = outsideTargets(links, path);
+  const unfetched = new Map(targets.slice(MAX_OUTSIDE_TARGETS).map((t) => [t, `more than ${MAX_OUTSIDE_TARGETS} link targets outside the folder`]));
+  // The links inside the fetched targets: linkCopies lists each under the copy that would hold it.
+  const beyond: ZipLink[] = [];
+  const quota: string[] = [];
+  const refusals = new Map<string, HttpError>();
+  for (const t of targets.slice(0, MAX_OUTSIDE_TARGETS)) {
+    try {
+      const got = await fetchTarget(t);
+      files = [...files, ...got.files];
+      beyond.push(...got.links);
+    } catch (e) {
+      // A refusal of this target alone (413 over a cap, 400 the a4q8 quota or a bad entry in it); GitHub failing (429, 502) fails the import.
+      if (!(e instanceof HttpError) || (e.status !== 413 && e.status !== 400)) throw e;
+      if ((e as { quota?: true }).quota) quota.push(t);
+      refusals.set(t, e);
+      unfetched.set(t, e.status === 413 ? 'its target is too large to fetch' : `its target was not fetched: ${e.message}`);
+    }
+  }
+  const linked = linkCopies(files, links, limits, unfetched, beyond);
+  const under = (t: string | null, of: string[]) => !!t && of.find((q) => t === q || t.startsWith(q + '/'));
+  const retry = links.filter((l) => under(linkTarget(l), quota));
+  // A `path` that is itself a link is the copy as a whole: nothing in the tree to report it at. Its target
+  // refused, the link's own reason (and the refusal's status: 413 over a cap, 400 the quota) is the answer.
+  const self = path === null ? undefined : links.find((l) => l.path === path);
+  const by = self && !linked.copied.includes(self) ? under(linkTarget(self), [...refusals.keys()]) : undefined;
+  const refused = by ? refusals.get(by)! : undefined;
+  return {
+    files: linked.files,
+    copied: subtree(linked.copied.filter((l) => l.path !== path), path),
+    skipped: [...subtree(linked.skipped, path), ...subtree(hopped, path), ...subs],
+    retry: subtree(retry, path).map((l) => l.path),
+    refused: refused && new HttpError(refused.status, refused.code, `'${path}' is a ${linked.skipped.find((s) => s.path === path)!.reason}`),
+  };
 }
 
 /**
@@ -187,7 +267,9 @@ importRoutes.post('/items/import/pack', archiveBody, async (c) => {
   const intoGroup = intoGroupOf(c, p, { group: opts.group, intoGroup: slug });
   const bytes = new Uint8Array(await file.arrayBuffer());
   const name = baseOf(file.name) || 'pack.zip';
-  const { files, top, links } = unpack(bytes, undefined, packLimits(c.var.ctx));
+  const limits = packLimits(c.var.ctx);
+  const { top, ...unpacked } = unpack(bytes, undefined, limits);
+  const { files, copied, skipped } = linkCopies(unpacked.files, unpacked.links, limits);
   const zipName = name.replace(/\.(zip|skill)$/i, '');
   const source: ItemSource = { kind: 'zip', repo: name, ref: null, path: null, commit: sha256Hex(bytes) };
   // A stripped wrapper folder (`zip -r my-skill.zip my-skill/`) is one folder, so its SKILL.md is the whole folder's.
@@ -199,7 +281,8 @@ importRoutes.post('/items/import/pack', archiveBody, async (c) => {
     rootName: top ?? zipName,
     clashPrefix: zipName,
     folderRoot: top !== null,
-    skipped: linkSkips(links),
+    skipped,
+    copied,
     note: `import zip ${name}`,
   });
   return respond(c, p, out, source);
@@ -217,10 +300,10 @@ importRoutes.post('/items/import/github', async (c) => {
   // `repo` as GitHub spells it, whatever case the user typed: it identifies the items on re-import.
   const { repo, ref, sha } = await resolveCommit(ctx, importer, src.repo, src.ref);
   return withZipballSlot(async () => {
-    const { files, skipped } = await download(c, importer, repo, sha, src.path);
+    const { files, copied, skipped, refused } = await download(c, importer, repo, sha, src.path);
     const pathIsFile = files.some((f) => f.path === src.path);
     const tree = subtree(files, src.path);
-    if (!tree.length) throw badSource(`'${src.path}' holds no files in ${repo}@${short(sha)}`);
+    if (!tree.length) throw refused ?? badSource(`'${src.path}' holds no files in ${repo}@${short(sha)}`);
     // The archive can take up to a minute to arrive; the key may have been revoked meanwhile.
     const p = reauthenticate(c);
     const source: ItemSource = { kind: 'github', repo, ref, path: src.path, commit: sha };
@@ -234,6 +317,7 @@ importRoutes.post('/items/import/github', async (c) => {
       folderRoot: !!src.path,
       pathIsFile,
       skipped,
+      copied,
       visibility: body.visibility,
       kind: body.kind,
       name: body.name,
@@ -286,9 +370,19 @@ importRoutes.post('/items/:id/source/update', async (c) => {
   // The same commit check reports as up to date: re-applying its tree would overwrite a local edit made since.
   if (sha === item.source_commit) throw upToDate();
   return withZipballSlot(async () => {
-    const { files, skipped } = await download(c, editor, repo, sha, item.source_path);
+    const { files, skipped, retry, refused } = await download(c, editor, repo, sha, item.source_path);
     const tree = subtree(files, item.source_path);
-    if (!tree.length) throw badSource(`'${item.source_path}' no longer exists in ${repo}@${short(sha)}`);
+    if (!tree.length) {
+      // The whole item is the copy of a link at its path (D1): a target only the quota refused waits for the reset, as below.
+      if (retry.length) throw new HttpError(429, 'rate_limited', `the target of the link '${item.source_path}' needs more GitHub requests than are left this hour, and '${item.name}' is its copy, so it was not updated; try again after GitHub's hourly reset`);
+      throw refused ?? badSource(`'${item.source_path}' no longer exists in ${repo}@${short(sha)}`);
+    }
+    // A link target only the a4q8 quota refused is fetched after GitHub's reset: writing now would drop the copy the
+    // latest version holds from every group serving latest, so the update waits. A target over a cap is written
+    // without its copy and reported in `skipped`, since waiting would not change that; an import never waits.
+    const held = retry.length ? listFiles(ctx.db, resolveVersion(ctx.db, item).id) : [];
+    const lost = retry.find((l) => held.some((f) => f.path === l || f.path.startsWith(l + '/')));
+    if (lost) throw new HttpError(429, 'rate_limited', `the target of the link '${lost}' needs more GitHub requests than are left this hour, and '${item.name}' holds its copy, so it was not updated; try again after GitHub's hourly reset`);
     const p = reauthenticate(c);
     const source = { ...itemSource(item)!, commit: sha };
     const r = versionFromSource(ctx, p, item, updateTree(ctx.db, item, tree), source, body.note ?? `import github ${repo}@${short(sha)} ${item.source_path ?? ''}`.trimEnd());

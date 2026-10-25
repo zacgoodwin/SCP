@@ -225,12 +225,15 @@ function ItemView({ id }: { id: string }) {
         <SourcePanel
           item={item}
           source={item.source}
-          onUpdated={(next) => {
+          onUpdated={(next, left) => {
             setItem(next);
             selectVersion(next.latestSeq, next.latestSeq);
             setTab('files');
             void loadVersions();
-            toast(`Updated to v${next.latestSeq} from GitHub.`, 'ok');
+            toast(
+              left ? `Updated to v${next.latestSeq} from GitHub; ${left} path${left === 1 ? ' was' : 's were'} not imported (listed under Source).` : `Updated to v${next.latestSeq} from GitHub.`,
+              left ? 'info' : 'ok',
+            );
           }}
           onRepinned={setItem}
         />
@@ -359,19 +362,23 @@ function SourcePanel({
 }: {
   item: api.ItemDetail;
   source: api.ItemSource;
-  onUpdated: (i: api.ItemDetail) => void;
+  /** left: how many paths the update did not import (listed in the panel). */
+  onUpdated: (i: api.ItemDetail, left: number) => void;
   /** Same item, new pinned commit, no new version. */
   onRepinned: (i: api.ItemDetail) => void;
 }) {
   const [check, setCheck] = useState<imp.SourceCheck | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // What the last update passed over (a link whose target it could not fetch): the only notice that a copy was dropped.
+  const [left, setLeft] = useState<imp.ImportResult['skipped']>([]);
   const url = imp.sourceUrl(s);
   const short = (sha: string) => sha.slice(0, 7);
 
   const run = (fn: () => Promise<void>) => async () => {
     setBusy(true);
     setError(null);
+    setLeft([]);
     try {
       await fn();
     } catch (e) {
@@ -385,7 +392,8 @@ function SourcePanel({
     try {
       const r = await imp.updateSource(item.id);
       setCheck(null);
-      onUpdated(r.item);
+      setLeft(r.skipped);
+      onUpdated(r.item, r.skipped.length);
     } catch (e) {
       if (!(e instanceof api.ApiError && e.code === 'up_to_date')) throw e;
       // The tree matched, so the server only re-pinned the commit: reload the panel, or it keeps
@@ -435,6 +443,18 @@ function SourcePanel({
             </span>
           )}
         </div>
+      )}
+      {left.length > 0 && (
+        <details open>
+          <summary>Not imported by this update ({left.length})</summary>
+          <ul className="link-list">
+            {left.map((x, i) => (
+              <li key={i}>
+                <code>{x.path || '(root)'}</code> <span className="muted">{x.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
     </section>
   );

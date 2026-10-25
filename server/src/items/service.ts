@@ -53,6 +53,8 @@ export interface CreateItemInput {
   sourcePrefix?: string;
   /** With source: the frontmatter the import put in front of the entry (jcfm), stored to re-apply on source writes. */
   suppliedFrontmatter?: SuppliedFrontmatter;
+  /** With source: the import kept the repository's own tooling (ItemRow.source_tooling). */
+  sourceTooling?: boolean;
 }
 
 export interface VersionInput {
@@ -535,7 +537,7 @@ function checkVisibility(v: unknown): void {
 // steered by whatever keys a row happens to carry.
 const INSERT_COLUMNS = {
   items: ['id', 'owner_id', 'kind', 'name', 'title', 'description', 'category', 'tags', 'visibility', 'format',
-    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'lint_waived', 'source_prefix', 'supplied_frontmatter', 'upstream_frontmatter', 'forked_from', 'created_at', 'updated_at'],
+    'latest_seq', 'source_repo', 'source_ref', 'source_path', 'source_kind', 'source_commit', 'source_tree_sha256', 'source_scope', 'source_carve', 'lint_waived', 'source_prefix', 'supplied_frontmatter', 'upstream_frontmatter', 'source_tooling', 'forked_from', 'created_at', 'updated_at'],
   item_versions: ['id', 'item_id', 'seq', 'entry_path', 'tree_sha256', 'frontmatter', 'lint', 'total_bytes', 'note',
     'created_by_user', 'created_by_key', 'created_by_client', 'created_at'],
 } as const;
@@ -676,6 +678,7 @@ export function createItemTx(
     source_prefix: (input.source && input.sourcePrefix) || null,
     supplied_frontmatter: input.source && input.suppliedFrontmatter ? JSON.stringify(input.suppliedFrontmatter) : null,
     upstream_frontmatter: 0,
+    source_tooling: input.source && input.sourceTooling ? 1 : 0,
     forked_from: input.forkedFrom ?? null,
     created_at: ts,
     updated_at: ts,

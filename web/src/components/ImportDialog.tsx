@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useId, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router';
 import * as api from '../api.ts';
 import * as imp from '../api-import.ts';
@@ -133,7 +133,7 @@ export function ImportDialog({
             {tab === 'file' ? (
               <FileForm plane={plane} limits={limits} onCancel={close} />
             ) : tab === 'pack' ? (
-              <PackForm limits={limits} intoGroup={intoGroup} onCancel={close} onRun={show} />
+              <PackForm plane={plane} limits={limits} intoGroup={intoGroup} onCancel={close} onRun={show} />
             ) : (
               <GithubForm plane={plane} intoGroup={intoGroup} onCancel={close} onRun={show} />
             )}
@@ -204,17 +204,59 @@ export function VisibilitySelect({ value, onChange, autoFocus }: { value: api.Vi
   );
 }
 
-/** jcfm: the description SCP writes as frontmatter when the one imported file has none. */
-function DescriptionField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+/**
+ * jcfm: the description SCP writes as frontmatter when the one imported file has none. `again`: the item
+ * has a source to update from (pack, GitHub), where SCP supplies it again; a File-tab item has none (F2).
+ */
+function DescriptionField({ value, onChange, again = true }: { value: string; onChange: (v: string) => void; again?: boolean }) {
   return (
     <label className="field">
       <span>Description</span>
       <textarea rows={2} maxLength={1024} value={value} placeholder="Optional" onChange={(e) => onChange(e.target.value)} />
       <small className="muted">
         For an import of one item whose file has no frontmatter (a plain .md imported as a skill, say): SCP adds this description (and a skill's or agent's name) as its
-        frontmatter, and adds it again on every update from the source. A file with frontmatter of its own keeps it.
+        frontmatter{again && ', and adds it again on every update from the source'}. A file with frontmatter of its own keeps it.
       </small>
     </label>
+  );
+}
+
+/** jwz6: the server's `kind`, which turns detection off: one item per .md for the single-file kinds, the whole tree one item for the rest. */
+function FolderKindSelect({ value, kinds, onChange, note }: { value: api.Kind | ''; kinds: api.Kind[]; onChange: (k: api.Kind | '') => void; note?: string }) {
+  return (
+    <label className="field">
+      <span>Import items in folder as one type</span>
+      <select value={value} onChange={(e) => onChange(e.target.value as api.Kind | '')}>
+        <option value="">No, detect each item's type</option>
+        {kinds.map((k) => (
+          <option key={k} value={k}>
+            Yes, all as {k}
+          </option>
+        ))}
+      </select>
+      <small className="muted">
+        Picking a type turns detection off. Agent, command, prompt and instructions: each .md file directly in the folder (not in subfolders) becomes its own item of that type (README-style docs are left
+        out). Skill, design and package: the whole folder becomes one item holding every file{note}. A source of many kinds of items needs detection.
+      </small>
+    </label>
+  );
+}
+
+/** nenk: 4ky8's maintainer-tooling skip, turned off; each item stores the choice, so its source updates carve the same tree. */
+function ToolingCheckbox({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+  // F1: the explanation sits under the label (.toggle does not wrap), linked for screen readers.
+  const help = useId();
+  return (
+    <div className="field">
+      <label className="toggle">
+        <input type="checkbox" checked={value} aria-describedby={help} onChange={(e) => onChange(e.target.checked)} />
+        Also import the repo's own tooling
+      </label>
+      <small id={help} className="muted">
+        A repo that ships a plugin or a <code>skills/</code> folder otherwise skips its <code>.claude/</code>, <code>.agents/</code> and similar folders and, with a plugin, its root AGENTS.md,
+        CLAUDE.md and GEMINI.md.
+      </small>
+    </div>
   );
 }
 
@@ -286,12 +328,16 @@ function FileForm({ plane, limits, onCancel }: { plane?: api.Plane; limits: imp.
   // a .md, which would land an Artifacts-page import in Prompts & MDs.
   const [kind, setKind] = useState<api.Kind | ''>(kinds.length === 1 ? kinds[0] : '');
   const [visibility, setVisibility] = useState<api.Visibility>('private');
+  const [description, setDescription] = useState('');
   const { busy, error, submit } = useSubmit();
+  // An artifact carries no frontmatter (one detected from a .html takes the text as its item description); a package has no one entry file.
+  const describable = kind !== 'artifact' && kind !== 'package';
 
   const go = submit(async () => {
     if (!file) return;
     if (limits) imp.refuseOversize(file, limits.maxFileMb);
-    const { item } = await api.importItem(file, { kind: kind || undefined, visibility });
+    // Text typed before the kind changed to one without the field is not sent.
+    const { item } = await api.importItem(file, { kind: kind || undefined, visibility, description: (describable && description.trim()) || undefined });
     onCancel();
     nav(`/items/${item.id}`);
   });
@@ -306,6 +352,7 @@ function FileForm({ plane, limits, onCancel }: { plane?: api.Plane; limits: imp.
         </small>
       </label>
       <KindSelect value={kind} kinds={kinds} onChange={setKind} />
+      {describable && <DescriptionField value={description} onChange={setDescription} again={false} />}
       <VisibilitySelect value={visibility} onChange={setVisibility} />
       <ErrorBox error={error} />
       <Actions busy={busy} label="Import" disabled={!file} onCancel={onCancel} />
@@ -313,17 +360,22 @@ function FileForm({ plane, limits, onCancel }: { plane?: api.Plane; limits: imp.
   );
 }
 
-function PackForm({ limits, intoGroup, onCancel, onRun }: { limits: imp.ImportLimits | null; intoGroup?: string; onCancel: () => void; onRun: OnRun }) {
+function PackForm({ plane, limits, intoGroup, onCancel, onRun }: { plane?: api.Plane; limits: imp.ImportLimits | null; intoGroup?: string; onCancel: () => void; onRun: OnRun }) {
   const [file, setFile] = useState<File | null>(null);
   const [visibility, setVisibility] = useState<api.Visibility>('private');
   const [group, setGroup] = useState(() => initialGroup(intoGroup));
   const [description, setDescription] = useState('');
+  // No artifact: a tree has no format, so the server refuses kind: artifact for a pack.
+  const kinds = (plane ? api.KINDS_BY_PLANE[plane] : ALL_KINDS).filter((k) => k !== 'artifact');
+  const [kind, setKind] = useState<api.Kind | ''>('');
+  const [tooling, setTooling] = useState(false);
   const { busy, error, submit } = useSubmit();
 
   const go = submit(async () => {
     if (!file) return;
     if (limits) imp.refuseOversize(file, limits.maxArchiveMb);
-    const opts = { visibility, description: description.trim() || undefined, ...groupOpts(group) };
+    // A package has no one entry file, so the server refuses a description with it: text typed before picking it is not sent.
+    const opts = { visibility, kind: kind || undefined, includeRepoTooling: tooling || undefined, description: (kind !== 'package' && description.trim()) || undefined, ...groupOpts(group) };
     await onRun((more) => imp.importOrSkipped(imp.importPack(file, { ...opts, ...more })));
   });
 
@@ -341,8 +393,10 @@ function PackForm({ limits, intoGroup, onCancel, onRun }: { limits: imp.ImportLi
           Re-uploading a zip under the same file name updates the items it created; a renamed file is treated as a new pack.
         </small>
       </label>
+      <FolderKindSelect value={kind} kinds={kinds} onChange={setKind} />
+      <ToolingCheckbox value={tooling} onChange={setTooling} />
       <VisibilitySelect value={visibility} onChange={setVisibility} />
-      <DescriptionField value={description} onChange={setDescription} />
+      {kind !== 'package' && <DescriptionField value={description} onChange={setDescription} />}
       <GroupFields value={group} onChange={setGroup} />
       <ErrorBox error={error} />
       <Actions busy={busy} label="Import pack" disabled={!file} onCancel={onCancel} />
@@ -361,6 +415,7 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
   const [visibility, setVisibility] = useState<api.Visibility>('private');
   const [group, setGroup] = useState(() => initialGroup(intoGroup));
   const [description, setDescription] = useState('');
+  const [tooling, setTooling] = useState(false);
   const { busy, error, submit } = useSubmit();
 
   const byUrl = url.trim() !== '';
@@ -368,7 +423,15 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
 
   const go = submit(async () => {
     const where: imp.GithubImport = byUrl ? { url: url.trim() } : { repo: repo.trim(), ref: ref.trim() || undefined, path: path.trim() || undefined };
-    const body: imp.GithubImport = { ...where, kind: kind || undefined, visibility, description: description.trim() || undefined, ...groupOpts(group) };
+    const body: imp.GithubImport = {
+      ...where,
+      kind: kind || undefined,
+      visibility,
+      includeRepoTooling: tooling || undefined,
+      // Not with a package, as in PackForm.
+      description: (kind !== 'package' && description.trim()) || undefined,
+      ...groupOpts(group),
+    };
     await onRun((more) => imp.importOrSkipped(imp.importGithub({ ...body, ...more })));
   });
 
@@ -403,24 +466,9 @@ function GithubForm({ plane, intoGroup, onCancel, onRun }: { plane?: api.Plane; 
           <input className="code-input" value={path} spellCheck={false} placeholder="repo root" disabled={byUrl} onChange={(e) => setPath(e.target.value)} />
         </label>
       </div>
-      {/* The server's `kind` turns detection off (jwz6): one item per .md for the single-file kinds, the whole tree one item for the rest. */}
-      <label className="field">
-        <span>Import items in folder as one type</span>
-        <select value={kind} onChange={(e) => setKind(e.target.value as api.Kind | '')}>
-          <option value="">No, detect each item's type</option>
-          {kinds.map((k) => (
-            <option key={k} value={k}>
-              Yes, all as {k}
-            </option>
-          ))}
-        </select>
-        <small className="muted">
-          Picking a type turns detection off. Agent, command, prompt and instructions: each .md file directly in the folder (not in subfolders) becomes its own item of that type (README-style docs are
-          left out). Skill, design and package: the whole folder becomes one item holding every file; a Path naming one .md file as a skill makes that file its SKILL.md.
-          A repo of many kinds of items needs detection.
-        </small>
-      </label>
-      <DescriptionField value={description} onChange={setDescription} />
+      <FolderKindSelect value={kind} kinds={kinds} onChange={setKind} note="; a Path naming one .md file as a skill makes that file its SKILL.md" />
+      <ToolingCheckbox value={tooling} onChange={setTooling} />
+      {kind !== 'package' && <DescriptionField value={description} onChange={setDescription} />}
       <VisibilitySelect value={visibility} onChange={setVisibility} />
       <GroupFields value={group} onChange={setGroup} />
       <p className="muted">Fetched through the GitHub API at the ref's current commit, which is pinned on every item for update checks.</p>

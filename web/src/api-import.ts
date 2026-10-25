@@ -40,6 +40,8 @@ export interface ImportGroupOpts {
   frontmatterErrors?: 'ask' | 'import' | 'skip';
   /** jcfm: frontmatter description (a skill's or agent's name too) SCP supplies when the one imported file has none. */
   description?: string;
+  /** 4ky8/nenk: import the repository's own contributor tooling too; stored on each item, so source updates carve the same tree. */
+  includeRepoTooling?: boolean;
 }
 
 /** The instance's caps (GET /imports/limits): admin settings, read by any signed-in user. */
@@ -110,8 +112,9 @@ export interface SourceCheck {
 }
 
 export const checkSource = (id: string) => json<SourceCheck>('POST', `/items/${id}/source/check`);
+/** skipped: what this update passed over (a link whose target it could not fetch), so a dropped copy is never a plain "updated". */
 export const updateSource = (id: string, note?: string) =>
-  json<{ item: ItemDetail }>('POST', `/items/${id}/source/update`, note ? { note } : {});
+  json<{ item: ItemDetail; skipped: ImportResult['skipped'] }>('POST', `/items/${id}/source/update`, note ? { note } : {});
 /** jcfm: change the supplied description; a new version while the supplied block is in use. */
 export const editSuppliedFrontmatter = (id: string, description: string) => json<{ item: ItemDetail }>('PUT', `/items/${id}/source/frontmatter`, { description });
 
