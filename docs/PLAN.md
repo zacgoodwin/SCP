@@ -196,9 +196,9 @@ POST   /items/:id/fork?version=N                                                
 GET    /search?q=&plane=&kind=&group=&limit=                                       -> {results:[ItemSummary & {groups?}]}  (FTS over readable items)
 ```
 `FileIn = {path, content?: string(utf8), contentBase64?: string, mode?: 420|493}`.
-`ItemSummary = {id, kind, plane, name, title, description, category, tags, visibility, format, latestSeq, executable, owner:{id,username}, updatedAt}`
-(`executable`: the latest version's runs-code flag, docs/PLAN-v4.md mc52).
-`ItemDetail = ItemSummary & {createdAt, source, forkedFrom, version: VersionDetail, groups:[{slug,name}], canEdit}`.
+`ItemSummary = {id, kind, plane, name, title, description, category, tags, visibility, format, latestSeq, executable, owner:{id,username}, updatedAt, canEdit}`
+(`executable`: the latest version's runs-code flag, docs/PLAN-v4.md mc52; `canEdit` is `access.ts` `canEditItem` for the viewer, on list rows too since v4 mwre, so clients never re-derive it).
+`ItemDetail = ItemSummary & {createdAt, source, forkedFrom, version: VersionDetail, groups:[{slug,name}]}`.
 `VersionDetail = {seq, entryPath, treeSha256, frontmatter, lint:[Lint], totalBytes, note, createdAt, executable, createdBy:{userId, keyId}, files:[{path, mode, size, sha256}]}`.
 `Lint = {level: error|warn|info, code, message, path?}`. Writes with any `error` lint return 422 with the lint list.
 Name: skills `^[a-z0-9]+(-[a-z0-9]+)*$` <= 64; other kinds `^[a-z0-9][a-z0-9._-]{0,63}$`; derived

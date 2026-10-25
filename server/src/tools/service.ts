@@ -3,8 +3,8 @@ import { itemReadSql, requiringGroupsSql } from '../access.ts';
 import { isUniqueViolation, now, type Db } from '../db.ts';
 import { HttpError, notFound } from '../lib/http.ts';
 import { CLI_NAME } from '../items/lint.ts';
-import type { ResolvedMember } from '../groups/service.ts';
-import type { Kind, Principal } from '../types.ts';
+import { servesRequiringCheck, type ResolvedMember } from '../groups/service.ts';
+import type { GroupRow, Kind, Principal } from '../types.ts';
 
 /**
  * The CLI tools registry (docs/PLAN-v3.md "CLI tools", f9j0 / fx78). Install commands come only from
@@ -118,8 +118,14 @@ export function deleteTool(db: Db, name: string): void {
 
 /** usedBy entries per kind: a CLI every public skill needs must not make the listing attacker-sized. */
 export const USED_BY_MAX = 50;
+/**
+ * What one usedBy call may spend confirming its candidate groups (groups/service.ts
+ * servesRequiringCheck, 5x0a): at most about 500 statements, tens of milliseconds, so a CLI whose
+ * candidates all fail the check cannot make every reader's /tools seconds long.
+ */
+export const USED_BY_CHECK_BUDGET = 500;
 
-/** Readable items whose latest version requires the CLI, and readable groups serving a member that does (access.ts). */
+/** Readable items whose latest version requires the CLI, and readable groups whose Requires panel lists it. */
 export function usedBy(db: Db, p: Principal, name: string): UsedBy {
   const read = itemReadSql(p);
   const items = db
@@ -128,9 +134,19 @@ export function usedBy(db: Db, p: Principal, name: string): UsedBy {
        WHERE vr.name = ? AND ${read.sql} ORDER BY i.name, i.id LIMIT ${USED_BY_MAX}`,
     )
     .all(name, ...read.params) as UsedBy['items'];
-  const g = requiringGroupsSql(p, USED_BY_MAX);
-  const groups = db.prepare(g.sql).all(name, ...g.params) as UsedBy['groups'];
-  return { items: items.map((r) => ({ ...r })), groups: groups.map((r) => ({ ...r })) };
+  const g = requiringGroupsSql(p);
+  const groups: UsedBy['groups'] = [];
+  // ponytail: past USED_BY_CHECK_BUDGET the remaining candidates go unchecked, so a group whose
+  // Requires panel lists the CLI may be missed (never one whose panel does not). Upgrade path: the
+  // first-occurrence rule in SQL.
+  const check = servesRequiringCheck(db, p, name, USED_BY_CHECK_BUDGET);
+  for (const row of db.prepare(g.sql).iterate(name, ...g.params) as Iterable<GroupRow>) {
+    if (groups.length >= USED_BY_MAX) break;
+    const serves = check(row);
+    if (serves === null) break;
+    if (serves) groups.push({ slug: row.slug, name: row.name });
+  }
+  return { items: items.map((r) => ({ ...r })), groups };
 }
 
 /** One registry row as /tools shows it: the row plus what the viewer can read that needs it. */

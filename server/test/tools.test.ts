@@ -4,7 +4,12 @@ import type { Server } from 'node:http';
 import { createAdaptorServer } from '@hono/node-server';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { StatementSync } from 'node:sqlite';
 import { listenLocal, makeTestCtx, type TestCtx } from './helpers.ts';
+import { newId, now, tx } from '../src/db.ts';
+import { MAX_EFFECTIVE_GROUPS } from '../src/groups/service.ts';
+import { USED_BY_CHECK_BUDGET, usedBy } from '../src/tools/service.ts';
+import type { Principal } from '../src/types.ts';
 
 // fx78: the Tools section, GET /api/v1/tools and the MCP scp://tools resource, on f9j0's registry.
 
@@ -98,6 +103,123 @@ test('usedBy lists only items and groups the viewer can read; another user\'s pr
   // A key restricted to bob's hub sees what flows through it and nothing else.
   const restricted = t.key(alice, { groupIds: [hub.id] }).headers;
   assert.deepEqual(names(await used(restricted)), [['theirs'], ['hub']]);
+});
+
+test('5x0a: usedBy lists a group only when its Requires panel does, when one item reaches the group twice', async () => {
+  const { t, ah, h } = setup();
+  await addTool(t, ah, { name: 'roborev' });
+  // x v1 requires roborev; x v2 (latest) requires nothing.
+  const x = await skill(t, h.alice, 'x', 'metadata:\n  requires: [roborev]\n');
+  assert.equal((await t.req('POST', `${API}/items/${x.id}/versions`, { headers: h.alice, json: { content: '---\nname: x\ndescription: d\n---\n' } })).status, 201);
+  const pinned = async (slug: string) => {
+    await group(t, h.alice, slug, []);
+    assert.equal((await t.req('POST', `${API}/groups/${slug}/members`, { headers: h.alice, json: { itemId: x.id, pinnedSeq: 1 } })).status, 201);
+  };
+  const include = async (parent: string, child: string) =>
+    assert.equal((await t.req('POST', `${API}/groups/${parent}/includes`, { headers: h.alice, json: { slug: child } })).status, 201);
+  // The ticket's case: p has x unpinned (its own row wins) and includes c, which pins x at v1.
+  await pinned('cc');
+  await group(t, h.alice, 'pp', [x.id]);
+  await include('pp', 'cc');
+  // The reverse: q pins x at v1 itself and includes d, which has x unpinned.
+  await group(t, h.alice, 'dd', [x.id]);
+  await pinned('qq');
+  await include('qq', 'dd');
+  // Sibling order: r includes d (x unpinned) before c (x at v1), so d's row wins.
+  await group(t, h.alice, 'rr', []);
+  await include('rr', 'dd');
+  await include('rr', 'cc');
+
+  const panel = async (slug: string) => ((await t.req('GET', `${API}/groups/${slug}`, { headers: h.alice })).json.group.requires as { name: string }[]).map((r) => r.name);
+  const usedBy = ((await t.req('GET', `${API}/tools/roborev`, { headers: h.alice })).json.tool.usedBy.groups as { slug: string }[]).map((g) => g.slug);
+  const listing = [];
+  for (const slug of ['cc', 'dd', 'pp', 'qq', 'rr']) if ((await panel(slug)).includes('roborev')) listing.push(slug);
+  assert.deepEqual(listing, ['cc', 'qq'], 'the Requires panels');
+  assert.deepEqual(usedBy, listing, '/tools agrees with the panels');
+});
+
+test('5x0a: usedBy confirms many failing candidates in bounded work; past the budget it misses a group, never lists a failing one', async () => {
+  const { t, ah, alice, bob, h } = setup();
+  await addTool(t, ah, { name: 'roborev' });
+  // x v1 requires roborev, x v2 (latest) does not. cc pins x at v1, so its panel lists roborev.
+  const x = await skill(t, h.alice, 'x', 'metadata:\n  requires: [roborev]\n', 'public');
+  assert.equal((await t.req('POST', `${API}/items/${x.id}/versions`, { headers: h.alice, json: { content: '---\nname: x\ndescription: d\n---\n' } })).status, 201);
+  const ts = now();
+  const ins = {
+    group: t.db.prepare("INSERT INTO scp_groups (id, owner_id, slug, name, visibility, created_at, updated_at) VALUES (?, ?, ?, ?, 'public', ?, ?)"),
+    member: t.db.prepare('INSERT INTO group_members (group_id, item_id, pinned_seq, position, added_at) VALUES (?, ?, ?, ?, ?)'),
+    include: t.db.prepare('INSERT INTO group_includes (group_id, included_id, position, added_at) VALUES (?, ?, ?, ?)'),
+    item: t.db.prepare("INSERT INTO items (id, owner_id, kind, name, visibility, latest_seq, created_at, updated_at) VALUES (?, ?, 'prompt', ?, 'public', 2, ?, ?)"),
+    version: t.db.prepare("INSERT INTO item_versions (id, item_id, seq, entry_path, tree_sha256, total_bytes, created_at) VALUES (?, ?, ?, 'p.md', ?, 1, ?)"),
+    requires: t.db.prepare("INSERT INTO version_requires (version_id, name) VALUES (?, 'roborev')"),
+  };
+  const sqlGroup = (slug: string, members: string[], includes: string[] = [], pin: number | null = null) => {
+    const id = newId();
+    ins.group.run(id, alice.id, slug, slug, ts, ts);
+    members.forEach((item, i) => ins.member.run(id, item, pin, i, ts));
+    includes.forEach((c, i) => ins.include.run(id, c, i, ts));
+    return id;
+  };
+  const pad = (n: number) => String(n).padStart(3, '0');
+  let cc = '';
+  // Items whose v1 required roborev and whose latest does not: the check must read their rows, and they require nothing unpinned.
+  const formerly: string[] = [];
+  // Each a-group holds x unpinned (its own row wins over cc's pin) and includes cc and the same ten fillers.
+  tx(t.db, () => {
+    for (let i = 0; i < 200; i++) {
+      const id = newId();
+      const v1 = newId();
+      ins.item.run(id, alice.id, `old-${i}`, ts, ts);
+      ins.version.run(v1, id, 1, `a${i}`, ts);
+      ins.version.run(newId(), id, 2, `b${i}`, ts);
+      ins.requires.run(v1);
+      formerly.push(id);
+    }
+    cc = sqlGroup('cc', [x.id], [], 1);
+    const fillers = Array.from({ length: 10 }, (_, j) => sqlGroup(`f${j}`, formerly.slice(0, 20)));
+    for (let n = 0; n < 100; n++) sqlGroup(`a${pad(n)}`, [x.id], [cc, ...fillers]);
+  });
+  const p: Principal = { userId: bob.id, username: bob.username, isAdmin: false, via: 'key', scopes: ['read'], groupIds: null };
+  const proto = StatementSync.prototype as unknown as Record<'all' | 'get' | 'iterate', (...a: unknown[]) => unknown>;
+  const measured = () => {
+    const orig = { all: proto.all, get: proto.get, iterate: proto.iterate };
+    let statements = 0;
+    let rows = 0;
+    proto.all = function (this: unknown, ...a: unknown[]) {
+      statements++;
+      const r = orig.all.apply(this, a) as unknown[];
+      rows += r.length;
+      return r;
+    };
+    proto.get = function (this: unknown, ...a: unknown[]) {
+      statements++;
+      return orig.get.apply(this, a);
+    };
+    proto.iterate = function (this: unknown, ...a: unknown[]) {
+      statements++;
+      return orig.iterate.apply(this, a);
+    };
+    try {
+      return { ...usedBy(t.db, p, 'roborev'), statements, rows };
+    } finally {
+      Object.assign(proto, orig);
+    }
+  };
+
+  // 100 failing candidates, then cc: each group's includes and rows load once, so all are confirmed and cc is listed.
+  const shared = measured();
+  assert.deepEqual(shared.groups.map((g) => g.slug), ['cc']);
+  // One includes load and one rows load per group (100 a-groups, cc, 10 fillers), plus the two listing queries.
+  assert.ok(shared.statements <= 2 * 111 + 2, `${shared.statements} statements: one walk per candidate`);
+
+  // 200 more failing candidates sorting before cc, each through its own filler of 200 rows the check must read.
+  tx(t.db, () => {
+    for (let n = 0; n < 200; n++) sqlGroup(`b${pad(n)}`, [x.id], [cc, sqlGroup(`bf${pad(n)}`, formerly)]);
+  });
+  const many = measured();
+  assert.ok(many.statements <= USED_BY_CHECK_BUDGET + MAX_EFFECTIVE_GROUPS + 2, `${many.statements} statements`);
+  assert.ok(many.rows <= 10 * (USED_BY_CHECK_BUDGET + MAX_EFFECTIVE_GROUPS), `${many.rows} rows`);
+  assert.deepEqual(many.groups, [], 'past the budget cc goes unchecked, and no failing candidate is listed');
 });
 
 test('install commands on /tools come only from the registry; a skill\'s metadata.install never appears', async () => {

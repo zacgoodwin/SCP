@@ -106,13 +106,15 @@ export function servingGroupsSql(p: Principal): SqlFrag {
 }
 
 /**
- * Query: slug and name of the first `limit` groups p can read that serve a member whose served
- * version (the member row's pin, else latest) requires the CLI bound first (fx78 usedBy). The same
- * upward walk as servingGroupsSql, anchored on version_requires by name.
+ * Query: rows of the groups p can read, by name, that some member row requiring the CLI bound first
+ * reaches at that row's version (its pin, else latest) (fx78 usedBy). The same upward walk as
+ * servingGroupsSql, anchored on version_requires by name. Candidates only: when one item reaches a
+ * group twice the group serves the first occurrence (resolvedMembers), which this walk cannot tell,
+ * so usedBy confirms each with groups/service.ts servesRequiringCheck (5x0a).
  * ponytail: MAX_UP_ROWS caps the walk, so a CLI required across more than that many member rows
  * lists only the groups the first rows reach.
  */
-export function requiringGroupsSql(p: Principal, limit: number): SqlFrag {
+export function requiringGroupsSql(p: Principal): SqlFrag {
   const g = groupReadSql(p, 'g_r');
   const join =
     ' JOIN items i ON i.id = gm_r.item_id JOIN item_versions v_r ON v_r.item_id = i.id AND v_r.seq = COALESCE(gm_r.pinned_seq, i.latest_seq)' +
@@ -120,7 +122,7 @@ export function requiringGroupsSql(p: Principal, limit: number): SqlFrag {
   // A disabled owner's item is not served to non-admins (itemReadSql), so it requires nothing for them.
   const anchor = `vr_r.name = ?${p.isAdmin ? '' : ` AND ${ownerEnabled('i.owner_id')}`}`;
   return {
-    sql: `${upCte('i', anchor, join)} SELECT DISTINCT g_r.slug, g_r.name FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql} ORDER BY g_r.name, g_r.slug LIMIT ${limit}`,
+    sql: `${upCte('i', anchor, join)} SELECT DISTINCT g_r.* FROM up_r JOIN scp_groups g_r ON g_r.id = up_r.group_id WHERE ${g.sql} ORDER BY g_r.name, g_r.slug`,
     params: g.params,
   };
 }

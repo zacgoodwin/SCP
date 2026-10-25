@@ -4,6 +4,7 @@ import { strToU8, zipSync } from 'fflate';
 import { makeTestCtx, insertGroup, type TestCtx, type TestUser } from './helpers.ts';
 import { buildZip, safeUnzip } from '../src/lib/zip.ts';
 import { createItemTx, entryPathFor, insertRow, loadEditableItem, renameFrontmatter, searchItems } from '../src/items/service.ts';
+import { canEditItem } from '../src/access.ts';
 import type { Principal } from '../src/types.ts';
 
 const API = '/api/v1';
@@ -277,6 +278,45 @@ test('versions increment, old versions stay readable, tree hash is content-addre
   assert.equal(bad.status, 422);
   const actions = (t.db.prepare('SELECT action FROM audit WHERE target_id = ? ORDER BY id').all(v1.id) as { action: string }[]).map((a) => a.action);
   assert.deepEqual(actions, ['item.create', 'item.version', 'item.version']);
+});
+
+test('mwre: list rows carry canEdit, the server canEditItem for each viewer', async () => {
+  const { t, u, h } = setup();
+  const other = t.createUser();
+  const admin = t.createUser({ isAdmin: true });
+  const mine = await create(t, h, { kind: 'prompt', name: 'mine', content: 'x' });
+  const theirs = await create(t, t.key(other).headers, { kind: 'prompt', name: 'theirs', content: 'x', visibility: 'public' });
+  const kit = await t.req('POST', `${API}/groups`, { headers: h, json: { slug: 'kit', name: 'kit' } });
+  assert.equal(kit.status, 201, kit.text);
+  for (const itemId of [mine.id, theirs.id]) assert.equal((await t.req('POST', `${API}/groups/kit/members`, { headers: h, json: { itemId } })).status, 201);
+  const gid = kit.json.group.id as string;
+
+  const viewers: [string, H, Principal][] = [
+    ['owner', h, principal(u)],
+    ['other', t.key(other).headers, principal(other)],
+    ['admin', t.key(admin).headers, principal(admin)],
+    ['read-only', t.key(u, { scopes: ['read'] }).headers, principal(u, { scopes: ['read'] })],
+    ['restricted', t.key(u, { groupIds: [gid] }).headers, principal(u, { groupIds: [gid] })],
+  ];
+  const expected: Record<string, Record<string, boolean>> = {
+    owner: { mine: true, theirs: false },
+    other: { theirs: true },
+    admin: { mine: true, theirs: true },
+    'read-only': { mine: false, theirs: false },
+    restricted: { mine: true, theirs: false },
+  };
+  const flags = (rows: { name: string; canEdit: boolean }[]) => Object.fromEntries(rows.map((r) => [r.name, r.canEdit]));
+  for (const [who, hh, p] of viewers) {
+    const listed = await t.req('GET', `${API}/items?plane=md`, { headers: hh });
+    assert.equal(listed.status, 200, listed.text);
+    assert.deepEqual(flags(listed.json.items), expected[who], `GET /items as ${who}`);
+    for (const r of listed.json.items) assert.equal(r.canEdit, canEditItem(t.db, p, { id: r.id, owner_id: r.owner.id }), `${r.name} as ${who}`);
+    const search = await t.req('GET', `${API}/search?plane=md`, { headers: hh });
+    assert.deepEqual(flags(search.json.results), expected[who], `GET /search as ${who}`);
+  }
+  // Group members are ItemSummary too.
+  const members = (await t.req('GET', `${API}/groups/kit`, { headers: h })).json.group.members as { item: { name: string; canEdit: boolean } }[];
+  assert.deepEqual(flags(members.map((m) => m.item)), { mine: true, theirs: false });
 });
 
 test('access: private 404, public 200, PATCH 404/403, read-only key 403', async () => {

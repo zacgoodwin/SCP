@@ -4,8 +4,8 @@ import { HttpError, badRequest } from '../lib/http.ts';
 import { pathKey } from '../lib/paths.ts';
 import { buildZip } from '../lib/zip.ts';
 import type { TreeFile } from '../lib/tree.ts';
-import { itemSummary, listFiles, readTree } from '../items/service.ts';
-import { MAX_GROUP_FILES, resolvedMembers, serverNames, type ResolvedMember, type WithheldMember } from './service.ts';
+import { listFiles, readTree } from '../items/service.ts';
+import { MAX_GROUP_FILES, resolvedMembers, serverNames, usernameOf, type ResolvedMember, type WithheldMember } from './service.ts';
 import { EXECUTABLE_KINDS, isExecutable, planeOf, type GroupRow, type ItemRow, type Kind, type Plane, type Principal, type VersionRow } from '../types.ts';
 
 const MB = 1024 * 1024;
@@ -240,7 +240,7 @@ function place(db: Db, p: Principal, group: GroupRow, opts: InstallOpts): { plac
       path: installPath(m.item.kind, m.item.name, m.version.entry_path, o),
       paths: footprint(m.item.kind, m.item.name, m.version.entry_path, files, o),
       files,
-      owner: itemSummary(db, m.item).owner.username,
+      owner: usernameOf(db, m.item.owner_id),
     };
   });
   return { placed, files, withheld };

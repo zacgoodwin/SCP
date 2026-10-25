@@ -89,7 +89,13 @@ kind, name, title}], groups: [{slug, name}]}}`, at most 50 of each. `usedBy.item
 viewer can read (`itemReadSql`) whose latest version requires the tool; `usedBy.groups` are the groups
 the viewer can read (`groupReadSql`) serving a member whose served version (pin, else latest) does,
 directly or through includes (`access.ts` `requiringGroupsSql`, the upward walk of
-`servingGroupsSql`), so another user's private group never appears. The MCP resource `scp://tools`
+`servingGroupsSql`), so another user's private group never appears. When one item reaches a group
+twice, the group serves its first occurrence (`resolvedMembers`), so each candidate is confirmed by
+`groups/service.ts` `servesRequiringCheck` and a group is listed exactly when its Requires panel lists the
+tool (5x0a, v4). Confirmation is bounded per call (`USED_BY_CHECK_BUDGET`: each group's includes and
+rows load once across candidates, about 500 statements at most), because any account can build
+candidates that fail it; past the budget a group whose panel lists the tool may be missed, never one
+whose panel does not. The MCP resource `scp://tools`
 (`application/json`) returns the same `{tools}` for the connection's principal, on every endpoint.
 
 Anyone but a full admin (a non-admin, a
